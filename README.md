@@ -8,7 +8,8 @@ An ASI plugin for Driver: San Francisco on PC. Target exe version 1.04
 - Fits Bink cinematics inside the area the game draws them in, so movies keep their proportions.
 - Adds borderless windowed mode and an option to turn off VSync.
 - Forces anisotropic and trilinear texture filtering. It also has mip and LOD-bias settings.
-- Raises gameplay LOD thresholds and lets you extend how far away civilian traffic spawns.
+- Draws traffic cars at full detail out to their draw distance, raises other gameplay LOD thresholds, and lets you extend how far away civilian traffic spawns.
+- Shrinks the distant brake and position lamp flares to small dots.
 - Skips the legal-screen wait and dismisses the prompt about Ubisoft's servers, which no longer exist.
 
 ## Install
@@ -21,8 +22,10 @@ Copy three files from the release ZIP into the game folder, next to `Driver.exe`
 
 Settings live in `dsf_enhanced.ini`. The defaults turn on borderless mode, 16x anisotropic filtering, trilinear filtering, and higher gameplay detail. A few values you may want to change:
 
-- `TrafficSpawnDistanceScale=4.0` makes civilian cars spawn and despawn four times farther out. Set it to `1.0` for the game's normal radius.
-- `LODEngineThresholdScale` and `MapDetailLODThresholdScale` at `1.0` restore the native LOD thresholds.
+- `TrafficSpawnRadius=500` sets how far from you civilian cars spawn and despawn, in metres. `350` is the game's radius; `500` is the maximum, because larger radii overflow the game's traffic pools and crash.
+- `VehicleFullDetail=0` restores the game's vehicle LOD steps; `VehicleLODThresholdScale` then scales them.
+- `LODEngineThresholdScale` (terrain, pedestrians, drivers) and `MapDetailLODThresholdScale` at `1.0` restore the native LOD thresholds.
+- Clear `DRLFlareScale` and `DRLFlareBrightness` in `[Lights]` to keep the game's lamp flares.
 - `[General] Log=0` stops the plugin from writing `dsf_enhanced.log`.
 
 To uninstall, delete the three files. If the game already has a `winmm.dll`, from another ASI loader for example, back it up before installing. Nothing here touches `Driver.exe` or `gameconfig.txt`.

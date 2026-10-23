@@ -30,7 +30,11 @@ float g_lod_distance_scale = 1.0f;
 float g_lod_engine_threshold_scale = 0.25f;
 float g_map_detail_lod_threshold_scale = 1.0f;
 float g_imposter_draw_distance = 2800.0f;
-float g_traffic_spawn_distance_scale = 1.0f;
+float g_traffic_spawn_radius = 350.0f;
+float g_vehicle_lod_threshold_scale = 1.0f;
+bool g_vehicle_full_detail = false;
+float g_vehicle_draw_distance = 0.0f;
+bool g_traffic_diagnostics = false;
 float g_interesting_vehicle_min_distance_scale = 1.0f;
 float g_interesting_vehicle_max_distance_scale = 1.0f;
 int g_interesting_vehicle_slot_count = 0;
@@ -56,9 +60,6 @@ constexpr DWORD kGlobalFovScalarRva = 0x009D9A80;
 constexpr DWORD kMovieDrawRva = 0x0036C5D0;
 constexpr DWORD kLegalScreenWaitBranchRva = 0x00399C4A;
 constexpr DWORD kErrorMessageUpdateRva = 0x0032AD80;
-constexpr DWORD kLuaStateRva = 0x00E2B498;
-constexpr DWORD kLuaLoadStringRva = 0x00207AB0;
-constexpr DWORD kLuaPCallRva = 0x001F1CA0; // Native protected call, with its actual status return.
 constexpr DWORD kEngineSingletonRva = 0x00BE7228;
 constexpr DWORD kLodDirtyFlagRva = 0x00D8D6E0;
 constexpr DWORD kEngineSetLodThresholdRva = 0x002A4F40;
@@ -76,10 +77,51 @@ constexpr DWORD kOriginalFovScalarBits = 0x3C8EFA35;
 constexpr float kTrafficCandidateOriginalLateralWindow = 20.0f;
 constexpr float kTrafficCandidateOriginalForwardWindow = 6.0f;
 
+// Traffic road radius (research: draw-distance.md, plan A). 0x772800 builds the wanted road set
+// with 0x7723A0(list, position, radius); the radius comes from these two movss loads.
+constexpr DWORD kTrafficRadiusLoadRva = 0x00372A00;       // movss xmm0,[0xDE2344] 350 m (single player)
+constexpr DWORD kTrafficRadiusSplitLoadRva = 0x003729F6;  // movss xmm0,[0xDE2454] 256 m ([[engine+0x754]] != 0)
+constexpr DWORD kTrafficRadiusConstantRva = 0x009E2344;   // shared constants: never written
+constexpr DWORD kTrafficRadiusSplitConstantRva = 0x009E2454;
+constexpr float kTrafficStockRadius = 350.0f;
+constexpr float kTrafficStockSplitRadius = 256.0f;
+// 500 m: above it the traffic pools overflow at stock density. At 700 m the vehicle store
+// (500 cars, 0x77AA50) stayed full and the lane-carrier pool at manager+0x503648 (12,000 nodes of
+// 0x24 bytes, bump-allocated by 0x77BD30 with no bound check) ran into the vehicle store behind
+// it, corrupting its count and vehicle pointers (crash at 0x8CD230). Raise only with those pools.
+constexpr float kTrafficMaxRadius = 500.0f;
+// 0x7723A0 lists the 240 m road-grid cells inside the radius square in a 21-entry stack array
+// with no bound check. Above ~360 m the square spans 25+ cells and entry 21 lands on the count,
+// so cells (often the player's own) are silently lost and near roads ping out and back in.
+// These five instructions address the array; they are pointed at a plugin-owned buffer.
+constexpr DWORD kTrafficCellWriteRva = 0x0037247B;       // lea eax,[esp+eax*8+0xBC]
+constexpr DWORD kTrafficCellSortEndRva = 0x003724B7;     // lea eax,[esp+eax*8+0xC4]
+constexpr DWORD kTrafficCellSortBeginRva = 0x003724C0;   // lea edx,[esp+0xC4]
+constexpr DWORD kTrafficCellLoopBeginRva = 0x003724DD;   // lea edi,[esp+0xD0]
+constexpr DWORD kTrafficCellLoopEndRva = 0x003724E4;     // lea eax,[esp+eax*8+0xD0]
+constexpr int kTrafficCellCapacity = 1024;               // 500 m needs at most 6 x 6 cells; room to spare
+// Traffic manager [engine+0x758] fields read by TrafficDiagnostics.
+constexpr DWORD kTrafficActiveNodeCountOffset = 0x0C;        // active road directions (pool of 512)
+constexpr DWORD kTrafficActiveLaneCountOffset = 0x501818;
+constexpr DWORD kTrafficWantedCountOffset = 0x50282C;        // wanted list at +0x50182C, cap 512
+constexpr DWORD kTrafficVehicleCountOffset = 0x56CDE4;       // vehicle store +0x56CDDC, count +8, cap 500
+
+// Vehicle LOD (category 2). Setter/getter keys per selector slot: key 2 = slot 0 (draws mask 4,
+// full detail), 4 = slot 1 (mask 8), 8 = slot 2 (mask 16), 16 = slot 3 (mask 1 hull; its
+// threshold is the cull), 1 = slot 4 (draws nothing). Decoded from 0x6A4E10.
+constexpr int kLodSlotKeys[5] = {2, 4, 8, 16, 1};
+constexpr int kLodCategoryCount = 5;
+constexpr const char* kLodCategoryNames[kLodCategoryCount] = {"Static", "Terrain", "Vehicle", "Pedestrian", "Driver"};
+
+// DRL flare curves: float[2][3][4] per flare type at 0x120D198 (type 0 emergency, 1 DRL);
+// rows 0-2 distances, rows 3-5 values; columns scale, transparency, brightness. Filled by the
+// static initialiser 0xD31C30, read by 0x50B6C0, written by Lua Sfx.DRLFlare* via 0x50B410.
+constexpr DWORD kDrlFlareTableRva = 0x00E0D1F8;
+
 using Direct3DCreate9Fn = IDirect3D9* (WINAPI*)(UINT);
 using ResetFn = HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRESENT_PARAMETERS*);
 using SetSamplerStateFn = HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*, DWORD, D3DSAMPLERSTATETYPE, DWORD);
-using DrawIndexedPrimitiveFn = HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*, D3DPRIMITIVETYPE, INT, UINT, UINT, UINT, UINT);
+using PresentFn = HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*, const RECT*, const RECT*, HWND, const RGNDATA*);
 using SetPixelShaderConstantFFn = HRESULT (STDMETHODCALLTYPE*)(IDirect3DDevice9*, UINT, const float*, UINT);
 using EngineSetLodThresholdFn = void (__thiscall*)(void*, int, int, float);
 using EngineGetLodThresholdFn = float (__thiscall*)(void*, int, int);
@@ -87,15 +129,13 @@ using ImposterApplyDistanceFn = void (__thiscall*)(void*, float, float);
 using InterestingVehicleSetDistanceFn = void (__thiscall*)(void*, float);
 using InterestingVehicleSetSlotCountFn = void (__thiscall*)(void*, int);
 using TrafficApplySettingsVehiclePoolFn = bool (__thiscall*)(void*, void*);
-using LuaLoadStringFn = int (__cdecl*)(void*, const char*);
-using LuaPCallFn = int (__cdecl*)(void*, int, int, int);
 using BinkOpenFn = void* (WINAPI*)(const char*, UINT);
 using BinkCloseFn = void (WINAPI*)(void*);
 
 Direct3DCreate9Fn g_real_direct3d_create9 = nullptr;
 ResetFn g_real_reset = nullptr;
 SetSamplerStateFn g_real_set_sampler_state = nullptr;
-DrawIndexedPrimitiveFn g_real_draw_indexed_primitive = nullptr;
+PresentFn g_real_present = nullptr;
 SetPixelShaderConstantFFn g_real_set_pixel_shader_constant_f = nullptr;
 BinkOpenFn g_real_bink_open = nullptr;
 BinkCloseFn g_real_bink_close = nullptr;
@@ -104,15 +144,8 @@ volatile LONG g_cinematic_movie_draw_count = 0;
 volatile LONG g_cinematic_movie_draw_log_count = 0;
 volatile LONG g_sampler_quality_log_count = 0;
 volatile LONG g_lod_distance_scale_log_count = 0;
-void* g_map_lod_last_manager = nullptr;
-bool g_map_lod_threshold_patch_applied = false;
-volatile LONG g_traffic_radius_lua_attempt_count = 0;
-volatile LONG g_traffic_radius_last_attempt_tick = 0;
-bool g_traffic_radius_lua_executed = false;
 bool g_traffic_radius_patch_applied = false;
-volatile LONG g_lod_engine_log_count = 0;
-void* g_lod_engine_last_manager = nullptr;
-bool g_lod_engine_threshold_patch_applied = false;
+volatile LONG g_present_count = 0;
 volatile LONG g_imposter_log_count = 0;
 void* g_imposter_last_manager = nullptr;
 bool g_imposter_distance_patch_applied = false;
@@ -211,6 +244,47 @@ int ClampInt(int value, int low, int high)
     return std::max(low, std::min(value, high));
 }
 
+struct FlareCurve
+{
+    bool enabled;
+    float distances[3];
+    float values[3];
+};
+
+// DRL flare attributes in table column order.
+constexpr const char* kFlareAttributeKeys[3] = {"DRLFlareScale", "DRLFlareTransparency", "DRLFlareBrightness"};
+FlareCurve g_drl_flare_curves[3] = {};
+bool g_drl_flares_written = false;
+
+// "d1:v1, d2:v2, d3:v3"; empty leaves the game's curve. Distances must increase strictly,
+// as the game's own Lua setter requires (0x67F770).
+void LoadFlareConfig(const char* ini_path)
+{
+    for (int attr = 0; attr < 3; ++attr) {
+        FlareCurve& curve = g_drl_flare_curves[attr];
+        curve = {};
+        char buffer[128] = {};
+        GetPrivateProfileStringA("Lights", kFlareAttributeKeys[attr], "", buffer, sizeof(buffer), ini_path);
+        if (buffer[0] == '\0') {
+            continue;
+        }
+        float d[3] = {};
+        float v[3] = {};
+        bool valid = std::sscanf(buffer, " %f : %f , %f : %f , %f : %f", &d[0], &v[0], &d[1], &v[1], &d[2], &v[2]) == 6 &&
+            d[0] >= 0.0f && d[0] < d[1] && d[1] < d[2];
+        for (int i = 0; i < 3; ++i) {
+            valid = valid && std::isfinite(d[i]) && std::isfinite(v[i]) && v[i] >= 0.0f && v[i] <= 16.0f;
+        }
+        if (!valid) {
+            Log("Lights: ignoring %s=%s (expected d1:v1, d2:v2, d3:v3 with increasing distances)", kFlareAttributeKeys[attr], buffer);
+            continue;
+        }
+        curve.enabled = true;
+        std::memcpy(curve.distances, d, sizeof(d));
+        std::memcpy(curve.values, v, sizeof(v));
+    }
+}
+
 void LoadConfig()
 {
     char ini_path[MAX_PATH] = {};
@@ -218,6 +292,7 @@ void LoadConfig()
     BuildGamePath(g_log_path, MAX_PATH, "dsf_enhanced.log");
 
     g_log_enabled = GetPrivateProfileIntA("General", "Log", 1, ini_path) != 0;
+    g_traffic_diagnostics = GetPrivateProfileIntA("General", "TrafficDiagnostics", 0, ini_path) != 0;
     g_remove_vsync = GetPrivateProfileIntA("Display", "RemoveVSync", 0, ini_path) != 0;
     g_borderless_windowed = GetPrivateProfileIntA("Display", "BorderlessWindowed", 0, ini_path) != 0;
     g_ultrawide_enabled = GetPrivateProfileIntA("Ultrawide", "Enabled", 1, ini_path) != 0;
@@ -234,10 +309,15 @@ void LoadConfig()
     g_lod_distance_scale = std::max(0.25f, std::min(g_lod_distance_scale, 8.0f));
     g_lod_engine_threshold_scale = ReadProfileFloat("Quality", "LODEngineThresholdScale", 1.0f, ini_path);
     g_lod_engine_threshold_scale = std::max(0.25f, std::min(g_lod_engine_threshold_scale, 8.0f));
+    g_vehicle_lod_threshold_scale = ReadProfileFloat("Quality", "VehicleLODThresholdScale", 1.0f, ini_path);
+    g_vehicle_lod_threshold_scale = std::max(0.25f, std::min(g_vehicle_lod_threshold_scale, 8.0f));
+    g_vehicle_full_detail = GetPrivateProfileIntA("Quality", "VehicleFullDetail", 0, ini_path) != 0;
+    g_vehicle_draw_distance = ReadProfileFloat("Quality", "VehicleDrawDistance", 0.0f, ini_path);
+    g_vehicle_draw_distance = g_vehicle_draw_distance <= 0.0f ? 0.0f : std::max(200.0f, std::min(g_vehicle_draw_distance, 3000.0f));
     g_map_detail_lod_threshold_scale = ReadProfileFloat("Quality", "MapDetailLODThresholdScale", 1.0f, ini_path);
     g_map_detail_lod_threshold_scale = std::max(0.25f, std::min(g_map_detail_lod_threshold_scale, 8.0f));
-    g_traffic_spawn_distance_scale = ReadProfileFloat("Quality", "TrafficSpawnDistanceScale", 1.0f, ini_path);
-    g_traffic_spawn_distance_scale = std::max(1.0f, std::min(g_traffic_spawn_distance_scale, 8.0f));
+    g_traffic_spawn_radius = ReadProfileFloat("Quality", "TrafficSpawnRadius", kTrafficStockRadius, ini_path);
+    g_traffic_spawn_radius = std::max(kTrafficStockRadius, std::min(g_traffic_spawn_radius, kTrafficMaxRadius));
     g_imposter_draw_distance = ReadProfileFloat("Quality", "ImposterDrawDistance", 2800.0f, ini_path);
     g_imposter_draw_distance = std::max(-1.0f, std::min(g_imposter_draw_distance, 7000.0f));
     g_interesting_vehicle_min_distance_scale =
@@ -257,6 +337,7 @@ void LoadConfig()
     g_traffic_spawn_interval_scale = std::max(0.05f, std::min(g_traffic_spawn_interval_scale, 1.0f));
     g_skip_legal_screen = GetPrivateProfileIntA("Startup", "SkipLegalScreen", 1, ini_path) != 0;
     g_suppress_ubisoft_server_lost_prompt = GetPrivateProfileIntA("Startup", "SuppressUbisoftServerLostPrompt", 1, ini_path) != 0;
+    LoadFlareConfig(ini_path);
 }
 
 bool WriteMemory(void* address, const void* data, size_t size)
@@ -820,9 +901,114 @@ void MarkEngineLodThresholdsDirty(const ModuleRange& range)
     WriteMemory(dirty_flag, &dirty, sizeof(dirty));
 }
 
-void ApplyMapDetailLodThresholds(const ModuleRange& range, const char* source)
+struct LodCategoryState
 {
-    if (std::fabs(g_map_detail_lod_threshold_scale - 1.0f) < 0.001f ||
+    void* manager;
+    bool applied;
+    float original[5];
+    float written[5];
+    LONG log_count;
+};
+
+LodCategoryState g_lod_state[kLodCategoryCount] = {};
+
+float GetTargetFovScalar();
+
+// Vehicle LOD metric constant for a mid-size car (Desanne) in the current projection. Measured
+// K = 57.5 at 21:9 with the ultrawide FOV scaling, where P00 * P11 = 3.33 (research:
+// draw-distance.md); K scales with P00 * P11. The metric is about K / (d - 7.5)^2.
+float VehicleLodMetricConstant()
+{
+    constexpr float kDegreesToRadians = 3.14159265358979323846f / 180.0f;
+    constexpr float kStockFovScalar = 0.017453f;
+    const float aspect = g_ultrawide_enabled && g_current_aspect > 0.0f ? g_current_aspect : 16.0f / 9.0f;
+    float fov_scale = 1.0f;
+    if (g_ultrawide_enabled && g_fov_scaling) {
+        const float scalar = GetTargetFovScalar();
+        if (scalar > 0.0f) {
+            fov_scale = scalar / kStockFovScalar;
+        }
+    }
+    const float horizontal_fov = std::min(60.0f * fov_scale, 170.0f) * kDegreesToRadians;
+    const float p00 = 1.0f / std::tan(horizontal_fov * 0.5f);
+    const float p11 = aspect * p00;
+    return 57.5f * (p00 * p11) / 3.33f;
+}
+
+float VehicleLodThresholdForDistance(float distance)
+{
+    const float d = std::max(distance - 7.5f, 10.0f);
+    return VehicleLodMetricConstant() / (d * d);
+}
+
+// Spawned cars appear anywhere on a newly activated road, up to about the radius + 320 m
+// (stock: 318 to 666 m). The cull has to lie beyond that, or cars pop in at the cull line.
+float VehicleMinimumCullDistance()
+{
+    return g_traffic_radius_patch_applied ? g_traffic_spawn_radius + 350.0f : 0.0f;
+}
+
+void ScaleLodThresholds(const float original[5], float target[5], float scale)
+{
+    for (int slot = 0; slot < 5; ++slot) {
+        target[slot] = original[slot];
+        if (std::isfinite(original[slot]) && original[slot] > 0.0f) {
+            target[slot] = std::min(original[slot] * scale, 500000.0f);
+        }
+    }
+}
+
+bool VehicleLodEnabled()
+{
+    return g_vehicle_full_detail || g_vehicle_draw_distance > 0.0f ||
+        std::fabs(g_vehicle_lod_threshold_scale - 1.0f) >= 0.001f || VehicleMinimumCullDistance() > 0.0f;
+}
+
+bool LodCategoryEnabled(int category)
+{
+    switch (category) {
+    case 0: return std::fabs(g_map_detail_lod_threshold_scale - 1.0f) >= 0.001f;
+    case 2: return VehicleLodEnabled();
+    default: return std::fabs(g_lod_engine_threshold_scale - 1.0f) >= 0.001f;
+    }
+}
+
+void ComputeLodTargets(int category, const float original[5], float target[5])
+{
+    if (category == 0) {
+        ScaleLodThresholds(original, target, g_map_detail_lod_threshold_scale);
+        return;
+    }
+    if (category != 2) {
+        ScaleLodThresholds(original, target, g_lod_engine_threshold_scale);
+        return;
+    }
+
+    // With full detail the scale would only move the cull; VehicleDrawDistance does that.
+    ScaleLodThresholds(original, target, g_vehicle_full_detail ? 1.0f : g_vehicle_lod_threshold_scale);
+    // Slot 3 (the mask-1 hull) holds the cull threshold: below it nothing is drawn.
+    float cull = target[3];
+    if (g_vehicle_draw_distance > 0.0f) {
+        cull = VehicleLodThresholdForDistance(g_vehicle_draw_distance);
+    }
+    const float minimum_cull = VehicleMinimumCullDistance();
+    if (minimum_cull > 0.0f) {
+        cull = std::min(cull, VehicleLodThresholdForDistance(minimum_cull));
+    }
+    target[3] = cull;
+    for (int slot = 0; slot < 3; ++slot) {
+        // Full detail: slot 0 (mask 4) matches everything that is drawn at all.
+        target[slot] = g_vehicle_full_detail ? cull : std::max(target[slot], cull);
+    }
+    target[4] = std::min(target[4], cull);
+}
+
+// Applies one LOD category and re-applies it whenever the game rewrites it: a graphics-settings
+// change (0x6FCC90 -> 0xBAB070) restores the preset, which shows up as values that differ from
+// the ones written last.
+void ApplyLodCategory(const ModuleRange& range, int category, const char* source)
+{
+    if (!LodCategoryEnabled(category) ||
         !IsRvaInRange(range, kEngineGetLodThresholdRva, 1) ||
         !IsRvaInRange(range, kEngineSetLodThresholdRva, 1)) {
         return;
@@ -833,171 +1019,83 @@ void ApplyMapDetailLodThresholds(const ModuleRange& range, const char* source)
         return;
     }
 
-    if (manager != g_map_lod_last_manager) {
-        g_map_lod_last_manager = manager;
-        g_map_lod_threshold_patch_applied = false;
-    }
-    if (g_map_lod_threshold_patch_applied) {
-        return;
-    }
-
     auto getter = reinterpret_cast<EngineGetLodThresholdFn>(range.base + kEngineGetLodThresholdRva);
     auto setter = reinterpret_cast<EngineSetLodThresholdFn>(range.base + kEngineSetLodThresholdRva);
-    constexpr int kStaticCategory = 0;
-    constexpr int kMasks[] = {4, 8, 16, 1, 2};
-    float original[5] = {};
-    float patched[5] = {};
+    LodCategoryState& state = g_lod_state[category];
+
+    float current[5] = {};
     bool have_value = false;
-
     for (int slot = 0; slot < 5; ++slot) {
-        if (!TryGetEngineLodThreshold(getter, manager, kStaticCategory, kMasks[slot], &original[slot])) {
+        if (!TryGetEngineLodThreshold(getter, manager, category, kLodSlotKeys[slot], &current[slot])) {
             return;
         }
-        float target = original[slot];
-        if (std::isfinite(target) && target > 0.0f) {
-            have_value = true;
-            target = std::min(target * g_map_detail_lod_threshold_scale, 500000.0f);
-        }
-        if (!TrySetEngineLodThreshold(setter, manager, kStaticCategory, kMasks[slot], target)) {
-            return;
-        }
-        patched[slot] = target;
+        have_value = have_value || (std::isfinite(current[slot]) && current[slot] > 0.0f);
     }
-
     if (!have_value) {
         return;
     }
+    if (state.applied && state.manager == manager && std::memcmp(current, state.written, sizeof(current)) == 0) {
+        return;
+    }
+
+    const bool reapply = state.applied;
+    // Per slot: a value we wrote keeps its stored preset value, anything else is a new preset
+    // value (the game writes the records one by one, so a check can land mid-rewrite).
+    float original[5] = {};
+    for (int slot = 0; slot < 5; ++slot) {
+        const bool ours = reapply && state.manager == manager && FloatBits(current[slot]) == FloatBits(state.written[slot]);
+        original[slot] = ours ? state.original[slot] : current[slot];
+    }
+    float target[5] = {};
+    ComputeLodTargets(category, original, target);
+    for (int slot = 0; slot < 5; ++slot) {
+        if (FloatBits(target[slot]) != FloatBits(current[slot]) &&
+            !TrySetEngineLodThreshold(setter, manager, category, kLodSlotKeys[slot], target[slot])) {
+            Log("LOD: setter failed category=%s slot=%d", kLodCategoryNames[category], slot);
+            return;
+        }
+    }
+    float after[5] = {};
+    for (int slot = 0; slot < 5; ++slot) {
+        if (!TryGetEngineLodThreshold(getter, manager, category, kLodSlotKeys[slot], &after[slot])) {
+            after[slot] = target[slot];
+        }
+    }
 
     MarkEngineLodThresholdsDirty(range);
-    Log(
-        "MapLOD: source=%s category=Static/0 scale=%.3f slots=[%.3f, %.3f, %.3f, %.3f, %.3f] -> [%.3f, %.3f, %.3f, %.3f, %.3f]",
-        source != nullptr ? source : "Loop",
-        static_cast<double>(g_map_detail_lod_threshold_scale),
-        static_cast<double>(original[0]), static_cast<double>(original[1]),
-        static_cast<double>(original[2]), static_cast<double>(original[3]), static_cast<double>(original[4]),
-        static_cast<double>(patched[0]), static_cast<double>(patched[1]),
-        static_cast<double>(patched[2]), static_cast<double>(patched[3]), static_cast<double>(patched[4])
-    );
-    g_map_lod_threshold_patch_applied = true;
+    std::memcpy(state.original, original, sizeof(original));
+    std::memcpy(state.written, after, sizeof(after));
+    state.manager = manager;
+    state.applied = true;
+    if (InterlockedIncrement(&state.log_count) <= 24) {
+        Log(
+            "LOD: %s category=%s/%d source=%s manager=0x%p T0..T4 (draw mask 4, 8, 16, 1, none) "
+            "[%.6g, %.6g, %.6g, %.6g, %.6g] -> [%.6g, %.6g, %.6g, %.6g, %.6g]",
+            reapply ? "re-applied after the game rewrote" : "applied",
+            kLodCategoryNames[category], category, source != nullptr ? source : "Loop", manager,
+            static_cast<double>(original[0]), static_cast<double>(original[1]), static_cast<double>(original[2]),
+            static_cast<double>(original[3]), static_cast<double>(original[4]),
+            static_cast<double>(after[0]), static_cast<double>(after[1]), static_cast<double>(after[2]),
+            static_cast<double>(after[3]), static_cast<double>(after[4])
+        );
+        if (category == 2) {
+            const float k = VehicleLodMetricConstant();
+            auto distance = [k](float threshold) {
+                return threshold > 0.0f ? 7.5 + std::sqrt(static_cast<double>(k / threshold)) : 0.0;
+            };
+            Log(
+                "LOD: Vehicle K=%.2f mid-size car: mask 4 to %.0f m, mask 8 to %.0f m, mask 16 to %.0f m, culled beyond %.0f m",
+                static_cast<double>(k), distance(after[0]), distance(after[1]), distance(after[2]), distance(after[3])
+            );
+        }
+    }
 }
 
-void ApplyEngineLodThresholds(const ModuleRange& range, const char* source)
+void ApplyLodThresholds(const ModuleRange& range, const char* source)
 {
-    if (std::fabs(g_lod_engine_threshold_scale - 1.0f) < 0.001f) {
-        return;
+    for (int category = 0; category < kLodCategoryCount; ++category) {
+        ApplyLodCategory(range, category, source);
     }
-
-    if (!IsRvaInRange(range, kEngineGetLodThresholdRva, 1) || !IsRvaInRange(range, kEngineSetLodThresholdRva, 1)) {
-        return;
-    }
-
-    void* manager = nullptr;
-    if (!ResolveEngineLodManager(range, &manager)) {
-        const LONG count = InterlockedIncrement(&g_lod_engine_log_count);
-        if (count <= 3) {
-            Log("LOD.Engine: manager not ready from %s", source != nullptr ? source : "Loop");
-        }
-        return;
-    }
-
-    if (manager != g_lod_engine_last_manager) {
-        g_lod_engine_last_manager = manager;
-        g_lod_engine_threshold_patch_applied = false;
-        Log("LOD.Engine: manager=0x%p from %s", manager, source != nullptr ? source : "Loop");
-    }
-
-    if (g_lod_engine_threshold_patch_applied) {
-        return;
-    }
-
-    auto getter = reinterpret_cast<EngineGetLodThresholdFn>(range.base + kEngineGetLodThresholdRva);
-    auto setter = reinterpret_cast<EngineSetLodThresholdFn>(range.base + kEngineSetLodThresholdRva);
-    // Preserves the verified original mapping: Vehicle, Ped, Driver, and the
-    // fourth native LOD bank. Do not substitute the static-world category here.
-    constexpr int kCategories[] = {1, 2, 3, 4};
-    constexpr int kMasks[] = {4, 8, 16, 1, 2};
-    float original[4][5] = {};
-    bool have_values = false;
-
-    for (int category_index = 0; category_index < 4; ++category_index) {
-        for (int slot_index = 0; slot_index < 5; ++slot_index) {
-            float value = 0.0f;
-            if (!TryGetEngineLodThreshold(getter, manager, kCategories[category_index], kMasks[slot_index], &value)) {
-                Log(
-                    "LOD.Engine: getter failed category=%d slot=%d mask=%d",
-                    kCategories[category_index],
-                    slot_index + 1,
-                    kMasks[slot_index]
-                );
-                return;
-            }
-            original[category_index][slot_index] = value;
-            if (std::isfinite(value) && value > 0.0f) {
-                have_values = true;
-            }
-        }
-    }
-
-    if (!have_values) {
-        Log("LOD.Engine: threshold matrix is empty, retrying later");
-        return;
-    }
-
-    for (int category_index = 0; category_index < 4; ++category_index) {
-        Log(
-            "LOD.Engine: original category=%d slots=[%.3f, %.3f, %.3f, %.3f, %.3f]",
-            kCategories[category_index],
-            static_cast<double>(original[category_index][0]),
-            static_cast<double>(original[category_index][1]),
-            static_cast<double>(original[category_index][2]),
-            static_cast<double>(original[category_index][3]),
-            static_cast<double>(original[category_index][4])
-        );
-    }
-
-    float patched[4][5] = {};
-    for (int category_index = 0; category_index < 4; ++category_index) {
-        for (int slot_index = 0; slot_index < 5; ++slot_index) {
-            const float current = original[category_index][slot_index];
-            float target = current;
-            if (std::isfinite(current) && current > 0.0f) {
-                target = std::min(current * g_lod_engine_threshold_scale, 500000.0f);
-            }
-
-            if (!TrySetEngineLodThreshold(setter, manager, kCategories[category_index], kMasks[slot_index], target)) {
-                Log(
-                    "LOD.Engine: setter failed category=%d slot=%d mask=%d target=%.3f",
-                    kCategories[category_index],
-                    slot_index + 1,
-                    kMasks[slot_index],
-                    static_cast<double>(target)
-                );
-                return;
-            }
-
-            float after = 0.0f;
-            if (TryGetEngineLodThreshold(getter, manager, kCategories[category_index], kMasks[slot_index], &after)) {
-                patched[category_index][slot_index] = after;
-            } else {
-                patched[category_index][slot_index] = target;
-            }
-        }
-    }
-
-    MarkEngineLodThresholdsDirty(range);
-    for (int category_index = 0; category_index < 4; ++category_index) {
-        Log(
-            "LOD.Engine: scaled category=%d scale=%.3f slots=[%.3f, %.3f, %.3f, %.3f, %.3f]",
-            kCategories[category_index],
-            static_cast<double>(g_lod_engine_threshold_scale),
-            static_cast<double>(patched[category_index][0]),
-            static_cast<double>(patched[category_index][1]),
-            static_cast<double>(patched[category_index][2]),
-            static_cast<double>(patched[category_index][3]),
-            static_cast<double>(patched[category_index][4])
-        );
-    }
-    g_lod_engine_threshold_patch_applied = true;
 }
 
 bool ResolveImposterManager(const ModuleRange& range, void** out_manager)
@@ -1453,110 +1551,8 @@ void __stdcall PatchMovieDrawArgs(std::uintptr_t entry_esp, void* movie_player)
     }
 }
 
-void TryApplyTrafficSpawnRadiusLuaPatch()
-{
-    if (g_traffic_spawn_distance_scale <= 1.001f || g_traffic_radius_patch_applied) {
-        return;
-    }
-
-    const LONG now = static_cast<LONG>(GetTickCount());
-    const LONG previous = g_traffic_radius_last_attempt_tick;
-    if (previous != 0 && static_cast<DWORD>(now - previous) < 1000) {
-        return;
-    }
-    if (InterlockedCompareExchange(&g_traffic_radius_last_attempt_tick, now, previous) != previous) {
-        return;
-    }
-
-    const LONG attempt = InterlockedIncrement(&g_traffic_radius_lua_attempt_count);
-
-    const ModuleRange range = GetExeRange();
-    if (!IsRvaInRange(range, kLuaStateRva, sizeof(void*)) ||
-        !IsRvaInRange(range, kLuaLoadStringRva, 1) ||
-        !IsRvaInRange(range, kLuaPCallRva, 1)) {
-        return;
-    }
-
-    auto** state_slot = reinterpret_cast<void**>(range.base + kLuaStateRva);
-    if (!IsReadableMemory(state_slot, sizeof(*state_slot)) || *state_slot == nullptr) {
-        return;
-    }
-
-    char script[3072] = {};
-    _snprintf_s(
-        script,
-        sizeof(script),
-        _TRUNCATE,
-        "local ok,result=pcall(function() "
-        "if __dsfTrafficRadiusPatched then return -1 end "
-        "if not atlas or not atlas.road then return 0 end "
-        "local seen={} local changed=0 "
-        "for _,road in next,atlas.road,nil do "
-        "pcall(function() local p=road.trafficParameters "
-        "if p and not seen[p] then seen[p]=true "
-        "local pin=p.pingInRadius local pout=p.pingOutRadius "
-        "if type(pin)=='number' and pin>0 then p.pingInRadius=pin*%.6f changed=changed+1 end "
-        "if type(pout)=='number' and pout>0 then p.pingOutRadius=pout*%.6f end "
-        "end end) end "
-        "if changed>0 then __dsfTrafficRadiusPatched=changed end return changed "
-        "end) if ok then return result or 0 else return -2 end",
-        static_cast<double>(g_traffic_spawn_distance_scale),
-        static_cast<double>(g_traffic_spawn_distance_scale)
-    );
-
-    auto load_string = reinterpret_cast<LuaLoadStringFn>(range.base + kLuaLoadStringRva);
-    auto pcall = reinterpret_cast<LuaPCallFn>(range.base + kLuaPCallRva);
-    int load_status = -1;
-    int call_status = -1;
-    __try {
-        void* state = *state_slot;
-        load_status = load_string(state, script);
-        if (load_status == 0) {
-            call_status = pcall(state, 0, 1, 0);
-        }
-    } __except (EXCEPTION_EXECUTE_HANDLER) {
-        Log("TrafficRadius: Lua dispatch raised a native exception");
-        return;
-    }
-
-    float changed_count = -999.0f;
-    if (load_status == 0 && call_status == 0) {
-        auto* state = static_cast<std::uint8_t*>(*state_slot);
-        if (IsReadableMemory(state + 0x08, sizeof(void*))) {
-            auto** top_slot = reinterpret_cast<std::uint8_t**>(state + 0x08);
-            auto* top = *top_slot;
-            if (top != nullptr && IsReadableMemory(top - 8, 8)) {
-                const int type = *reinterpret_cast<int*>(top - 4);
-                if (type == 3) {
-                    changed_count = *reinterpret_cast<float*>(top - 8);
-                }
-                *top_slot = top - 8;
-            }
-        }
-    }
-
-    if (changed_count > 0.0f || changed_count == -1.0f) {
-        g_traffic_radius_patch_applied = true;
-    }
-
-    if (!g_traffic_radius_lua_executed || load_status != 0 || call_status != 0 || changed_count != 0.0f) {
-        Log(
-            "TrafficRadius: Lua dispatch attempt=%ld scale=%.3f load=%d call=%d changed=%.0f applied=%d",
-            static_cast<long>(attempt),
-            static_cast<double>(g_traffic_spawn_distance_scale),
-            load_status,
-            call_status,
-            static_cast<double>(changed_count),
-            g_traffic_radius_patch_applied ? 1 : 0
-        );
-        g_traffic_radius_lua_executed = load_status == 0 && call_status == 0;
-    }
-}
-
 bool AutoAcknowledgeUbisoftServerLostPrompt(void* message_page)
 {
-    TryApplyTrafficSpawnRadiusLuaPatch();
-
     if (!g_suppress_ubisoft_server_lost_prompt || message_page == nullptr) {
         return false;
     }
@@ -1718,27 +1714,16 @@ void WINAPI ProxyBinkClose(void* handle)
     }
 }
 
-HRESULT STDMETHODCALLTYPE ProxyDrawIndexedPrimitive(
+HRESULT STDMETHODCALLTYPE ProxyPresent(
     IDirect3DDevice9* device,
-    D3DPRIMITIVETYPE primitive_type,
-    INT base_vertex_index,
-    UINT min_vertex_index,
-    UINT num_vertices,
-    UINT start_index,
-    UINT primitive_count
+    const RECT* source_rect,
+    const RECT* dest_rect,
+    HWND dest_window,
+    const RGNDATA* dirty_region
 )
 {
-    TryApplyTrafficSpawnRadiusLuaPatch();
-
-    return g_real_draw_indexed_primitive(
-        device,
-        primitive_type,
-        base_vertex_index,
-        min_vertex_index,
-        num_vertices,
-        start_index,
-        primitive_count
-    );
+    InterlockedIncrement(&g_present_count);
+    return g_real_present(device, source_rect, dest_rect, dest_window, dirty_region);
 }
 
 HRESULT STDMETHODCALLTYPE ProxySetPixelShaderConstantF(
@@ -2034,7 +2019,7 @@ void HookDeviceMethods(IDirect3DDevice9* device)
 
     void* reset_replacement = reinterpret_cast<void*>(&ProxyReset);
     void* set_sampler_state_replacement = reinterpret_cast<void*>(&ProxySetSamplerState);
-    void* draw_indexed_primitive_replacement = reinterpret_cast<void*>(&ProxyDrawIndexedPrimitive);
+    void* present_replacement = reinterpret_cast<void*>(&ProxyPresent);
     void* set_pixel_shader_constant_f_replacement = reinterpret_cast<void*>(&ProxySetPixelShaderConstantF);
 
     if (vtable != nullptr && vtable[16] == reset_replacement) {
@@ -2055,9 +2040,11 @@ void HookDeviceMethods(IDirect3DDevice9* device)
         ApplySamplerQuality(device, "CreateDevice");
     }
 
-    void* original_draw_indexed_primitive = nullptr;
-    if (HookDeviceVTable(vtable, 82, draw_indexed_primitive_replacement, &original_draw_indexed_primitive, "DrawIndexedPrimitive")) {
-        g_real_draw_indexed_primitive = reinterpret_cast<DrawIndexedPrimitiveFn>(original_draw_indexed_primitive);
+    // Present only counts frames for TrafficDiagnostics.
+    void* original_present = nullptr;
+    if (g_traffic_diagnostics &&
+        HookDeviceVTable(vtable, 17, present_replacement, &original_present, "Present")) {
+        g_real_present = reinterpret_cast<PresentFn>(original_present);
     }
 
     void* original_set_pixel_shader_constant_f = nullptr;
@@ -2269,7 +2256,7 @@ void ApplyStartupPatches(const ModuleRange& range)
 
 void ApplyUbisoftServerLostPromptPatch(const ModuleRange& range)
 {
-    if (!g_suppress_ubisoft_server_lost_prompt && g_traffic_spawn_distance_scale <= 1.001f) {
+    if (!g_suppress_ubisoft_server_lost_prompt) {
         return;
     }
 
@@ -2303,7 +2290,7 @@ void ApplyUbisoftServerLostPromptPatch(const ModuleRange& range)
 
     if (WriteMemory(target, patch, sizeof(patch))) {
         Log(
-            "Startup: installed frontend update hook for server-prompt and traffic-radius patches at RVA 0x%08lX",
+            "Startup: installed frontend update hook for the server-prompt patch at RVA 0x%08lX",
             static_cast<unsigned long>(kErrorMessageUpdateRva)
         );
     } else {
@@ -2330,6 +2317,185 @@ void PatchBinkImports(const ModuleRange& range)
         Log("Bink: failed to patch BinkClose");
     }
 
+}
+
+// Plan A: the radius loads read plugin-owned floats (the shared 350/256 constants stay), and
+// 0x7723A0's cell list moves to a buffer large enough for the bigger square. Without the buffer
+// a radius above ~360 m overflows the 21-entry stack array (see kTrafficCellWriteRva).
+alignas(16) std::int32_t g_traffic_cell_buffer[kTrafficCellCapacity * 2] = {};
+float g_traffic_radius_value = kTrafficStockRadius;
+float g_traffic_split_radius_value = kTrafficStockSplitRadius;
+
+void ApplyTrafficRadiusPatch(const ModuleRange& range)
+{
+    if (g_traffic_spawn_radius <= kTrafficStockRadius + 0.5f) {
+        return;
+    }
+
+    struct Site
+    {
+        DWORD rva;
+        std::uint8_t expected[8];
+        size_t size;
+    };
+    const DWORD radius_constant = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(range.base) + kTrafficRadiusConstantRva);
+    const DWORD split_constant = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(range.base) + kTrafficRadiusSplitConstantRva);
+    Site sites[] = {
+        {kTrafficCellWriteRva, {0x8D, 0x84, 0xC4, 0xBC, 0x00, 0x00, 0x00}, 7},
+        {kTrafficCellSortEndRva, {0x8D, 0x84, 0xC4, 0xC4, 0x00, 0x00, 0x00}, 7},
+        {kTrafficCellSortBeginRva, {0x8D, 0x94, 0x24, 0xC4, 0x00, 0x00, 0x00}, 7},
+        {kTrafficCellLoopBeginRva, {0x8D, 0xBC, 0x24, 0xD0, 0x00, 0x00, 0x00}, 7},
+        {kTrafficCellLoopEndRva, {0x8D, 0x84, 0xC4, 0xD0, 0x00, 0x00, 0x00}, 7},
+        {kTrafficRadiusLoadRva, {0xF3, 0x0F, 0x10, 0x05, 0, 0, 0, 0}, 8},
+        {kTrafficRadiusSplitLoadRva, {0xF3, 0x0F, 0x10, 0x05, 0, 0, 0, 0}, 8},
+    };
+    std::memcpy(&sites[5].expected[4], &radius_constant, 4);
+    std::memcpy(&sites[6].expected[4], &split_constant, 4);
+
+    for (const Site& site : sites) {
+        if (!IsRvaInRange(range, site.rva, site.size) ||
+            std::memcmp(range.base + site.rva, site.expected, site.size) != 0) {
+            const std::uint8_t* bytes = IsRvaInRange(range, site.rva, 8) ? range.base + site.rva : nullptr;
+            Log(
+                "TrafficRadius: unexpected bytes at RVA 0x%08lX (%02X %02X %02X %02X %02X %02X %02X %02X); radius stays %.0f m",
+                static_cast<unsigned long>(site.rva),
+                bytes ? bytes[0] : 0, bytes ? bytes[1] : 0, bytes ? bytes[2] : 0, bytes ? bytes[3] : 0,
+                bytes ? bytes[4] : 0, bytes ? bytes[5] : 0, bytes ? bytes[6] : 0, bytes ? bytes[7] : 0,
+                static_cast<double>(kTrafficStockRadius)
+            );
+            return;
+        }
+    }
+
+    g_traffic_radius_value = g_traffic_spawn_radius;
+    g_traffic_split_radius_value = g_traffic_spawn_radius * (kTrafficStockSplitRadius / kTrafficStockRadius);
+    const DWORD buffer = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(g_traffic_cell_buffer));
+    const DWORD radius = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(&g_traffic_radius_value));
+    const DWORD split_radius = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(&g_traffic_split_radius_value));
+
+    // Cell list first, so the larger radius never runs with the stack array.
+    std::uint8_t lea_scaled[7] = {0x8D, 0x04, 0xC5, 0, 0, 0, 0};   // lea eax,[eax*8+buffer]
+    std::memcpy(&lea_scaled[3], &buffer, 4);
+    std::uint8_t mov_edx[7] = {0xBA, 0, 0, 0, 0, 0x66, 0x90};       // mov edx,buffer
+    std::memcpy(&mov_edx[1], &buffer, 4);
+    std::uint8_t mov_edi[7] = {0xBF, 0, 0, 0, 0, 0x66, 0x90};       // mov edi,buffer
+    std::memcpy(&mov_edi[1], &buffer, 4);
+    bool ok =
+        WriteMemory(range.base + kTrafficCellWriteRva, lea_scaled, sizeof(lea_scaled)) &&
+        WriteMemory(range.base + kTrafficCellSortEndRva, lea_scaled, sizeof(lea_scaled)) &&
+        WriteMemory(range.base + kTrafficCellSortBeginRva, mov_edx, sizeof(mov_edx)) &&
+        WriteMemory(range.base + kTrafficCellLoopBeginRva, mov_edi, sizeof(mov_edi)) &&
+        WriteMemory(range.base + kTrafficCellLoopEndRva, lea_scaled, sizeof(lea_scaled));
+    ok = ok &&
+        WriteMemory(range.base + kTrafficRadiusLoadRva + 4, &radius, sizeof(radius)) &&
+        WriteMemory(range.base + kTrafficRadiusSplitLoadRva + 4, &split_radius, sizeof(split_radius));
+    g_traffic_radius_patch_applied = ok;
+    Log(
+        "TrafficRadius: %s road radius %.0f m (split %.0f m), cell list at 0x%p for %d cells",
+        ok ? "patched" : "FAILED to patch",
+        static_cast<double>(g_traffic_radius_value),
+        static_cast<double>(g_traffic_split_radius_value),
+        static_cast<void*>(g_traffic_cell_buffer),
+        kTrafficCellCapacity
+    );
+}
+
+void ApplyDrlFlareCurves(const ModuleRange& range)
+{
+    bool any = false;
+    for (const FlareCurve& curve : g_drl_flare_curves) {
+        any = any || curve.enabled;
+    }
+    if (!any || !IsRvaInRange(range, kDrlFlareTableRva, 0x60)) {
+        return;
+    }
+
+    auto* table = reinterpret_cast<float*>(range.base + kDrlFlareTableRva);
+    if (!IsReadableMemory(table, 0x60)) {
+        return;
+    }
+    // Zero until the game's static initialiser has filled it.
+    bool initialised = false;
+    for (int i = 0; i < 24; ++i) {
+        initialised = initialised || table[i] != 0.0f;
+    }
+    if (!initialised) {
+        return;
+    }
+
+    for (int attr = 0; attr < 3; ++attr) {
+        const FlareCurve& curve = g_drl_flare_curves[attr];
+        if (!curve.enabled) {
+            continue;
+        }
+        float before_d[3];
+        float before_v[3];
+        bool differs = false;
+        for (int point = 0; point < 3; ++point) {
+            const float* d = table + point * 4 + attr;
+            const float* v = table + (3 + point) * 4 + attr;
+            before_d[point] = *d;
+            before_v[point] = *v;
+            differs = differs || *d != curve.distances[point] || *v != curve.values[point];
+        }
+        if (!differs) {
+            continue;
+        }
+        for (int point = 0; point < 3; ++point) {
+            WriteMemory(table + point * 4 + attr, &curve.distances[point], sizeof(float));
+            WriteMemory(table + (3 + point) * 4 + attr, &curve.values[point], sizeof(float));
+        }
+        Log(
+            "Lights: %s {%.4g, %.4g, %.4g}:{%.4g, %.4g, %.4g} -> {%.4g, %.4g, %.4g}:{%.4g, %.4g, %.4g}%s",
+            kFlareAttributeKeys[attr],
+            static_cast<double>(before_d[0]), static_cast<double>(before_d[1]), static_cast<double>(before_d[2]),
+            static_cast<double>(before_v[0]), static_cast<double>(before_v[1]), static_cast<double>(before_v[2]),
+            static_cast<double>(curve.distances[0]), static_cast<double>(curve.distances[1]), static_cast<double>(curve.distances[2]),
+            static_cast<double>(curve.values[0]), static_cast<double>(curve.values[1]), static_cast<double>(curve.values[2]),
+            g_drl_flares_written ? " (re-applied)" : ""
+        );
+    }
+    g_drl_flares_written = true;
+}
+
+void LogTrafficDiagnostics(const ModuleRange& range)
+{
+    static DWORD last_tick = 0;
+    static LONG last_presents = 0;
+    if (!g_traffic_diagnostics) {
+        return;
+    }
+    const DWORD now = GetTickCount();
+    if (last_tick != 0 && now - last_tick < 2000) {
+        return;
+    }
+    const LONG presents = g_present_count;
+    const double fps = last_tick != 0 ? (presents - last_presents) * 1000.0 / static_cast<double>(now - last_tick) : 0.0;
+    last_tick = now;
+    last_presents = presents;
+
+    std::uint8_t* engine = nullptr;
+    if (!ResolveEngineInstance(range, &engine) || !IsReadableMemory(engine + 0x758, sizeof(void*))) {
+        return;
+    }
+    auto* manager = *reinterpret_cast<std::uint8_t**>(engine + 0x758);
+    if (manager == nullptr || !IsReadableMemory(manager + kTrafficVehicleCountOffset, sizeof(DWORD)) ||
+        !IsReadableMemory(manager + kTrafficActiveNodeCountOffset, sizeof(DWORD)) ||
+        !IsReadableMemory(manager + kTrafficActiveLaneCountOffset, sizeof(DWORD)) ||
+        !IsReadableMemory(manager + kTrafficWantedCountOffset, sizeof(DWORD)) ||
+        !IsReadableMemory(manager + 0x5ca84c, 1)) {
+        return;
+    }
+    Log(
+        "TrafficDiag: fps=%.1f radius=%.0f enabled=%u wantedRoads=%lu activeRoads=%lu activeLanes=%lu vehicles=%lu",
+        fps,
+        static_cast<double>(g_traffic_radius_patch_applied ? g_traffic_radius_value : kTrafficStockRadius),
+        static_cast<unsigned>(manager[0x5ca84c]),
+        static_cast<unsigned long>(*reinterpret_cast<DWORD*>(manager + kTrafficWantedCountOffset)),
+        static_cast<unsigned long>(*reinterpret_cast<DWORD*>(manager + kTrafficActiveNodeCountOffset)),
+        static_cast<unsigned long>(*reinterpret_cast<DWORD*>(manager + kTrafficActiveLaneCountOffset)),
+        static_cast<unsigned long>(*reinterpret_cast<DWORD*>(manager + kTrafficVehicleCountOffset))
+    );
 }
 
 void ApplyPatches()
@@ -2370,26 +2536,41 @@ void ApplyPatches()
     ApplyMovieDrawPatch(exe);
     ApplyAspectConstantPatch(exe, "Init");
     ApplyGlobalFovScalarPatch(exe, "Init");
-    Log("Config: MapDetailLODThresholdScale=%.3f TrafficSpawnDistanceScale=%.3f",
+    ApplyTrafficRadiusPatch(exe);
+    Log(
+        "Config: MapDetailLODThresholdScale=%.3f VehicleLODThresholdScale=%.3f VehicleFullDetail=%d VehicleDrawDistance=%.0f TrafficSpawnRadius=%.0f TrafficDiagnostics=%d DRLFlares=%d/%d/%d",
         static_cast<double>(g_map_detail_lod_threshold_scale),
-        static_cast<double>(g_traffic_spawn_distance_scale));
+        static_cast<double>(g_vehicle_lod_threshold_scale),
+        g_vehicle_full_detail ? 1 : 0,
+        static_cast<double>(g_vehicle_draw_distance),
+        static_cast<double>(g_traffic_spawn_radius),
+        g_traffic_diagnostics ? 1 : 0,
+        g_drl_flare_curves[0].enabled ? 1 : 0,
+        g_drl_flare_curves[1].enabled ? 1 : 0,
+        g_drl_flare_curves[2].enabled ? 1 : 0
+    );
 }
 
 DWORD WINAPI InitThread(LPVOID)
 {
     LoadConfig();
     ApplyPatches();
-    for (;;) {
+    for (unsigned tick = 0;; ++tick) {
         const ModuleRange exe = GetExeRange();
-        ApplyAspectConstantPatch(exe, "Loop");
-        ApplyGlobalFovScalarPatch(exe, "Loop");
-        ApplyMapDetailLodThresholds(exe, "Loop");
-        ApplyEngineLodThresholds(exe, "Loop");
-        ApplyImposterDrawDistancePatch(exe, "Loop");
-        ApplyInterestingVehiclePatch(exe, "Loop");
-        ApplyTrafficVehiclePoolPreload(exe, "Loop");
-        ApplyTrafficRuntimePatches(exe, "Loop");
-        Sleep(1000);
+        // LOD thresholds and flare curves are re-checked every 250 ms, so a graphics-settings
+        // change (which restores the preset) is undone at once; the rest runs once a second.
+        ApplyLodThresholds(exe, "Loop");
+        ApplyDrlFlareCurves(exe);
+        LogTrafficDiagnostics(exe);
+        if (tick % 4 == 0) {
+            ApplyAspectConstantPatch(exe, "Loop");
+            ApplyGlobalFovScalarPatch(exe, "Loop");
+            ApplyImposterDrawDistancePatch(exe, "Loop");
+            ApplyInterestingVehiclePatch(exe, "Loop");
+            ApplyTrafficVehiclePoolPreload(exe, "Loop");
+            ApplyTrafficRuntimePatches(exe, "Loop");
+        }
+        Sleep(250);
     }
     return 0;
 }
