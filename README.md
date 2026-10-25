@@ -1,4 +1,4 @@
-﻿# DSF Enhanced
+# DSF Enhanced
 
 An ASI plugin for Driver: San Francisco on PC. Target exe version 1.04
 
@@ -10,6 +10,7 @@ An ASI plugin for Driver: San Francisco on PC. Target exe version 1.04
 - Forces anisotropic and trilinear texture filtering. It also has mip and LOD-bias settings.
 - Draws traffic cars at full detail out to their draw distance, raises other gameplay LOD thresholds, and lets you extend how far away civilian traffic spawns.
 - Shrinks the distant brake and position lamp flares to small dots.
+- In the garage's vehicles screen, Up/Down move through an open maker's cars as Left/Right do.
 - Skips the legal-screen wait and dismisses the prompt about Ubisoft's servers, which no longer exist.
 
 ## Install

@@ -43,6 +43,7 @@ float g_traffic_candidate_window_scale = 1.0f;
 float g_traffic_spawn_interval_scale = 1.0f;
 bool g_skip_legal_screen = true;
 bool g_suppress_ubisoft_server_lost_prompt = true;
+bool g_vertical_car_list = true;
 float g_target_aspect = 0.0f;
 float g_fov_scalar = 0.0f;
 float g_current_aspect = 16.0f / 9.0f;
@@ -341,6 +342,7 @@ void LoadConfig()
     g_traffic_spawn_interval_scale = std::max(0.05f, std::min(g_traffic_spawn_interval_scale, 1.0f));
     g_skip_legal_screen = GetPrivateProfileIntA("Startup", "SkipLegalScreen", 1, ini_path) != 0;
     g_suppress_ubisoft_server_lost_prompt = GetPrivateProfileIntA("Startup", "SuppressUbisoftServerLostPrompt", 1, ini_path) != 0;
+    g_vertical_car_list = GetPrivateProfileIntA("Garage", "VerticalCarList", 1, ini_path) != 0;
     LoadFlareConfig(ini_path);
 }
 
@@ -2584,6 +2586,150 @@ void LogTrafficDiagnostics(const ModuleRange& range)
     );
 }
 
+// Garage vehicles screen: Up/Down move through an open maker's car list.
+//
+// The vehicles screen lists makers top to bottom (Up/Down); Enter opens the
+// maker's cars as a row of cards that Left/Right scroll, and there Up/Down only
+// move the focus between the card row and the BACK button (Esc does the same as
+// BACK). With VerticalCarList=1, while that card browser shows vehicles, Down
+// acts as Right (next car) and Up as Left (previous car).
+//
+// Menu input (reverse_engineering/driver_sf/garage_vertical_car_list.md): the
+// game's menu-input object (vtable 0xE280D0) holds per player (2, stride 0x158,
+// from +0x10) one {float value, int state} entry per MmDk menu key, filled once a
+// frame (FUN_00719940: state 0xFF pressed, 1 held, 0xFE released, 0 idle). Its
+// slot 3 (FUN_00719B50, thiscall menu, arg; ret 8) copies them into one menu's key
+// table and runs the key handlers. Keys 0..3 are Up, Down, Right, Left (as the
+// arrow keys map in FUN_00719650). The hook swaps the vertical entries into the
+// horizontal ones for that one call and puts them back afterwards, so other menus
+// updated in the same frame see the real keys.
+constexpr DWORD kMenuInputUpdateSlotRva = 0x00A280DC;  // vtable 0x00E280D0 + 0x0C
+constexpr DWORD kMenuInputUpdateRva = 0x00319B50;      // FUN_00719B50
+constexpr DWORD kMenuFindVariableRva = 0x006CBE20;     // FUN_00ACBE20, MmDk menu script variable lookup
+constexpr DWORD kMenuInputKeysOffset = 0x10;
+constexpr DWORD kMenuInputPlayerStride = 0x158;
+constexpr int kMenuKeyUp = 0, kMenuKeyDown = 1, kMenuKeyRight = 2, kMenuKeyLeft = 3;
+constexpr char kCarBrowserPage[] = "ItemBrowser";      // the card browser page of menusmaster.sp
+
+struct MenuKeyInput
+{
+    float value;
+    int state;
+};
+
+using MenuInputUpdateFn = char (__fastcall*)(void* input, void* edx, void* menu, int arg);
+MenuInputUpdateFn g_menu_input_update = nullptr;
+std::uint8_t* g_exe_base = nullptr;
+volatile LONG g_vertical_car_list_log_count = 0;
+
+// Name of the page on top of an MmDk menu's page stack (entries of 8 bytes at
+// +0x1C0, count at +0x1CC, FUN_00AB9440; an entry's first word is the page, a
+// page's first word its name), or "".
+const char* MenuTopPageName(std::uint8_t* menu)
+{
+    if (!IsReadableMemory(menu + 0x1C0, 0x10)) {
+        return "";
+    }
+    const int depth = *reinterpret_cast<int*>(menu + 0x1CC);
+    auto* stack = *reinterpret_cast<std::uint8_t**>(menu + 0x1C0);
+    if (depth <= 0 || depth > 64 || !IsReadableMemory(stack + (depth - 1) * 8, 4)) {
+        return "";
+    }
+    auto* page = *reinterpret_cast<std::uint8_t**>(stack + (depth - 1) * 8);
+    if (!IsReadableMemory(page, 4)) {
+        return "";
+    }
+    const char* name = *reinterpret_cast<const char**>(page);
+    return IsReadableMemory(name, sizeof(kCarBrowserPage)) ? name : "";
+}
+
+// The card browser page also shows the abilities and challenges lists; the
+// menu script's variable startPageSelected says which (2 or 3: vehicles, as the
+// garage hub FUN_0070E7D0 reads it). Variables: FUN_00ACBE20, thiscall on
+// menu + 0x50 (name, info out) -> int*.
+bool VehicleCardBrowserOpen(std::uint8_t* menu)
+{
+    if (g_exe_base == nullptr || std::strcmp(MenuTopPageName(menu), kCarBrowserPage) != 0) {
+        return false;
+    }
+    static std::uint8_t* var_menu = nullptr;
+    static int* page_var = nullptr;
+    if (var_menu != menu) {
+        using FindVarFn = int* (__fastcall*)(void* vars, void* edx, const char* name, int* info);
+        auto find_var = reinterpret_cast<FindVarFn>(g_exe_base + kMenuFindVariableRva);
+        var_menu = menu;
+        page_var = find_var(menu + 0x50, nullptr, "startPageSelected", nullptr);
+    }
+    return page_var != nullptr && (*page_var == 2 || *page_var == 3);
+}
+
+char __fastcall ProxyMenuInputUpdate(std::uint8_t* input, void* edx, std::uint8_t* menu, int arg)
+{
+    if (!g_vertical_car_list || menu == nullptr || !VehicleCardBrowserOpen(menu)) {
+        return g_menu_input_update(input, edx, menu, arg);
+    }
+
+    MenuKeyInput saved[2][4];
+    bool moved = false;
+    for (int player = 0; player < 2; ++player) {
+        auto* keys = reinterpret_cast<MenuKeyInput*>(input + kMenuInputKeysOffset + player * kMenuInputPlayerStride);
+        std::memcpy(saved[player], keys, sizeof(saved[player]));
+        if (keys[kMenuKeyDown].state != 0 && keys[kMenuKeyRight].state == 0) {
+            keys[kMenuKeyRight] = keys[kMenuKeyDown];
+            moved = true;
+        }
+        if (keys[kMenuKeyUp].state != 0 && keys[kMenuKeyLeft].state == 0) {
+            keys[kMenuKeyLeft] = keys[kMenuKeyUp];
+            moved = true;
+        }
+        keys[kMenuKeyUp] = MenuKeyInput{};
+        keys[kMenuKeyDown] = MenuKeyInput{};
+    }
+    if (moved && InterlockedIncrement(&g_vertical_car_list_log_count) <= 4) {
+        Log("Garage: Up/Down in the vehicles card browser sent as Left/Right");
+    }
+
+    const char result = g_menu_input_update(input, edx, menu, arg);
+    for (int player = 0; player < 2; ++player) {
+        auto* keys = reinterpret_cast<MenuKeyInput*>(input + kMenuInputKeysOffset + player * kMenuInputPlayerStride);
+        std::memcpy(keys, saved[player], sizeof(saved[player]));
+    }
+    return result;
+}
+
+void ApplyVerticalCarListPatch(const ModuleRange& range)
+{
+    if (!g_vertical_car_list) {
+        return;
+    }
+    if (!IsRvaInRange(range, kMenuInputUpdateSlotRva, 4) || !IsRvaInRange(range, kMenuFindVariableRva, 16)) {
+        Log("Garage: menu input vtable slot RVA 0x%08lX is outside the loaded image",
+            static_cast<unsigned long>(kMenuInputUpdateSlotRva));
+        return;
+    }
+
+    auto* slot = reinterpret_cast<std::uint8_t**>(range.base + kMenuInputUpdateSlotRva);
+    auto* expected = range.base + kMenuInputUpdateRva;
+    if (*slot == reinterpret_cast<std::uint8_t*>(&ProxyMenuInputUpdate)) {
+        return;
+    }
+    if (*slot != expected) {
+        Log("Garage: menu input update slot holds 0x%p, expected 0x%p; vertical car list not installed", *slot, expected);
+        return;
+    }
+
+    g_exe_base = range.base;
+    g_menu_input_update = reinterpret_cast<MenuInputUpdateFn>(expected);
+    void* replacement = reinterpret_cast<void*>(&ProxyMenuInputUpdate);
+    if (WriteMemory(slot, &replacement, sizeof(replacement))) {
+        Log("Garage: Up/Down move through an open maker's car list (menu input slot RVA 0x%08lX)",
+            static_cast<unsigned long>(kMenuInputUpdateSlotRva));
+    } else {
+        Log("Garage: failed to install the vertical car list hook");
+        g_menu_input_update = nullptr;
+    }
+}
+
 void ApplyPatches()
 {
     const ModuleRange exe = GetExeRange();
@@ -2619,6 +2765,7 @@ void ApplyPatches()
     PatchBinkImports(exe);
     ApplyStartupPatches(exe);
     ApplyUbisoftServerLostPromptPatch(exe);
+    ApplyVerticalCarListPatch(exe);
     ApplyMovieDrawPatch(exe);
     ApplyAspectConstantPatch(exe, "Init");
     ApplyGlobalFovScalarPatch(exe, "Init");
