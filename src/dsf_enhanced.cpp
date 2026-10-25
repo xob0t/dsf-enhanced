@@ -59,6 +59,10 @@ constexpr DWORD kAspect16x9Rva = 0x009E50B0;
 constexpr DWORD kGlobalFovScalarRva = 0x009D9A80;
 constexpr DWORD kMovieDrawRva = 0x0036C5D0;
 constexpr DWORD kLegalScreenWaitBranchRva = 0x00399C4A;
+constexpr DWORD kLegalScreenBeginLoadingCallRva = 0x00399C92;   // call 0x4A20C0 when the legal screen ends
+constexpr DWORD kLoadingScreenBeginRva = 0x000A20C0;
+constexpr DWORD kPendingResourceReferenceClearRva = 0x000A2153; // mov dword [0x188A6B8],0
+constexpr DWORD kPendingResourceReferenceCountRva = 0x0148A6B8; // resource manager 0x1732BF0 + 0x157AC8
 constexpr DWORD kErrorMessageUpdateRva = 0x0032AD80;
 constexpr DWORD kEngineSingletonRva = 0x00BE7228;
 constexpr DWORD kLodDirtyFlagRva = 0x00D8D6E0;
@@ -2213,6 +2217,52 @@ bool ApplyMovieDrawPatch(const ModuleRange& range)
     return true;
 }
 
+// When the legal screen ends, state 4 calls the loading screen's begin function 0x4A20C0, which
+// ends by clearing the resource manager's list of unresolved resource references (count at
+// 0x188A6B8: mov dword [0x188A6B8],0 at 0x4A2153). After the stock 5 s wait the startup packages
+// have finished loading and the list is empty. Without the wait the call comes a frame after the
+// legal screen appears, while startup packages are still being fixed up, and the clear drops up
+// to a few hundred references that are still waiting for their resources. The engine never
+// resolves those slots, and the world load later faults on the corrupted reference lists
+// (0xBAE85A, 0xBAE8BE, 0xBAEBB2). So the skip keeps the list across that one call; every other
+// loading screen still clears it.
+volatile LONG g_keep_pending_resource_references = 0;
+DWORD* g_pending_resource_reference_count = nullptr;
+DWORD g_kept_pending_resource_references = 0;
+using LoadingScreenBeginFn = void (__thiscall*)(void*);
+LoadingScreenBeginFn g_real_loading_screen_begin = nullptr;
+
+__declspec(naked) void ProxyClearPendingResourceReferences()
+{
+    __asm {
+        push eax
+        mov eax, dword ptr [g_pending_resource_reference_count]
+        cmp dword ptr [g_keep_pending_resource_references], 0
+        jne keep
+        mov dword ptr [eax], 0
+        pop eax
+        ret
+
+    keep:
+        mov eax, dword ptr [eax]
+        mov dword ptr [g_kept_pending_resource_references], eax
+        pop eax
+        ret
+    }
+}
+
+void __fastcall ProxyLegalScreenBeginLoading(void* loading_screen)
+{
+    g_kept_pending_resource_references = 0;
+    InterlockedExchange(&g_keep_pending_resource_references, 1);
+    g_real_loading_screen_begin(loading_screen);
+    InterlockedExchange(&g_keep_pending_resource_references, 0);
+    Log(
+        "Startup: legal screen skipped; kept %lu pending resource references",
+        static_cast<unsigned long>(g_kept_pending_resource_references)
+    );
+}
+
 void ApplyStartupPatches(const ModuleRange& range)
 {
     if (!g_skip_legal_screen) {
@@ -2224,9 +2274,18 @@ void ApplyStartupPatches(const ModuleRange& range)
     // setup and teardown without rewriting the widely shared 5.0f constant.
     constexpr std::uint8_t expected[] = { 0x0F, 0x82, 0x89, 0x00, 0x00, 0x00 };
     constexpr std::uint8_t patch[] = { 0x90, 0x90, 0x90, 0x90, 0x90, 0x90 };
+    // call 0x4A20C0 (begin loading) at the end of state 4, and the list clear inside it.
+    std::uint8_t expected_call[5] = { 0xE8 };
+    const std::int32_t call_relative = static_cast<std::int32_t>(kLoadingScreenBeginRva - (kLegalScreenBeginLoadingCallRva + 5));
+    std::memcpy(&expected_call[1], &call_relative, sizeof(call_relative));
+    std::uint8_t expected_clear[10] = { 0xC7, 0x05 };
+    const DWORD count_address = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(range.base) + kPendingResourceReferenceCountRva);
+    std::memcpy(&expected_clear[2], &count_address, sizeof(count_address));
 
-    if (!IsRvaInRange(range, kLegalScreenWaitBranchRva, sizeof(patch))) {
-        Log("Startup: legal screen wait branch RVA 0x%08lX is outside the loaded image", static_cast<unsigned long>(kLegalScreenWaitBranchRva));
+    if (!IsRvaInRange(range, kLegalScreenWaitBranchRva, sizeof(patch)) ||
+        !IsRvaInRange(range, kLegalScreenBeginLoadingCallRva, sizeof(expected_call)) ||
+        !IsRvaInRange(range, kPendingResourceReferenceClearRva, sizeof(expected_clear))) {
+        Log("Startup: legal screen patch sites are outside the loaded image");
         return;
     }
 
@@ -2235,21 +2294,48 @@ void ApplyStartupPatches(const ModuleRange& range)
         return;
     }
 
-    if (std::memcmp(target, expected, sizeof(expected)) != 0) {
+    auto* call_site = range.base + kLegalScreenBeginLoadingCallRva;
+    auto* clear_site = range.base + kPendingResourceReferenceClearRva;
+    if (std::memcmp(target, expected, sizeof(expected)) != 0 ||
+        std::memcmp(call_site, expected_call, sizeof(expected_call)) != 0 ||
+        std::memcmp(clear_site, expected_clear, sizeof(expected_clear)) != 0) {
         Log(
-            "Startup: legal screen wait branch mismatch at RVA 0x%08lX bytes=%02X %02X %02X %02X %02X %02X",
-            static_cast<unsigned long>(kLegalScreenWaitBranchRva),
-            target[0], target[1], target[2], target[3], target[4], target[5]
+            "Startup: legal screen code differs (wait branch %02X %02X, call %02X, clear %02X %02X); keeping the 5 s legal screen",
+            target[0], target[1], call_site[0], clear_site[0], clear_site[1]
         );
+        return;
+    }
+
+    // The guard first, the skip last: without the guard the skip must not run.
+    g_pending_resource_reference_count = reinterpret_cast<DWORD*>(range.base + kPendingResourceReferenceCountRva);
+    g_real_loading_screen_begin = reinterpret_cast<LoadingScreenBeginFn>(range.base + kLoadingScreenBeginRva);
+    std::uint8_t clear_patch[10] = { 0xE8, 0, 0, 0, 0, 0x0F, 0x1F, 0x44, 0x00, 0x00 };   // call stub; nop5
+    const auto clear_relative = static_cast<std::int32_t>(
+        reinterpret_cast<std::uint8_t*>(&ProxyClearPendingResourceReferences) - (clear_site + 5));
+    std::memcpy(&clear_patch[1], &clear_relative, sizeof(clear_relative));
+    std::uint8_t call_patch[5] = { 0xE8 };
+    const auto proxy_relative = static_cast<std::int32_t>(
+        reinterpret_cast<std::uint8_t*>(&ProxyLegalScreenBeginLoading) - (call_site + 5));
+    std::memcpy(&call_patch[1], &proxy_relative, sizeof(proxy_relative));
+
+    if (!WriteMemory(clear_site, clear_patch, sizeof(clear_patch))) {
+        Log("Startup: failed to patch the pending resource reference clear; keeping the 5 s legal screen");
+        return;
+    }
+    if (!WriteMemory(call_site, call_patch, sizeof(call_patch))) {
+        WriteMemory(clear_site, expected_clear, sizeof(expected_clear));
+        Log("Startup: failed to patch the legal screen's begin-loading call; keeping the 5 s legal screen");
         return;
     }
 
     if (WriteMemory(target, patch, sizeof(patch))) {
         Log(
-            "Startup: bypassed legal screen wait branch at RVA 0x%08lX",
+            "Startup: bypassed legal screen wait branch at RVA 0x%08lX (pending resource references kept)",
             static_cast<unsigned long>(kLegalScreenWaitBranchRva)
         );
     } else {
+        WriteMemory(call_site, expected_call, sizeof(expected_call));
+        WriteMemory(clear_site, expected_clear, sizeof(expected_clear));
         Log("Startup: failed to patch legal screen wait branch");
     }
 }
