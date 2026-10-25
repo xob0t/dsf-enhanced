@@ -2618,6 +2618,7 @@ constexpr DWORD kMenuFindListRva = 0x006B5E70;         // FUN_00AB5E70, MmDk men
 constexpr DWORD kMenuInputKeysOffset = 0x10;
 constexpr DWORD kMenuInputPlayerStride = 0x158;
 constexpr int kMenuKeyCount = 43;
+constexpr int kMenuButtonKeys = 16;  // keys 0..15: actions 6..22, the buttons (directions to L2/R2); then mouse and text
 constexpr int kMenuKeyUp = 0, kMenuKeyDown = 1, kMenuKeySelect = 4, kMenuKeyCancel = 5;
 constexpr int kMenuKeyPressed = 0xFF, kMenuKeyReleased = 1;
 constexpr char kCarBrowserPage[] = "ItemBrowser";               // the card browser page of menusmaster.sp
@@ -2815,11 +2816,12 @@ bool Tap(MenuKeyInput* keys, int key)
 // Runs one menu update of the switch; the key entries are already saved.
 void StepSwitch(std::uint8_t* input, std::uint8_t* menu, const char* page)
 {
-    // Meanwhile the player's own presses don't reach the menu; further
-    // Up/Down presses are kept and run after this switch.
+    // Meanwhile the player's own button presses don't reach the menu (mouse and
+    // text entries are left alone); further Up/Down presses are kept and run
+    // after this switch.
     g_switch.queued += VerticalPress(input);
     for (int player = 0; player < 2; ++player) {
-        std::memset(PlayerKeys(input, player), 0, sizeof(MenuKeyInput) * kMenuKeyCount);
+        std::memset(PlayerKeys(input, player), 0, sizeof(MenuKeyInput) * kMenuButtonKeys);
     }
     MenuKeyInput* keys = PlayerKeys(input, 0);
 
