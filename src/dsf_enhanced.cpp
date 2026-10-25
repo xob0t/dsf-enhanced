@@ -2618,7 +2618,7 @@ constexpr DWORD kMenuFindListRva = 0x006B5E70;         // FUN_00AB5E70, MmDk men
 constexpr DWORD kMenuInputKeysOffset = 0x10;
 constexpr DWORD kMenuInputPlayerStride = 0x158;
 constexpr int kMenuKeyCount = 43;
-constexpr int kMenuButtonKeys = 16;  // keys 0..15: actions 6..22, the buttons (directions to L2/R2); then mouse and text
+constexpr int kMenuButtonKeys = 16;  // keys 0..15: actions 6..22, the buttons (directions to L2/R2); 16..42: actions 44..70 (mouse and text, going by the enum's names)
 constexpr int kMenuKeyUp = 0, kMenuKeyDown = 1, kMenuKeySelect = 4, kMenuKeyCancel = 5;
 constexpr int kMenuKeyPressed = 0xFF, kMenuKeyReleased = 1;
 constexpr char kCarBrowserPage[] = "ItemBrowser";               // the card browser page of menusmaster.sp
