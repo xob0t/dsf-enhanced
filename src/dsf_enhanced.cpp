@@ -43,7 +43,7 @@ float g_traffic_candidate_window_scale = 1.0f;
 float g_traffic_spawn_interval_scale = 1.0f;
 bool g_skip_legal_screen = true;
 bool g_suppress_ubisoft_server_lost_prompt = true;
-bool g_vertical_car_list = true;
+bool g_updown_switches_maker = true;
 float g_target_aspect = 0.0f;
 float g_fov_scalar = 0.0f;
 float g_current_aspect = 16.0f / 9.0f;
@@ -342,7 +342,7 @@ void LoadConfig()
     g_traffic_spawn_interval_scale = std::max(0.05f, std::min(g_traffic_spawn_interval_scale, 1.0f));
     g_skip_legal_screen = GetPrivateProfileIntA("Startup", "SkipLegalScreen", 1, ini_path) != 0;
     g_suppress_ubisoft_server_lost_prompt = GetPrivateProfileIntA("Startup", "SuppressUbisoftServerLostPrompt", 1, ini_path) != 0;
-    g_vertical_car_list = GetPrivateProfileIntA("Garage", "VerticalCarList", 1, ini_path) != 0;
+    g_updown_switches_maker = GetPrivateProfileIntA("Garage", "UpDownSwitchesMaker", 1, ini_path) != 0;
     LoadFlareConfig(ini_path);
 }
 
@@ -2586,30 +2586,43 @@ void LogTrafficDiagnostics(const ModuleRange& range)
     );
 }
 
-// Garage vehicles screen: Up/Down move through an open maker's car list.
+// Garage vehicles screen: Up/Down switch makers while a maker's cars are open.
 //
 // The vehicles screen lists makers top to bottom (Up/Down); Enter opens the
 // maker's cars as a row of cards that Left/Right scroll, and there Up/Down only
-// move the focus between the card row and the BACK button (Esc does the same as
-// BACK). With VerticalCarList=1, while that card browser shows vehicles, Down
-// acts as Right (next car) and Up as Left (previous car).
+// move the focus between the card row and the BACK button; Esc goes back to
+// the makers. With UpDownSwitchesMaker=1, Down in the card row opens the next
+// maker's cars and Up the previous maker's, at their first card, so all makers
+// can be browsed with Up/Down and one maker's cars with Left/Right.
+//
+// The switch drives the menu's own actions, so the script keeps its state:
+// Cancel (back to the maker list), Down or Up there, Select (open). Only the
+// key entries the menu reads are changed; the maker list, the card row, the
+// side panel, the "x/y OWNED" texts and Select all come from the script and
+// the game's car list as when a player presses those keys.
 //
 // Menu input (reverse_engineering/driver_sf/garage_vertical_car_list.md): the
 // game's menu-input object (vtable 0xE280D0) holds per player (2, stride 0x158,
 // from +0x10) one {float value, int state} entry per MmDk menu key, filled once a
-// frame (FUN_00719940: state 0xFF pressed, 1 held, 0xFE released, 0 idle). Its
-// slot 3 (FUN_00719B50, thiscall menu, arg; ret 8) copies them into one menu's key
-// table and runs the key handlers. Keys 0..3 are Up, Down, Right, Left (as the
-// arrow keys map in FUN_00719650). The hook swaps the vertical entries into the
-// horizontal ones for that one call and puts them back afterwards, so other menus
+// frame (FUN_00719940: state 0xFF the first frame down, 0xFE still down, 1 the
+// release frame, 0 idle). Its slot 3 (FUN_00719B50, thiscall menu, arg; ret 8)
+// copies them into one menu's key table and runs the key handlers. The keys'
+// input actions are in the table at 0xE28000: 0..3 Up, Down, Right, Left
+// (EInputAction_Menu_Up/Down/Right/Left), 4 Select, 5 Cancel. The hook changes
+// the entries for that one call and puts them back afterwards, so other menus
 // updated in the same frame see the real keys.
 constexpr DWORD kMenuInputUpdateSlotRva = 0x00A280DC;  // vtable 0x00E280D0 + 0x0C
 constexpr DWORD kMenuInputUpdateRva = 0x00319B50;      // FUN_00719B50
 constexpr DWORD kMenuFindVariableRva = 0x006CBE20;     // FUN_00ACBE20, MmDk menu script variable lookup
+constexpr DWORD kMenuFindListRva = 0x006B5E70;         // FUN_00AB5E70, MmDk menu list lookup (thiscall menu, name, -1)
 constexpr DWORD kMenuInputKeysOffset = 0x10;
 constexpr DWORD kMenuInputPlayerStride = 0x158;
-constexpr int kMenuKeyUp = 0, kMenuKeyDown = 1, kMenuKeyRight = 2, kMenuKeyLeft = 3;
-constexpr char kCarBrowserPage[] = "ItemBrowser";      // the card browser page of menusmaster.sp
+constexpr int kMenuKeyCount = 43;
+constexpr int kMenuButtonKeys = 16;  // keys 0..15: actions 6..22, the buttons (directions to L2/R2); 16..42: actions 44..70 (mouse and text, going by the enum's names)
+constexpr int kMenuKeyUp = 0, kMenuKeyDown = 1, kMenuKeySelect = 4, kMenuKeyCancel = 5;
+constexpr int kMenuKeyPressed = 0xFF, kMenuKeyReleased = 1;
+constexpr char kCarBrowserPage[] = "ItemBrowser";               // the card browser page of menusmaster.sp
+constexpr char kMakerListPage[] = "CategorySelect_Vehicles";    // the maker list page
 
 struct MenuKeyInput
 {
@@ -2620,7 +2633,7 @@ struct MenuKeyInput
 using MenuInputUpdateFn = char (__fastcall*)(void* input, void* edx, void* menu, int arg);
 MenuInputUpdateFn g_menu_input_update = nullptr;
 std::uint8_t* g_exe_base = nullptr;
-volatile LONG g_vertical_car_list_log_count = 0;
+volatile LONG g_garage_log_count = 0;
 
 // Name of the page on top of an MmDk menu's page stack (entries of 8 bytes at
 // +0x1C0, count at +0x1CC, FUN_00AB9440; an entry's first word is the page, a
@@ -2640,69 +2653,302 @@ const char* MenuTopPageName(std::uint8_t* menu)
         return "";
     }
     const char* name = *reinterpret_cast<const char**>(page);
-    return IsReadableMemory(name, sizeof(kCarBrowserPage)) ? name : "";
+    return IsReadableMemory(name, sizeof(kMakerListPage)) ? name : "";
 }
 
-// The card browser page also shows the abilities and challenges lists; the
-// menu script's variable startPageSelected says which (2 or 3: vehicles, as the
-// garage hub FUN_0070E7D0 reads it). Variables: FUN_00ACBE20, thiscall on
-// menu + 0x50 (name, info out) -> int*.
-bool VehicleCardBrowserOpen(std::uint8_t* menu)
+// Script variables of the vehicles screen (FUN_00ACBE20, thiscall on menu + 0x50,
+// (name, info out) -> int*). startPageSelected is 2 or 3 while the screen shows
+// vehicles (as the garage hub FUN_0070E7D0 reads it); the same card browser page
+// shows the abilities (1) and challenges (4). categorySelected is the maker,
+// 1-based, as the car list FUN_007113A0 reads it.
+struct VehicleScreenVars
 {
-    if (g_exe_base == nullptr || std::strcmp(MenuTopPageName(menu), kCarBrowserPage) != 0) {
-        return false;
-    }
-    static std::uint8_t* var_menu = nullptr;
-    static int* page_var = nullptr;
-    if (var_menu != menu) {
+    std::uint8_t* menu = nullptr;
+    int* page = nullptr;
+    int* maker = nullptr;
+};
+VehicleScreenVars g_screen_vars;
+
+const VehicleScreenVars& ScreenVars(std::uint8_t* menu)
+{
+    if (g_screen_vars.menu != menu) {
         using FindVarFn = int* (__fastcall*)(void* vars, void* edx, const char* name, int* info);
         auto find_var = reinterpret_cast<FindVarFn>(g_exe_base + kMenuFindVariableRva);
-        var_menu = menu;
-        page_var = find_var(menu + 0x50, nullptr, "startPageSelected", nullptr);
+        g_screen_vars.menu = menu;
+        g_screen_vars.page = find_var(menu + 0x50, nullptr, "startPageSelected", nullptr);
+        g_screen_vars.maker = find_var(menu + 0x50, nullptr, "categorySelected", nullptr);
     }
-    return page_var != nullptr && (*page_var == 2 || *page_var == 3);
+    return g_screen_vars;
+}
+
+bool ShowsVehicles(std::uint8_t* menu)
+{
+    const VehicleScreenVars& vars = ScreenVars(menu);
+    return vars.page != nullptr && (*vars.page == 2 || *vars.page == 3);
+}
+
+int CurrentMaker(std::uint8_t* menu)
+{
+    const VehicleScreenVars& vars = ScreenVars(menu);
+    return vars.maker != nullptr && IsReadableMemory(vars.maker, sizeof(int)) ? *vars.maker : 0;
+}
+
+// Makers in the maker list: the length of the script list ManufacturerNumList
+// (MmDk list: int16 length at +0x0C), which the garage's maker fill
+// (FUN_006C6940) sets to the makers it lists; dsfforza.asi's fill keeps that.
+int MakerCount(std::uint8_t* menu)
+{
+    using FindListFn = std::uint8_t* (__fastcall*)(void* menu, void* edx, const char* name, int index);
+    auto find_list = reinterpret_cast<FindListFn>(g_exe_base + kMenuFindListRva);
+    std::uint8_t* list = find_list(menu, nullptr, "ManufacturerNumList", -1);
+    if (list == nullptr || !IsReadableMemory(list + 0x0C, 2)) {
+        return 0;
+    }
+    return *reinterpret_cast<std::int16_t*>(list + 0x0C);
+}
+
+MenuKeyInput* PlayerKeys(std::uint8_t* input, int player)
+{
+    return reinterpret_cast<MenuKeyInput*>(input + kMenuInputKeysOffset + player * kMenuInputPlayerStride);
+}
+
+// The maker switch, one step per menu update of the vehicles menu.
+enum class SwitchStep
+{
+    Idle,
+    Back,       // Cancel pressed and released: the card row closes
+    ToMakers,   // until the maker list is on top and has settled
+    Move,       // Down or Up pressed and released
+    Moved,      // until categorySelected is the next maker and the list has settled
+    Open,       // Select pressed and released
+    ToBrowser,  // until the card row is on top again
+};
+
+struct MakerSwitch
+{
+    SwitchStep step = SwitchStep::Idle;
+    std::uint8_t* menu = nullptr;
+    int dir = 0;          // +1 next maker, -1 previous
+    int target = 0;       // categorySelected to reach
+    int queued = 0;       // presses that came in meanwhile (+ Down, - Up)
+    int frames = 0;       // menu updates in this step
+    int settled = 0;      // menu updates the wait condition has held
+    DWORD started = 0;    // GetTickCount of this step
+};
+MakerSwitch g_switch;
+
+constexpr int kSettleUpdates = 2;          // menu updates a page or maker must hold before the next key
+constexpr int kStepTimeoutUpdates = 300;   // a step that takes more menu updates (about 5 s) ends the switch
+constexpr DWORD kStepTimeoutMs = 30000;    // so does one that takes longer, however slow the frames (stalls)
+
+const char* StepName(SwitchStep step)
+{
+    switch (step) {
+    case SwitchStep::Idle: return "idle";
+    case SwitchStep::Back: return "back";
+    case SwitchStep::ToMakers: return "to-makers";
+    case SwitchStep::Move: return "move";
+    case SwitchStep::Moved: return "moved";
+    case SwitchStep::Open: return "open";
+    case SwitchStep::ToBrowser: return "to-browser";
+    }
+    return "?";
+}
+
+void SetStep(SwitchStep step)
+{
+    g_switch.step = step;
+    g_switch.frames = 0;
+    g_switch.settled = 0;
+    g_switch.started = GetTickCount();
+}
+
+// Up/Down pressed this frame by either player: +1 Down, -1 Up, 0 none.
+int VerticalPress(std::uint8_t* input)
+{
+    int dir = 0;
+    for (int player = 0; player < 2; ++player) {
+        MenuKeyInput* keys = PlayerKeys(input, player);
+        if (keys[kMenuKeyDown].state == kMenuKeyPressed) {
+            dir += 1;
+        }
+        if (keys[kMenuKeyUp].state == kMenuKeyPressed) {
+            dir -= 1;
+        }
+    }
+    return dir;
+}
+
+// Starts a switch towards maker + dir, if there is one (the switch stops at the
+// first and the last maker, as the maker list does).
+bool BeginSwitch(std::uint8_t* menu, int dir)
+{
+    const int maker = CurrentMaker(menu);
+    const int count = MakerCount(menu);
+    const int target = maker + dir;
+    if (maker < 1 || target < 1 || target > count) {
+        return false;
+    }
+    g_switch.menu = menu;
+    g_switch.dir = dir;
+    g_switch.target = target;
+    g_switch.queued = 0;
+    g_switch.step = SwitchStep::Idle;
+    if (InterlockedIncrement(&g_garage_log_count) <= 8) {
+        Log("Garage: %s in the vehicles card row: maker %d -> %d of %d", dir > 0 ? "Down" : "Up", maker, target, count);
+    }
+    SetStep(SwitchStep::Back);
+    return true;
+}
+
+// Writes one injected key for player 0: press on the step's first update,
+// release on the second. Returns true once both are sent.
+bool Tap(MenuKeyInput* keys, int key)
+{
+    if (g_switch.frames == 0) {
+        keys[key] = MenuKeyInput{1.0f, kMenuKeyPressed};
+        return false;
+    }
+    keys[key] = MenuKeyInput{0.0f, kMenuKeyReleased};
+    return true;
+}
+
+// Runs one menu update of the switch; the key entries are already saved.
+void StepSwitch(std::uint8_t* input, std::uint8_t* menu, const char* page)
+{
+    // Meanwhile the player's own button presses don't reach the menu (mouse and
+    // text entries are left alone); further Up/Down presses are kept and run
+    // after this switch.
+    g_switch.queued += VerticalPress(input);
+    for (int player = 0; player < 2; ++player) {
+        std::memset(PlayerKeys(input, player), 0, sizeof(MenuKeyInput) * kMenuButtonKeys);
+    }
+    MenuKeyInput* keys = PlayerKeys(input, 0);
+
+    if (g_switch.frames > kStepTimeoutUpdates || GetTickCount() - g_switch.started > kStepTimeoutMs) {
+        Log("Garage: maker switch gave up in step %s (page %s, maker %d, target %d)", StepName(g_switch.step), page,
+            CurrentMaker(menu), g_switch.target);
+        g_switch.step = SwitchStep::Idle;
+        g_switch.queued = 0;
+        return;
+    }
+
+    switch (g_switch.step) {
+    case SwitchStep::Back:
+        if (Tap(keys, kMenuKeyCancel)) {
+            SetStep(SwitchStep::ToMakers);
+            return;
+        }
+        break;
+    case SwitchStep::ToMakers:
+        g_switch.settled = std::strcmp(page, kMakerListPage) == 0 ? g_switch.settled + 1 : 0;
+        if (g_switch.settled > kSettleUpdates) {
+            SetStep(SwitchStep::Move);
+            return;
+        }
+        break;
+    case SwitchStep::Move:
+        if (Tap(keys, g_switch.dir > 0 ? kMenuKeyDown : kMenuKeyUp)) {
+            SetStep(SwitchStep::Moved);
+            return;
+        }
+        break;
+    case SwitchStep::Moved:
+        g_switch.settled = CurrentMaker(menu) == g_switch.target ? g_switch.settled + 1 : 0;
+        if (g_switch.settled > kSettleUpdates) {
+            // Presses that came in meanwhile move on in the list before it opens
+            // (and stop at its ends).
+            if (g_switch.queued != 0) {
+                const int dir = g_switch.queued > 0 ? 1 : -1;
+                const int next = g_switch.target + dir;
+                g_switch.queued -= dir;
+                if (next >= 1 && next <= MakerCount(menu)) {
+                    g_switch.dir = dir;
+                    g_switch.target = next;
+                    SetStep(SwitchStep::Move);
+                    return;
+                }
+                g_switch.queued = 0;
+            }
+            SetStep(SwitchStep::Open);
+            return;
+        }
+        break;
+    case SwitchStep::Open:
+        if (Tap(keys, kMenuKeySelect)) {
+            SetStep(SwitchStep::ToBrowser);
+            return;
+        }
+        break;
+    case SwitchStep::ToBrowser:
+        g_switch.settled = std::strcmp(page, kCarBrowserPage) == 0 ? g_switch.settled + 1 : 0;
+        if (g_switch.settled > kSettleUpdates) {
+            SetStep(SwitchStep::Idle);
+            // Presses that came in while the row opened start the next switch.
+            const int queued = g_switch.queued;
+            if (queued != 0 && BeginSwitch(menu, queued > 0 ? 1 : -1)) {
+                g_switch.queued = queued - g_switch.dir;
+            }
+            return;
+        }
+        break;
+    case SwitchStep::Idle:
+        break;
+    }
+    ++g_switch.frames;
 }
 
 char __fastcall ProxyMenuInputUpdate(std::uint8_t* input, void* edx, std::uint8_t* menu, int arg)
 {
-    if (!g_vertical_car_list || menu == nullptr || !VehicleCardBrowserOpen(menu)) {
+    if (!g_updown_switches_maker || menu == nullptr || input == nullptr) {
+        return g_menu_input_update(input, edx, menu, arg);
+    }
+    const bool switching = g_switch.step != SwitchStep::Idle;
+    if (switching && menu != g_switch.menu) {
+        return g_menu_input_update(input, edx, menu, arg);
+    }
+    const char* page = MenuTopPageName(menu);
+    const bool browser = std::strcmp(page, kCarBrowserPage) == 0;
+    if (!switching && !browser) {
+        return g_menu_input_update(input, edx, menu, arg);
+    }
+    if (!switching && !ShowsVehicles(menu)) {
         return g_menu_input_update(input, edx, menu, arg);
     }
 
-    MenuKeyInput saved[2][4];
-    bool moved = false;
+    MenuKeyInput saved[2][kMenuKeyCount];
     for (int player = 0; player < 2; ++player) {
-        auto* keys = reinterpret_cast<MenuKeyInput*>(input + kMenuInputKeysOffset + player * kMenuInputPlayerStride);
-        std::memcpy(saved[player], keys, sizeof(saved[player]));
-        if (keys[kMenuKeyDown].state != 0 && keys[kMenuKeyRight].state == 0) {
-            keys[kMenuKeyRight] = keys[kMenuKeyDown];
-            moved = true;
-        }
-        if (keys[kMenuKeyUp].state != 0 && keys[kMenuKeyLeft].state == 0) {
-            keys[kMenuKeyLeft] = keys[kMenuKeyUp];
-            moved = true;
-        }
-        keys[kMenuKeyUp] = MenuKeyInput{};
-        keys[kMenuKeyDown] = MenuKeyInput{};
+        std::memcpy(saved[player], PlayerKeys(input, player), sizeof(saved[player]));
     }
-    if (moved && InterlockedIncrement(&g_vertical_car_list_log_count) <= 4) {
-        Log("Garage: Up/Down in the vehicles card browser sent as Left/Right");
+    if (switching) {
+        StepSwitch(input, menu, page);
+    } else if (browser) {
+        // In the card row Up/Down only switch makers; they never take the focus to BACK.
+        const int dir = VerticalPress(input);
+        for (int player = 0; player < 2; ++player) {
+            MenuKeyInput* keys = PlayerKeys(input, player);
+            keys[kMenuKeyUp] = MenuKeyInput{};
+            keys[kMenuKeyDown] = MenuKeyInput{};
+        }
+        if (dir != 0 && BeginSwitch(menu, dir > 0 ? 1 : -1)) {
+            StepSwitch(input, menu, page);
+        }
     }
 
     const char result = g_menu_input_update(input, edx, menu, arg);
     for (int player = 0; player < 2; ++player) {
-        auto* keys = reinterpret_cast<MenuKeyInput*>(input + kMenuInputKeysOffset + player * kMenuInputPlayerStride);
-        std::memcpy(keys, saved[player], sizeof(saved[player]));
+        std::memcpy(PlayerKeys(input, player), saved[player], sizeof(saved[player]));
     }
     return result;
 }
 
-void ApplyVerticalCarListPatch(const ModuleRange& range)
+void ApplyGarageMakerSwitchPatch(const ModuleRange& range)
 {
-    if (!g_vertical_car_list) {
+    if (!g_updown_switches_maker) {
         return;
     }
-    if (!IsRvaInRange(range, kMenuInputUpdateSlotRva, 4) || !IsRvaInRange(range, kMenuFindVariableRva, 16)) {
+    if (!IsRvaInRange(range, kMenuInputUpdateSlotRva, 4) || !IsRvaInRange(range, kMenuFindVariableRva, 16) ||
+        !IsRvaInRange(range, kMenuFindListRva, 16)) {
         Log("Garage: menu input vtable slot RVA 0x%08lX is outside the loaded image",
             static_cast<unsigned long>(kMenuInputUpdateSlotRva));
         return;
@@ -2714,7 +2960,8 @@ void ApplyVerticalCarListPatch(const ModuleRange& range)
         return;
     }
     if (*slot != expected) {
-        Log("Garage: menu input update slot holds 0x%p, expected 0x%p; vertical car list not installed", *slot, expected);
+        Log("Garage: menu input update slot holds 0x%p, expected 0x%p; Up/Down maker switch not installed", *slot,
+            expected);
         return;
     }
 
@@ -2722,10 +2969,10 @@ void ApplyVerticalCarListPatch(const ModuleRange& range)
     g_menu_input_update = reinterpret_cast<MenuInputUpdateFn>(expected);
     void* replacement = reinterpret_cast<void*>(&ProxyMenuInputUpdate);
     if (WriteMemory(slot, &replacement, sizeof(replacement))) {
-        Log("Garage: Up/Down move through an open maker's car list (menu input slot RVA 0x%08lX)",
+        Log("Garage: Up/Down switch makers in the vehicles card row (menu input slot RVA 0x%08lX)",
             static_cast<unsigned long>(kMenuInputUpdateSlotRva));
     } else {
-        Log("Garage: failed to install the vertical car list hook");
+        Log("Garage: failed to install the Up/Down maker switch hook");
         g_menu_input_update = nullptr;
     }
 }
@@ -2765,7 +3012,7 @@ void ApplyPatches()
     PatchBinkImports(exe);
     ApplyStartupPatches(exe);
     ApplyUbisoftServerLostPromptPatch(exe);
-    ApplyVerticalCarListPatch(exe);
+    ApplyGarageMakerSwitchPatch(exe);
     ApplyMovieDrawPatch(exe);
     ApplyAspectConstantPatch(exe, "Init");
     ApplyGlobalFovScalarPatch(exe, "Init");
