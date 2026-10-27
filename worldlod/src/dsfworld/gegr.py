@@ -6,7 +6,9 @@ order the stock groups use. Each group stays within the stock limits of 1,100
 children and about 2.6 MB. MDID gains the new UIDs after the last stock UID of
 the same kind. The target parts' finest LOD is pointed at the new submodels;
 their box and trailer follow. The stock submodels stay in the archive,
-unreferenced.
+unreferenced. Submodels of the target LOD that the bake doesn't replace (the
+shared sea and low-detail trees that 192 stock terrain parts carry next to the
+terrain) stay in it.
 
 Entry headers (tags, versions, alignment, names) are copied from stock GEGR
 entries of the same kind.
@@ -31,8 +33,9 @@ DRSP_BUDGET = 2_600_000  # bytes, about the stock group size
 
 @dataclass
 class CellBake:
-    part_uid: int  # stock part whose finest LOD is replaced
+    part_uid: int  # stock part whose finest LOD gets the baked groups
     groups: list[Group]
+    keep: list[int] = field(default_factory=list)  # stock submodels of that LOD that stay
 
 
 @dataclass
@@ -53,6 +56,12 @@ def _like(template: Entry, payload: bytes | None = None, children: list[Entry] |
     e.payload = payload
     e.children = children if children is not None else (None if payload is not None else template.children)
     return e
+
+
+def _box_corners(box: np.ndarray) -> np.ndarray:
+    """The eight corners of a MODL box (corner row 0, edge vectors rows 1-3)."""
+    o, e = box[0, :3], box[1:4, :3]
+    return np.array([o + i * e[0] + j * e[1] + k * e[2] for i in (0, 1) for j in (0, 1) for k in (0, 1)])
 
 
 def _bounds_box(lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
@@ -97,8 +106,13 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
         ib_uid = uids.new()
         indices: list[np.ndarray] = []
         n_indices = 0
-        sub_uids, sub_flags = [], []
-        lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
+        flag_of = dict(zip(lod.submodels, lod.flags, strict=True))
+        sub_uids, sub_flags = list(cell.keep), [flag_of[s] for s in cell.keep]
+        if cell.keep:
+            corners = _box_corners(part.box)
+            lo, hi = corners.min(0), corners.max(0)
+        else:
+            lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
         for g in cell.groups:
             vb = layouts.setdefault(
                 (g.stride, g.elements), {"uid": uids.new(), "rows": [], "count": 0, "users": [], "decl": g.decl}

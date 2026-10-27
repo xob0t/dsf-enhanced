@@ -246,13 +246,55 @@ building shells.
 
 ### Open for the in-game test
 
-- Whether the engine hides the base terrain where a cell's detail is loaded.
+- (Answered above: the base is not drawn at Shift level 2 and below.) Whether the engine hides the base terrain where a cell's detail is loaded.
   The stock terrain is not consistently below the detail ground (R_360: median
   2 m below, above in 14% of 4 m bins; R_208: above in 65%), so something
   must hide it in gameplay; it is not the GRTD (a 24 x 24 grid of 21.3 m cells,
-  probably heights). `[bake] lower` (default 0.1 m) sinks the baked ground so
-  that, if both draw, the detail wins instead of z-fighting.
+  probably heights). `[bake] height_offset` moves the baked ground: positive
+  (default 0.05 m) puts it above, so in upper Shift the base hides the few
+  loaded detail cells and the map looks uniform; negative lets loaded detail
+  win, which is safer if the base turns out to draw in gameplay too.
 - What the per-cell binding (lightmap) does for a distant cell with the
   detailed ground materials.
 - Memory: GEGR is resident in gameplay too; the bake adds 42 MB of managed
   buffers to a 32-bit process.
+
+## When the base is drawn (runtime, user observation)
+
+The base LOD is drawn only at the upper Shift levels, together with the detailed
+cells the game loads around the cursor. At user level 2 and below the global
+map is despawned. So the baked ground can't z-fight with gameplay; at the upper
+levels it overlaps only the cells loaded around the cursor. `[bake]
+height_offset` (default +0.05 m) puts the bake above them, so the map looks the
+same inside and outside the loaded area.
+
+## Bake fixes and optimisation (static, verified offline)
+
+- **Stock terrain parts share their LOD with other stock geometry.** 160 of the
+  420 terrain parts also hold the shared sea (`water/lowpolysea_01`), 22 the
+  low-detail trees, 10 both. The bake replaces only the submodels whose material
+  matches `[bake] replace` and keeps the rest; replacing the whole LOD had
+  removed the sea around those cells.
+- **Detail regions draw the low-poly terrain material too** (119 regions, 27.9
+  km^2: hills, waterfront, the bridge approaches), so it is class `ground`, not
+  `skip`.
+- **Gap fill.** Some cells' detail has little ground (R_703, the bay bridge:
+  one parking garage). The bake keeps the stock terrain triangles that the baked
+  geometry leaves at least 5% uncovered seen from above (2 m grid), moved down
+  by `[bake] fill_drop` (2 m) so they stay under the baked ground where the two
+  meet. Stock-base area left uncovered per cell went from up to 96% (median
+  0.1%) to at most 0.3%.
+- **Simplification** (meshoptimizer, attribute-aware, absolute error). Ground is
+  thin strips of different materials (lanes, kerbs, trims, paving): 78-99% of a
+  material's vertices lie on its boundary, so per-material simplification with
+  locked borders barely helps (84% of triangles kept at 0.5 m on 30 sample
+  cells). Simplifying a whole cell as one mesh turns material boundaries into
+  seams, which meshoptimizer collapses on both sides together without cracks:
+  69% kept at 0.5 m with normal weight 0.5, 62% with 0.1; colour weight hardly
+  matters. Outer cell edges stay locked so neighbours meet.
+  `meshoptimizer` 0.2.30a0 doesn't declare ctypes argtypes for
+  `meshopt_simplifyWithAttributes`; `dsfworld/simplify.py` declares them.
+
+Default result: 403 parts replaced, 7,995 submodels, 1,049,811 triangles
+(931k baked ground and 118k stock fill; 1.57M before simplification), 30.6 MB of
+buffers in 20 DRSP groups.

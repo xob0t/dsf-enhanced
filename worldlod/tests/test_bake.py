@@ -1,6 +1,7 @@
 import struct
 
 import numpy as np
+import pytest
 
 from dsfworld import bake
 from dsfworld.formats.archive import SubModel
@@ -92,11 +93,55 @@ def test_chunks_stay_within_16_bit_indices():
         assert len(v) <= bake.MAX_VERTICES and t.max() < len(v)
 
 
-def test_lower_moves_down_in_world_space():
+def test_height_offset_moves_in_world_space():
     lib = library(
         [vertex(0, 0, 0, 0, 0, (0, 1, 0)), vertex(1, 0, 0, 0, 0, (0, 1, 0)), vertex(0, 0, 1, 0, 0, (0, 1, 0))],
         [0, 1, 2],
     )
-    (g,) = bake.bake_region(Classes(), lib, [Instance(4, 0, np.eye(4))], np.eye(4), {0}, lower=0.25).groups
+    (g,) = bake.bake_region(Classes(), lib, [Instance(4, 0, np.eye(4))], np.eye(4), {0}, height_offset=-0.25).groups
     pos = g.vertices[:, 0:6].copy().view("<i2").astype(float) / 64
     np.testing.assert_allclose(pos[:, 1], -0.25)
+
+
+def grid_group(material, x0, x1, n=12):
+    """A flat n x n grid between x0 and x1 (z 0..10), as one group."""
+    xs, zs = np.linspace(x0, x1, n), np.linspace(0, 10, n)
+    verts = [vertex(x, 0, z, 0, 0, (0, 1, 0)) for z in zs for x in xs]
+    tris = []
+    for j in range(n - 1):
+        for i in range(n - 1):
+            a = j * n + i
+            tris += [[a, a + n, a + 1], [a + 1, a + n, a + n + 1]]
+    rows = np.frombuffer(b"".join(verts), np.uint8).reshape(len(verts), 16).copy()
+    return bake.Group(material, 5, 16, tuple(ELEMENTS), b"", rows, np.array(tris, np.int64))
+
+
+def test_cell_simplification_keeps_material_boundaries_closed():
+    pytest.importorskip("meshoptimizer")
+    from dsfworld import simplify
+
+    left, right = grid_group(1, 0, 5), grid_group(2, 5, 10)
+    out = simplify.cell([left, right], 0.05, 0.1, 1.0, True)
+    assert sum(len(g.triangles) for g in out) < len(left.triangles) + len(right.triangles) // 4
+
+    def boundary(g):  # positions used on x == 5
+        p = g.vertices[np.unique(g.triangles), 0:6].copy().view("<i2")
+        return {tuple(v) for v in p if v[0] == 5 * 64}
+
+    a, b = (next(g for g in out if g.material == m) for m in (1, 2))
+    assert boundary(a) == boundary(b)  # both sides of the material boundary still meet
+
+
+def test_fill_keeps_only_uncovered_stock_triangles_lowered():
+    # stock: two 20 m triangles side by side (x 0..20 and 20..40); baked ground covers x 0..20
+    stock = library(
+        [vertex(x, 0, z, 0, 0, (0, 1, 0)) for x, z in ((0, 0), (0, 20), (20, 0), (20, 20), (40, 0), (40, 20))],
+        [0, 1, 2, 1, 3, 2, 2, 3, 4, 3, 5, 4],
+    )
+    lower = grid_group(9, 0, 20, n=6)  # x 0..20, z 0..10
+    upper = grid_group(9, 0, 20, n=6)  # moved to z 10..20 below
+    upper.vertices[:, 4:6] = (upper.vertices[:, 4:6].view("<i2") + 10 * 64).view(np.uint8)
+    (g,) = bake.fill_from_stock(stock, [(3, 5)], [lower, upper], drop=2.0)
+    pos = g.vertices[np.unique(g.triangles), 0:6].copy().view("<i2").astype(float) / 64
+    assert len(g.triangles) == 2  # the right square only
+    assert pos[:, 0].min() == 20 and np.all(pos[:, 1] == -2)

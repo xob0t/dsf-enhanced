@@ -22,7 +22,8 @@ select = "all"
 # lower case, '/' separators) starts with. Materials that match no prefix are
 # class "other". A class named "skip" is never drawn.
 [classes]
-skip = ["occludermaterial", "r:/toolchain/", "terrain/vertcolourlowpolyterrrain"]
+# The low-poly terrain material is ground too: 119 detailed regions draw it themselves.
+skip = ["occludermaterial", "r:/toolchain/"]
 ground = ["terrain/", "roads/", "ground/"]
 buildings = ["buildings/"]
 foliage = ["trees/", "hyperlowtree"]
@@ -37,18 +38,40 @@ classes = ["ground", "buildings", "foliage", "water", "props", "other"]
 min_model_size = 0.0
 
 [bake]
-# Classes from the detailed regions that go into the base LOD, replacing each
-# cell's stock part below. An empty list turns the bake off; pack then writes
-# the stock archive.
+# Classes from the detailed regions that go into the base LOD, replacing the
+# stock submodels below. An empty list turns the bake off; pack then writes the
+# stock archive.
 classes = ["ground"]
-# The stock base parts to replace: a part is replaced when its finest LOD uses a
-# material whose path starts with this prefix. One such part (the vertex-coloured
-# low-poly terrain) sits at the centre of 420 of the 532 detailed cells.
+# The stock submodels to replace: those whose material path starts with this
+# prefix (the vertex-coloured low-poly terrain). The part holding them, one at
+# the centre of 420 of the 532 detailed cells, receives the baked cell; its
+# other submodels (the shared sea, low-detail trees) stay.
 replace = "terrain/vertcolourlowpolyterrrain"
-# Move the baked geometry down by this many metres. If the engine also draws the
-# base where a cell's detail is loaded, the detail then wins the depth test
-# instead of z-fighting; from Shift height a few centimetres can't be seen.
-lower = 0.1
+# Move the baked geometry up by this many metres (negative: down). Above, the
+# base wins over detail cells loaded near the Shift cursor, so upper Shift looks
+# the same everywhere. If the engine also draws the base where detail is loaded
+# in gameplay (not known yet), it would cover the real ground by this much; a
+# negative value lets the detail win instead.
+height_offset = 0.05
+# Where the baked ground leaves a gap that the stock terrain covered (a cell
+# whose detail has little ground, the map edges), keep those stock terrain
+# triangles, moved down by this many metres so that they stay under the baked
+# ground where the two meet. A negative value turns the fill off.
+fill_drop = 2.0
+
+[simplify]
+# Largest geometric error, in metres, allowed when simplifying each baked cell.
+# Upper Shift views the city from hundreds of metres up. 0 turns simplification
+# off; above 0 it needs `uv sync --extra simplify`. 0.5 keeps about 62% of the
+# ground triangles, 1.0 about 52%.
+error = 0.5
+# Weights in the error metric of the normals (shading) and the vertex colour
+# (the terrain's texture blend weights). 0 ignores the attribute.
+normal_weight = 0.1
+colour_weight = 1.0
+# Keep each cell's outer edges in place so that neighbouring cells meet without
+# cracks. Material boundaries inside a cell stay closed either way.
+lock_border = true
 
 [preview]
 # Image width and height in pixels.

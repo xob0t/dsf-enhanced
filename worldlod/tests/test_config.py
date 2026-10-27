@@ -42,4 +42,4 @@ def test_material_classes():
         {1: short_path(path), 2: "terrain/terr_kerbs.matxml", 3: "buildings/specular/x.matxml", 4: "foo.matxml"},
         config.load(None).section("classes"),
     )
-    assert [mats.class_of(u) for u in (1, 2, 3, 4)] == ["skip", "ground", "buildings", "other"]
+    assert [mats.class_of(u) for u in (1, 2, 3, 4)] == ["ground", "ground", "buildings", "other"]

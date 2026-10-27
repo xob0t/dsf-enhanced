@@ -14,12 +14,14 @@ from pathlib import Path
 
 import numpy as np
 
-from dsfworld import bake
+from dsfworld import bake, simplify
 from dsfworld.config import Config
 from dsfworld.gegr import CellBake
 from dsfworld.world import World
 
-SECTIONS = ("game", "classes", "bake")
+SECTIONS = ("game", "classes", "bake", "simplify")
+# Part of the cache key: raise when the bake or simplification output changes for the same settings.
+VERSION = 3
 
 
 def output_dir(cfg: Config) -> Path:
@@ -51,7 +53,7 @@ def run(cfg: Config, world: World, force: bool = False) -> list[CellBake]:
     keep = {world.class_names.index(c) for c in settings["classes"]}
     out = output_dir(cfg)
     out.mkdir(parents=True, exist_ok=True)
-    digest = cfg.digest(*SECTIONS)
+    digest = f"{VERSION}:{cfg.digest(*SECTIONS)}"
     stock = targets(world, settings["replace"])
     names = world.region_names(cfg.section("regions")["select"])
     cells, rows, no_target = [], [], []
@@ -64,6 +66,13 @@ def run(cfg: Config, world: World, force: bool = False) -> list[CellBake]:
             no_target.append(name)
             continue
         part_uid, matrix = stock[centre]
+        lod = world.library.parts[part_uid].finest_lod()
+        replaced = [
+            world.materials.paths.get(world.library.submodels[s].material, "").startswith(settings["replace"])
+            for s in lod.submodels
+        ]
+        kept = [s for s, r in zip(lod.submodels, replaced, strict=True) if not r]
+        stock_terrain = [(s, f) for s, f, r in zip(lod.submodels, lod.flags, replaced, strict=True) if r]
         path = out / f"{name}.pkl"
         cached = None
         if not force and path.exists():
@@ -73,7 +82,15 @@ def run(cfg: Config, world: World, force: bool = False) -> list[CellBake]:
                 cached = None
         if cached is None:
             lib, g = world.region(name)
-            result = bake.bake_region(world, lib, g.instances, matrix, keep, settings["lower"])
+            result = bake.bake_region(world, lib, g.instances, matrix, keep, settings["height_offset"])
+            s = cfg.section("simplify")
+            result.groups = simplify.cell(
+                result.groups, s["error"], s["normal_weight"], s["colour_weight"], s["lock_border"]
+            )
+            if result.groups and settings["fill_drop"] >= 0:
+                result.groups += bake.fill_from_stock(
+                    world.library, stock_terrain, result.groups, settings["fill_drop"]
+                )
             cached = {"digest": digest, "part": part_uid, "groups": result.groups, "skipped": result.skipped}
             with path.with_suffix(".tmp").open("wb") as f:
                 pickle.dump(cached, f, protocol=pickle.HIGHEST_PROTOCOL)
@@ -85,7 +102,7 @@ def run(cfg: Config, world: World, force: bool = False) -> list[CellBake]:
         tris = sum(len(g.triangles) for g in groups)
         verts = sum(len(g.vertices) for g in groups)
         skipped_total.update(cached["skipped"])
-        cells.append(CellBake(part_uid, groups))
+        cells.append(CellBake(part_uid, groups, kept))
         rows.append([name, len(groups), verts, tris, sum(cached["skipped"].values())])
         print(f"[{n}/{len(names)}] {name} {state}: {tris:,} triangles in {len(groups)} groups")
     with open(out / "summary.tsv", "w", encoding="utf-8") as f:

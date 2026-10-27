@@ -9,10 +9,11 @@ freeway decks), props and building detail, but the engine only loads the few
 around the camera. This pipeline reads those regions from the player's own
 `san_francisco.dngc` and bakes them into a new base LOD. It ships no game data.
 
-Status: the first bake works offline. It copies the detailed regions' ground
-(roads, kerbs, paving, freeway decks) into the base LOD in place of each
-cell's stock low-poly terrain: 1.57M triangles in 284 cells, 42 MB of vertex
-and index data. It has not been tried in the game yet. Findings are in
+Status: the bake works offline. It copies the detailed regions' ground (roads,
+kerbs, paving, freeway decks, terrain) into the base LOD in place of each
+cell's stock low-poly terrain, simplifies it and fills what it doesn't cover
+with the stock terrain: 1.05M triangles in 403 cells, 31 MB of vertex and
+index data. It has not been tried in the game yet. Findings are in
 [research/world-lod.md](research/world-lod.md).
 
 ## Setup
@@ -20,9 +21,12 @@ and index data. It has not been tried in the game yet. Findings are in
 Python 3.13 and [uv](https://docs.astral.sh/uv/). From this folder:
 
 ```powershell
-uv sync
+uv sync --extra simplify
 uv run worldlod info
 ```
+
+The `simplify` extra (meshoptimizer) compiles on install and needs the Visual
+Studio C++ build tools. Without it, set `[simplify] error = 0`.
 
 The game folder comes from `[game] dir` in the settings or the `DSF_GAME_DIR`
 environment variable.

@@ -19,6 +19,11 @@ dependencies = [
     { name = "numpy" },
 ]
 
+[package.optional-dependencies]
+simplify = [
+    { name = "meshoptimizer" },
+]
+
 [package.dev-dependencies]
 dev = [
     { name = "pytest" },
@@ -26,7 +31,11 @@ dev = [
 ]
 
 [package.metadata]
-requires-dist = [{ name = "numpy", specifier = ">=2.1" }]
+requires-dist = [
+    { name = "meshoptimizer", marker = "extra == 'simplify'", specifier = "==0.2.30a0" },
+    { name = "numpy", specifier = ">=2.1" },
+]
+provides-extras = ["simplify"]
 
 [package.metadata.requires-dev]
 dev = [
@@ -42,6 +51,15 @@ sdist = { url = "https://files.pythonhosted.org/packages/01/e1/2069291243c926a2f
 wheels = [
     { url = "https://files.pythonhosted.org/packages/56/43/4ca9e49d27a1fcf6bece6f6aec0ea46bb9112489b93d4b688fb415457bdb/iniconfig-2.3.1-py3-none-any.whl", hash = "sha256:9121e2c1fdb355232495be3194c8dfe87ccc2d5dee45947b78e68f499790d7a7", size = 7552, upload-time = "2026-10-06T22:48:36.959Z" },
 ]
+
+[[package]]
+name = "meshoptimizer"
+version = "0.2.30a0"
+source = { registry = "https://pypi.org/simple" }
+dependencies = [
+    { name = "numpy" },
+]
+sdist = { url = "https://files.pythonhosted.org/packages/35/b9/23259780df3097b6b70e7091970a689b677bd320b02a63fdf60493902167/meshoptimizer-0.2.30a0.tar.gz", hash = "sha256:36b18b61a95ba992de804b1e91e86be2ba185925e4e2c1481495f8c68a17f5db", size = 98795, upload-time = "2026-02-27T06:39:01.628Z" }
 
 [[package]]
 name = "numpy"
