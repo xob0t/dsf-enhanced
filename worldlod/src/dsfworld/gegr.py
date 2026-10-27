@@ -12,6 +12,13 @@ terrain) stay in it.
 
 Entry headers (tags, versions, alignment, names) are copied from stock GEGR
 entries of the same kind.
+
+The streamer allocates its buffers from GEGL/GESI (static, san_francisco.dngc
+1.04): +0x24 GEGR's MDXN budget (its size rounded to 4 KB, 0x5337000, plus
+0x1E5000 of headroom), +0x28 GEGR's NONR size rounded to 4 KB, +0x2C and +0x30
+the largest region's MDXN and NONR, rounded. A GEGR above its budget left the
+game loading forever (in-game, 2026-10-28). update_budgets raises the GEGR
+budgets by what GEGR grew and keeps the headroom.
 """
 
 from __future__ import annotations
@@ -25,7 +32,7 @@ import numpy as np
 from dsfworld.bake import Group
 from dsfworld.formats import modl
 from dsfworld.formats.archive import Archive, kid, walk
-from dsfworld.formats.chnk import ENTRY_LIMIT, Entry
+from dsfworld.formats.chnk import ENTRY_LIMIT, Entry, entry_size
 from dsfworld.formats.uid import Allocator
 
 DRSP_BUDGET = 2_600_000  # bytes, about the stock group size
@@ -190,3 +197,29 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
 
     kid(nonr, "MODL").payload = modl.build_modl(parts)
     return stats
+
+
+GESI_GLOBAL_MDXN, GESI_GLOBAL_NONR, GESI_REGION_MDXN, GESI_REGION_NONR = 0x24, 0x28, 0x2C, 0x30
+
+
+def _page(n: int) -> int:
+    return -(-n // 0x1000) * 0x1000
+
+
+def budgets(a: Archive, gesi: Entry) -> dict[int, int]:
+    blob = gesi.payload if gesi.payload is not None else a.read(gesi)
+    return {o: struct.unpack_from("<I", blob, o)[0] for o in (0x24, 0x28, 0x2C, 0x30)}
+
+
+def update_budgets(a: Archive, entries: list[Entry], stock_mdxn: int, stock_nonr: int) -> tuple[int, int]:
+    """Raise GESI's GEGR budgets by what GEGR's MDXN and NONR grew. Returns the new (MDXN, NONR) budgets."""
+    gegr = next(e for e in entries if e.tag == "GEGR")
+    gesi = kid(next(e for e in entries if e.tag == "GEGL"), "GESI")
+    blob = bytearray(gesi.payload if gesi.payload is not None else a.read(gesi))
+    old = budgets(a, gesi)
+    mdxn = _page(entry_size(kid(gegr, "MDXN"))) - _page(stock_mdxn) + old[GESI_GLOBAL_MDXN]
+    nonr = max(old[GESI_GLOBAL_NONR], _page(entry_size(kid(gegr, "NONR"))))
+    mdxn = max(old[GESI_GLOBAL_MDXN], mdxn)
+    struct.pack_into("<II", blob, GESI_GLOBAL_MDXN, mdxn, nonr)
+    gesi.payload = bytes(blob)
+    return mdxn, nonr

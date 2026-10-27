@@ -74,6 +74,19 @@ def check(path: Path) -> list[str]:
         for d in walk(g, "DRSP"):
             if len(d.children) > ENTRY_LIMIT:
                 problems.append(f"DRSP with {len(d.children)} children")
+        # the streamer's buffers (GEGL/GESI) must hold GEGR and the largest region
+        gesi = kid(next(e for e in a.entries if e.tag == "GEGL"), "GESI")
+        b = gegr.budgets(a, gesi)
+        regions = [r for r in a.entries if r.tag == "GEIR"]
+        needs = {
+            gegr.GESI_GLOBAL_MDXN: kid(g, "MDXN").size,
+            gegr.GESI_GLOBAL_NONR: kid(g, "NONR").size,
+            gegr.GESI_REGION_MDXN: max(kid(r, "MDXN").size for r in regions if kid(r, "MDXN")),
+            gegr.GESI_REGION_NONR: max(kid(r, "NONR").size for r in regions if kid(r, "NONR")),
+        }
+        for offset, need in needs.items():
+            if need > b[offset]:
+                problems.append(f"GESI +{offset:#x} budget {b[offset]:#x} < {need:#x}")
     return problems
 
 
@@ -81,11 +94,15 @@ def run(cfg: Config, world: World, verify: bool = False) -> Path:
     a = world.archive
     cells = bake.run(cfg, world)
     if cells:
-        stats = gegr.apply(a, a.global_region(), cells, uid.Allocator(uid.existing(a)))
+        g = a.global_region()
+        stock_mdxn, stock_nonr = kid(g, "MDXN").size, kid(g, "NONR").size
+        stats = gegr.apply(a, g, cells, uid.Allocator(uid.existing(a)))
         print(
             f"GEGR: {stats.cells} parts replaced, {stats.submodels:,} submodels, {stats.triangles:,} triangles, "
             f"{(stats.vertex_bytes + stats.index_bytes) / 1e6:.1f} MB of buffers in {stats.drsp} new groups"
         )
+        mdxn, nonr = gegr.update_budgets(a, a.entries, stock_mdxn, stock_nonr)
+        print(f"GESI: GEGR budgets {mdxn / 1e6:.1f} MB renderer data, {nonr / 1e3:.0f} KB non-renderer data")
     out = cfg.work_dir / "pack" / a.path.name
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
@@ -97,7 +114,7 @@ def run(cfg: Config, world: World, verify: bool = False) -> Path:
     if verify:
         if not cells:
             same = sha256(out) == sha256(a.path)
-            print("identical to the game's archive" if same else "DIFFERS from the game's archive")
+            print(f"identical to {a.path}" if same else f"DIFFERS from {a.path}")
             if not same:
                 raise SystemExit(1)
         else:

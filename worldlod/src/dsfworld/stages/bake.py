@@ -53,7 +53,8 @@ def run(cfg: Config, world: World, force: bool = False) -> list[CellBake]:
     keep = {world.class_names.index(c) for c in settings["classes"]}
     out = output_dir(cfg)
     out.mkdir(parents=True, exist_ok=True)
-    digest = f"{VERSION}:{cfg.digest(*SECTIONS)}"
+    source = world.archive.path
+    digest = f"{VERSION}:{cfg.digest(*SECTIONS)}:{source}:{source.stat().st_size}"
     stock = targets(world, settings["replace"])
     names = world.region_names(cfg.section("regions")["select"])
     cells, rows, no_target = [], [], []

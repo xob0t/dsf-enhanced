@@ -11,6 +11,7 @@ from pathlib import Path
 
 DEFAULTS = Path(__file__).with_name("default.toml")
 USER_FILE = "worldlod.toml"
+BACKUP_DIR = "worldlod-backup"  # in the game folder, written by `worldlod install`
 
 
 def merge(base: dict, over: dict) -> dict:
@@ -38,8 +39,19 @@ class Config:
         return Path(d)
 
     @property
-    def archive(self) -> Path:
+    def game_archive(self) -> Path:
+        """The world archive in the game folder (what install replaces)."""
         return self.game_dir / self.data["game"]["archive"]
+
+    @property
+    def archive(self) -> Path:
+        """The world archive the pipeline reads: the original. After `worldlod install` the game's
+        file is a build, so the backup install made (checked against its hash then) is read instead."""
+        game = self.game_archive
+        backup = self.game_dir / BACKUP_DIR / game.name
+        if not Path(self.data["game"]["archive"]).is_absolute() and backup.exists():
+            return backup
+        return game
 
     @property
     def work_dir(self) -> Path:

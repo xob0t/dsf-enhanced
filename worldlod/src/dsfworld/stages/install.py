@@ -15,10 +15,9 @@ import subprocess
 import sys
 from pathlib import Path
 
-from dsfworld.config import Config
+from dsfworld.config import BACKUP_DIR, Config
 from dsfworld.stages.pack import check, sha256
 
-BACKUP_DIR = "worldlod-backup"
 MANIFEST = "manifest.json"
 
 
@@ -36,7 +35,7 @@ def _swap_in(source: Path, target: Path) -> None:
 
 
 def _paths(cfg: Config) -> tuple[Path, Path, Path]:
-    target = cfg.archive
+    target = cfg.game_archive
     backup_dir = cfg.game_dir / BACKUP_DIR
     return target, backup_dir / target.name, backup_dir / MANIFEST
 
