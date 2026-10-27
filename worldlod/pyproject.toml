@@ -1,0 +1,31 @@
+[project]
+name = "dsf-worldlod"
+version = "0.1.0"
+description = "Builds a high-detail base LOD for Driver: San Francisco's upper Shift levels from the game's detailed regions"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+dependencies = ["numpy>=2.1"]
+
+[project.scripts]
+worldlod = "dsfworld.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.8"]
+
+[build-system]
+requires = ["uv_build>=0.8,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "dsfworld"
+
+[tool.ruff]
+line-length = 120
+target-version = "py313"
+
+[tool.ruff.lint]
+select = ["E", "F", "I", "UP", "B"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]

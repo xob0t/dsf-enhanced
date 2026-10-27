@@ -5,3 +5,10 @@ dist/
 # Local reverse-engineering workspaces from the Shift-map archive branch.
 _ghidra_projects/
 reverse_engineering/
+
+# worldlod pipeline
+worldlod/.venv/
+worldlod/out/
+__pycache__/
+.pytest_cache/
+.ruff_cache/

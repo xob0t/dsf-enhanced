@@ -1,0 +1,43 @@
+# Default settings. A worldlod.toml in the working folder, or the file given with
+# --config, overrides any of these keys. `worldlod config` prints the merged result.
+
+[game]
+# Game folder (the one with Driver.exe). Empty: the DSF_GAME_DIR environment variable.
+dir = ""
+# World archive, relative to the game folder.
+archive = "Install/san_francisco.dngc"
+
+[run]
+# Output folder, relative to the config file's folder.
+work_dir = "out"
+# Process priority: "idle", "below_normal" or "normal". Idle keeps the PC usable.
+priority = "idle"
+
+[regions]
+# Regions to process: "all", or a list of region names such as ["R_360"].
+select = "all"
+
+# Material classes. A material belongs to the first class with a prefix that its
+# source path (below Levels/San_Francisco/{Materials,Textures}/[Permanent/],
+# lower case, '/' separators) starts with. Materials that match no prefix are
+# class "other". A class named "skip" is never drawn.
+[classes]
+skip = ["occludermaterial", "r:/toolchain/", "terrain/vertcolourlowpolyterrrain"]
+ground = ["terrain/", "roads/", "ground/"]
+buildings = ["buildings/"]
+foliage = ["trees/", "hyperlowtree"]
+water = ["water/"]
+props = ["misc/"]
+
+[flatten]
+# Classes to keep from the detailed regions.
+classes = ["ground", "buildings", "foliage", "water", "props", "other"]
+# Drop placed models whose largest box edge (after instance scale) is below this
+# many metres. 0 keeps everything.
+min_model_size = 0.0
+
+[preview]
+# Image width and height in pixels.
+size = 1024
+# "top" (orthographic, looking down) or "oblique" (45 degrees, from the south).
+view = "oblique"
