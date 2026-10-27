@@ -197,3 +197,62 @@ padded to the largest alignment among their entries (128). The reader records
 this per container (`pad_end`) and the writer reproduces it. dngvehicles.sp
 only has the padded form, so the forza writer would grow this archive by
 20,480 bytes.
+
+## Writing GEGR (static, verified offline)
+
+What the bake needs to know, and how `dsfworld/gegr.py` uses it:
+
+- **Techniques.** `MACO/MARC/MARH` starts with a technique key; `+0x10` is the
+  u64 UID of the GPU program (`GPCH/GPCI`), whose `GPVD` lists the vertex
+  inputs in VDCL form. All 311 detailed ground materials have the same six
+  keys as the stock terrain material (`4E7019C2`, `81A34B93`, `F59DDF6D`,
+  `55B3FEFD`, `13DC0D80`, `71240C6E`), so the base's far technique finds them.
+- **Ground vertex inputs.** The main technique wants `(0, 5, 8, 9)` or
+  `(0, 5, 8)` (position, normal, two UV sets) or `(0, 8, 19)` (colour in the
+  buffer). Semantic 9 is a second tiling UV, not a lightmap UV. Only 7 ground
+  placements in the city use the separate per-region stream (`SBBH +0x18`);
+  the bake skips them.
+- **Part trailer = per-cell binding mode** (`FUN_006BA750`): bit 2 (4) looks up
+  a per-cell material binding (passed whether the cell is resident), bit 3 (8)
+  a per-model binding, bit 5 (0x20) a cached command list. Stock terrain parts
+  have trailer 1 or 5, buildings 9. Baked ground mostly has flag 5, like the
+  trailer-5 stock terrain, so distant cells take the same path.
+- **Base instance flags.** Terrain and sea instances have GEBI flags 1, which
+  `EmitDrawMetadata` always gives the far technique; buildings have 0x80 (render
+  group 0: technique by cell residency). Technique key `F59DDF6D` gets no
+  per-cell binding.
+- **MODL layout:** header, parts, LOD table, all UID lists, then all flag lists.
+  `build_modl` reproduces all 533 stock MODLs byte for byte.
+- **VXDP** is n dependent submodel UIDs then n zero bytes; **IXDP** n UIDs;
+  **IXHD** ends in 8 bytes copied from a stock IXHD.
+- **MDID** lists every renderer UID of GEGR (483 GPCH, 527 MACO, 172 TEXC,
+  7,564 SBMC, 18 VXCK, 6 IXCK, and 106 UIDs interleaved with the GPCH that
+  match nothing). New UIDs go after the last stock UID of their kind.
+- **New UIDs** follow driversf-forza's stock-looking form (byte 1 0x12, byte 7
+  0x2D, top bit of byte 7 clear: the engine marks resolved slots with it),
+  prefix "WLD", checked against the 197,118 UIDs in the archive.
+
+Stock terrain coverage: 420 of the 532 detailed cells have exactly one terrain
+part centred on the cell. 136 of those bake no ground: sea, bay bridge and
+container yards, whose detail uses the same low-poly terrain material; they keep
+the stock part. The 112 cells without a terrain part hold 2,784 ground
+triangles in all (sea edge and the map border).
+
+Result of the default settings: 284 parts replaced, 7,480 submodels, 1,572,683
+triangles, 42.4 MB of buffers in 23 new DRSP groups; the archive grows from
+532 MB to 576 MB. `pack --verify` re-reads it and finds every reference intact,
+and `preview --base` on the packed archive draws the new ground under the stock
+building shells.
+
+### Open for the in-game test
+
+- Whether the engine hides the base terrain where a cell's detail is loaded.
+  The stock terrain is not consistently below the detail ground (R_360: median
+  2 m below, above in 14% of 4 m bins; R_208: above in 65%), so something
+  must hide it in gameplay; it is not the GRTD (a 24 x 24 grid of 21.3 m cells,
+  probably heights). `[bake] lower` (default 0.1 m) sinks the baked ground so
+  that, if both draw, the detail wins instead of z-fighting.
+- What the per-cell binding (lightmap) does for a distant cell with the
+  detailed ground materials.
+- Memory: GEGR is resident in gameplay too; the bake adds 42 MB of managed
+  buffers to a 32-bit process.

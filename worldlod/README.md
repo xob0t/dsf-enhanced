@@ -9,9 +9,10 @@ freeway decks), props and building detail, but the engine only loads the few
 around the camera. This pipeline reads those regions from the player's own
 `san_francisco.dngc` and bakes them into a new base LOD. It ships no game data.
 
-Status: research and the first stages. `flatten`, `preview` and `pack` work;
-`pack` reproduces the game's archive byte for byte but has nothing baked to put
-in it yet. Findings are in
+Status: the first bake works offline. It copies the detailed regions' ground
+(roads, kerbs, paving, freeway decks) into the base LOD in place of each
+cell's stock low-poly terrain: 1.57M triangles in 284 cells, 42 MB of vertex
+and index data. It has not been tried in the game yet. Findings are in
 [research/world-lod.md](research/world-lod.md).
 
 ## Setup
@@ -51,9 +52,14 @@ The pipeline lowers its own process priority (`[run] priority`, default
 | `worldlod info` | archive summary and the stock base LOD by material class |
 | `worldlod flatten` | `flatten/<region>.npz`: each region's models placed in world space, with a material and class per triangle; `flatten/summary.tsv` |
 | `worldlod preview [--base]` | `preview/<region>.png`, and with `--base` the stock base over the same cell |
-| `worldlod pack [--verify]` | `pack/san_francisco.dngc`; `--verify` checks it against the game's file (identical while nothing is baked) |
+| `worldlod bake` | `bake/<region>.pkl`: the region's `[bake] classes`, moved into the frame of its cell's stock terrain part; `bake/summary.tsv` |
+| `worldlod pack [--verify]` | `pack/san_francisco.dngc` with the baked cells in GEGR; `--verify` re-reads it and checks GEGR's references (with `[bake] classes = []`: that it equals the game's file) |
 
 A stage reuses its earlier output while the settings it depends on are unchanged.
+`--archive <file>` reads another world archive, e.g. `uv run worldlod --archive
+out/pack/san_francisco.dngc preview --base` renders the packed base LOD.
+
+Nothing is installed into the game yet; the packed archive stays in `out/pack`.
 
 ## Development
 

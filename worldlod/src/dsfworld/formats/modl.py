@@ -3,8 +3,11 @@
 MODL is the vehicle MODL of driversf-forza (research/vehicle-model.md):
 {u32 parts, u32 lods, u32 lod_table, u32 0}, parts x 0x60 {float box[16],
 u64 uid, u32 lod_count, u32 lod_offset, ..., u32 trailer @+0x5C}, LOD records
-{u32 mask, u32 count, u32 uid_list, u32 extra_list}, then the submodel UID lists.
-For world parts the box is a corner (row 0) and three full edge vectors.
+{u32 mask, u32 count, u32 uid_list, u32 flag_list}, then every LOD's submodel
+UID list, then every LOD's u32 flag list (one per submodel: render flags, 1 or 5
+on most world geometry). For world parts the box is a corner (row 0) and three
+full edge vectors. The part trailer is the OR of its submodels' flags in 97% of
+stock parts.
 
 World int16 positions are 1/64 m (raw extent = 64 x box size).
 """
@@ -27,6 +30,7 @@ DTYPES = {1: "<i2", 2: "u1", 6: "u1", 8: "<f2", 9: "<f4"}
 class Lod:
     mask: int
     submodels: list[int]  # submodel UIDs
+    flags: list[int]  # one per submodel
 
 
 @dataclass
@@ -35,6 +39,7 @@ class Part:
     box: np.ndarray  # 4x4: corner, then three edge vectors (column 3 unused)
     lods: list[Lod]
     trailer: int
+    reserved: bytes = bytes(12)  # +0x50..0x5B, zero in all but three stock parts
 
     @property
     def size(self) -> float:
@@ -55,6 +60,15 @@ class VertexBuffer:
     stride: int
     elements: list[tuple[int, int, int, int]]  # semantic, components, type, byte offset
     data: bytes
+    decl: bytes = b""  # the VDCL payload as stored
+
+    @property
+    def layout(self) -> tuple:
+        return (self.stride, tuple(self.elements))
+
+    def rows(self) -> np.ndarray:
+        """Vertices as (count, stride) bytes."""
+        return np.frombuffer(self.data, np.uint8, self.count * self.stride).reshape(self.count, self.stride)
 
     def attribute(self, semantic: int) -> np.ndarray | None:
         for sem, comps, typ, off in self.elements:
@@ -87,13 +101,36 @@ def parse_modl(m: bytes) -> list[Part]:
         box = np.array(struct.unpack_from("<16f", m, o)).reshape(4, 4)
         uid = struct.unpack_from("<Q", m, o + 0x40)[0]
         lod_count, lod_offset = struct.unpack_from("<II", m, o + 0x48)
+        reserved = m[o + 0x50 : o + 0x5C]
         trailer = struct.unpack_from("<I", m, o + 0x5C)[0]
         lods = []
         for k in range(lod_count):
-            mask, n, uid_offset, _ = struct.unpack_from("<4I", m, lod_offset + 16 * k)
-            lods.append(Lod(mask, list(struct.unpack_from(f"<{n}Q", m, uid_offset))))
-        parts.append(Part(uid, box, lods, trailer))
+            mask, n, uid_offset, flag_offset = struct.unpack_from("<4I", m, lod_offset + 16 * k)
+            uids = list(struct.unpack_from(f"<{n}Q", m, uid_offset))
+            lods.append(Lod(mask, uids, list(struct.unpack_from(f"<{n}I", m, flag_offset))))
+        parts.append(Part(uid, box, lods, trailer, reserved))
     return parts
+
+
+def build_modl(parts: list[Part]) -> bytes:
+    """Serialise parts in the stock layout (parse_modl round-trips stock MODLs byte for byte)."""
+    lods = [lod for p in parts for lod in p.lods]
+    lod_table = 0x10 + 0x60 * len(parts)
+    uid_list = lod_table + 16 * len(lods)
+    flag_list = uid_list + 8 * sum(len(lod.submodels) for lod in lods)
+    out = bytearray(struct.pack("<4I", len(parts), len(lods), lod_table, 0))
+    k = 0
+    for p in parts:
+        out += struct.pack("<16f", *p.box.reshape(16))
+        out += struct.pack("<QII", p.uid, len(p.lods), lod_table + 16 * k if p.lods else 0)
+        out += p.reserved + struct.pack("<I", p.trailer)
+        k += len(p.lods)
+    uids, flags = bytearray(), bytearray()
+    for lod in lods:
+        out += struct.pack("<4I", lod.mask, len(lod.submodels), uid_list + len(uids), flag_list + len(flags))
+        uids += struct.pack(f"<{len(lod.submodels)}Q", *lod.submodels)
+        flags += struct.pack(f"<{len(lod.flags)}I", *lod.flags)
+    return bytes(out + uids + flags)
 
 
 def load(a: Archive, res, lib: Library | None = None, geometry: bool = True) -> Library:
@@ -114,7 +151,7 @@ def load(a: Archive, res, lib: Library | None = None, geometry: bool = True) -> 
             sem, comps, typ, _ = struct.unpack_from("<IIII", decl, 4 + 16 * i)
             elements.append((sem, comps, typ, off))
             off += comps * np.dtype(DTYPES[typ]).itemsize
-        lib.vbs[uid] = VertexBuffer(n, stride, elements, a.read(kid(v, "VXDT")))
+        lib.vbs[uid] = VertexBuffer(n, stride, elements, a.read(kid(v, "VXDT")), decl)
     for i in walk(res, "IXCK"):
         uid, n, size = struct.unpack_from("<QII", a.read(kid(i, "IXHD")))
         lib.ibs[uid] = np.frombuffer(a.read(kid(i, "IXDT")), "<u2" if size == 2 else "<u4", n)

@@ -36,6 +36,20 @@ classes = ["ground", "buildings", "foliage", "water", "props", "other"]
 # many metres. 0 keeps everything.
 min_model_size = 0.0
 
+[bake]
+# Classes from the detailed regions that go into the base LOD, replacing each
+# cell's stock part below. An empty list turns the bake off; pack then writes
+# the stock archive.
+classes = ["ground"]
+# The stock base parts to replace: a part is replaced when its finest LOD uses a
+# material whose path starts with this prefix. One such part (the vertex-coloured
+# low-poly terrain) sits at the centre of 420 of the 532 detailed cells.
+replace = "terrain/vertcolourlowpolyterrrain"
+# Move the baked geometry down by this many metres. If the engine also draws the
+# base where a cell's detail is loaded, the detail then wins the depth test
+# instead of z-fighting; from Shift height a few centimetres can't be seen.
+lower = 0.1
+
 [preview]
 # Image width and height in pixels.
 size = 1024
