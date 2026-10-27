@@ -158,6 +158,17 @@ def load(a: Archive, res, lib: Library | None = None, geometry: bool = True) -> 
     return lib
 
 
+def submodel_uv(lib: Library, sub: SubModel) -> np.ndarray:
+    """First UV set (semantic 8) of a submodel's vertices, in submodel_geometry's vertex order; zeros if none."""
+    vb = lib.vbs[sub.vb]
+    idx = lib.ibs[sub.ib][sub.first_index : sub.first_index + sub.index_count].astype(np.int64) + sub.base_vertex
+    used = np.unique(idx)
+    uv = vb.attribute(8)
+    if uv is None:
+        return np.zeros((len(used), 2))
+    return uv[used, :2].astype(np.float64)
+
+
 def submodel_geometry(lib: Library, sub: SubModel) -> tuple[np.ndarray, np.ndarray]:
     """Local-space positions (N x 3, metres) and triangles (M x 3) of one submodel."""
     vb = lib.vbs[sub.vb]

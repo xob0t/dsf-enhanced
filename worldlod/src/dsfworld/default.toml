@@ -73,6 +73,17 @@ colour_weight = 1.0
 # cracks. Material boundaries inside a cell stay closed either way.
 lock_border = true
 
+[render]
+# Area for `worldlod render`: "city" (every cell), or [min_x, min_z, max_x, max_z]
+# in metres (made square around its centre).
+area = "city"
+# Image width and height in pixels.
+size = 2048
+# "top" (orthographic, looking down) or "oblique" (45 degrees, from the south).
+view = "top"
+# Largest texture side, in texels, decoded for drawing.
+texture_size = 256
+
 [preview]
 # Image width and height in pixels.
 size = 1024

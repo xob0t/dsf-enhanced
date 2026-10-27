@@ -13,7 +13,7 @@ Status: the bake works offline. It copies the detailed regions' ground (roads,
 kerbs, paving, freeway decks, terrain) into the base LOD in place of each
 cell's stock low-poly terrain, simplifies it and fills what it doesn't cover
 with the stock terrain: 1.05M triangles in 403 cells, 31 MB of vertex and
-index data. It has not been tried in the game yet. Findings are in
+index data. Installable with `worldlod install`; not yet tried in the game. Findings are in
 [research/world-lod.md](research/world-lod.md).
 
 ## Setup
@@ -58,12 +58,18 @@ The pipeline lowers its own process priority (`[run] priority`, default
 | `worldlod preview [--base]` | `preview/<region>.png`, and with `--base` the stock base over the same cell |
 | `worldlod bake` | `bake/<region>.pkl`: the region's `[bake] classes`, moved into the frame of its cell's stock terrain part; `bake/summary.tsv` |
 | `worldlod pack [--verify]` | `pack/san_francisco.dngc` with the baked cells in GEGR; `--verify` re-reads it and checks GEGR's references (with `[bake] classes = []`: that it equals the game's file) |
+| `worldlod render [--cell R_360 \| --area ...] [--view top\|oblique]` | `render/<name>_<view>_{stock,baked,compare}.png`: the stock and the packed base LOD, textured, over the same area (default: the whole city) |
+| `worldlod install` | backs up the game's `san_francisco.dngc` once to `<game>/worldlod-backup/` (with its SHA-256) and puts the packed one in its place |
+| `worldlod uninstall` | puts the backed-up original back |
 
 A stage reuses its earlier output while the settings it depends on are unchanged.
 `--archive <file>` reads another world archive, e.g. `uv run worldlod --archive
 out/pack/san_francisco.dngc preview --base` renders the packed base LOD.
 
-Nothing is installed into the game yet; the packed archive stays in `out/pack`.
+`install` refuses while the game runs, when the packed archive fails its check,
+or when the game's file changed since the last install. It swaps files by
+rename, so a hard link to the original (the stock file has one) keeps the
+original bytes.
 
 ## Development
 

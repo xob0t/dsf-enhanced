@@ -43,6 +43,14 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--force", action="store_true", help="rebuild regions that are up to date")
     p = sub.add_parser("preview", help="render flattened regions to PNG")
     p.add_argument("--base", action="store_true", help="also render the stock base LOD over each cell")
+    sub.add_parser("install", help="back up the game's world archive and put the packed one in its place")
+    sub.add_parser("uninstall", help="put the game's original world archive back")
+    p = sub.add_parser("render", help="draw the stock and the packed base LOD over the same area")
+    p.add_argument("--area", type=float, nargs=4, metavar=("MIN_X", "MIN_Z", "MAX_X", "MAX_Z"), help="metres")
+    p.add_argument("--cell", help="the area of this region's cell, e.g. R_360")
+    p.add_argument("--size", type=int, help="pixels")
+    p.add_argument("--view", choices=["top", "oblique"])
+    p.add_argument("--name", help="output file name prefix")
     p = sub.add_parser("bake", help="copy each region's [bake] classes into its cell's stock base part")
     p.add_argument("--force", action="store_true", help="rebuild regions that are up to date")
     p = sub.add_parser("pack", help="write the world archive with the baked cells in GEGR")
@@ -52,6 +60,12 @@ def main(argv: list[str] | None = None) -> None:
     cfg = config.load(args.config)
     if args.archive:
         cfg.data["game"]["archive"] = str(args.archive.resolve())
+    if args.command in ("install", "uninstall"):
+        from dsfworld.stages import install
+
+        set_priority(cfg.section("run")["priority"])
+        (install.install if args.command == "install" else install.uninstall)(cfg)
+        return
     if args.command == "config":
         print(dump_toml(cfg.data), end="")
         return
@@ -73,6 +87,14 @@ def main(argv: list[str] | None = None) -> None:
             from dsfworld.stages import preview
 
             preview.run(cfg, world, base=args.base)
+        elif args.command == "render":
+            from dsfworld.stages import render
+
+            area, name = args.area, args.name
+            if args.cell:
+                area = world.archive.cell(world.archive.resource(args.cell)).box
+                name = name or args.cell
+            render.run(cfg, world, area, args.size, args.view, name)
         elif args.command == "bake":
             from dsfworld.stages import bake
 
