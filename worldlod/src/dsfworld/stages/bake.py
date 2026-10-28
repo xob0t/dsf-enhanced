@@ -21,7 +21,7 @@ from dsfworld.world import World
 
 SECTIONS = ("game", "classes", "bake", "simplify")
 # Part of the cache key: raise when the bake or simplification output changes for the same settings.
-VERSION = 3
+VERSION = 4
 
 
 def output_dir(cfg: Config) -> Path:
@@ -83,15 +83,20 @@ def run(cfg: Config, world: World, force: bool = False) -> list[CellBake]:
                 cached = None
         if cached is None:
             lib, g = world.region(name)
-            result = bake.bake_region(world, lib, g.instances, matrix, keep, settings["height_offset"])
-            s = cfg.section("simplify")
-            result.groups = simplify.cell(
-                result.groups, s["error"], s["normal_weight"], s["colour_weight"], s["lock_border"]
+            result = bake.bake_region(
+                world, lib, g.instances, matrix, keep, settings["height_offset"], tuple(settings["exclude"])
             )
-            if result.groups and settings["fill_drop"] >= 0:
-                result.groups += bake.fill_from_stock(
-                    world.library, stock_terrain, result.groups, settings["fill_drop"]
-                )
+            s = cfg.section("simplify")
+            simplified = {world.class_names.index(c) for c in s["classes"] if c in world.class_names}
+            to_simplify = [x for x in result.groups if world.class_index(x.material) in simplified]
+            rest = [x for x in result.groups if world.class_index(x.material) not in simplified]
+            result.groups = (
+                simplify.cell(to_simplify, s["error"], s["normal_weight"], s["colour_weight"], s["lock_border"]) + rest
+            )
+            cover_classes = {world.class_names.index(c) for c in settings["fill_cover"] if c in world.class_names}
+            cover = [x for x in result.groups if world.class_index(x.material) in cover_classes]
+            if cover and settings["fill_drop"] >= 0:
+                result.groups += bake.fill_from_stock(world.library, stock_terrain, cover, settings["fill_drop"])
             cached = {"digest": digest, "part": part_uid, "groups": result.groups, "skipped": result.skipped}
             with path.with_suffix(".tmp").open("wb") as f:
                 pickle.dump(cached, f, protocol=pickle.HIGHEST_PROTOCOL)

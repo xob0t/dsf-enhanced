@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from dsfworld.bake import Group
+from dsfworld.bake import Group, read_positions
 from dsfworld.formats import modl
 from dsfworld.formats.archive import Archive, kid, walk
 from dsfworld.formats.chnk import ENTRY_LIMIT, Entry, entry_size
@@ -124,7 +124,7 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
             vb = layouts.setdefault(
                 (g.stride, g.elements), {"uid": uids.new(), "rows": [], "count": 0, "users": [], "decl": g.decl}
             )
-            pos_off = next(e[3] for e in g.elements if e[0] == 0)
+            pos_el = next(e for e in g.elements if e[0] == 0)
             for verts, tris in g.chunks():
                 sub = uids.new()
                 base = vb["count"]
@@ -138,7 +138,7 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
                 n_indices += len(flat)
                 sub_uids.append(sub)
                 sub_flags.append(g.flag)
-                p = verts[:, pos_off : pos_off + 6].copy().view("<i2").astype(np.float64) / 64
+                p = read_positions(verts, pos_el)
                 lo, hi = np.minimum(lo, p.min(0)), np.maximum(hi, p.max(0))
                 stats.submodels += 1
                 stats.triangles += len(tris)

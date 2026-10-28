@@ -41,7 +41,10 @@ min_model_size = 0.0
 # Classes from the detailed regions that go into the base LOD, replacing the
 # stock submodels below. An empty list turns the bake off; pack then writes the
 # stock archive.
-classes = ["ground"]
+classes = ["ground", "foliage"]
+# Materials left out of the bake: their path starts with one of these. Grass
+# cards (1.45M triangles) can't be seen from Shift height.
+exclude = ["trees/foliage_grass", "trees/misc_grasses"]
 # The stock submodels to replace: those whose material path starts with this
 # prefix (the vertex-coloured low-poly terrain). The part holding them, one at
 # the centre of 420 of the 532 detailed cells, receives the baked cell; its
@@ -58,8 +61,13 @@ height_offset = 0.05
 # triangles, moved down by this many metres so that they stay under the baked
 # ground where the two meet. A negative value turns the fill off.
 fill_drop = 2.0
+# Baked classes that count as covering the stock terrain (seen from above) for
+# that fill. Trees don't: the ground under them still needs filling.
+fill_cover = ["ground"]
 
 [simplify]
+# Classes simplified (leaf cards and other small open meshes don't simplify well).
+classes = ["ground"]
 # Largest geometric error, in metres, allowed when simplifying each baked cell.
 # Upper Shift views the city from hundreds of metres up. 0 turns simplification
 # off; above 0 it needs `uv sync --extra simplify`. 0.5 keeps about 62% of the

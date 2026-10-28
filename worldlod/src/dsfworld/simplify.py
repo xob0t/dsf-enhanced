@@ -16,7 +16,7 @@ from __future__ import annotations
 
 import numpy as np
 
-from dsfworld.bake import NORMAL, POSITION, UBYTE4, Group
+from dsfworld.bake import NORMAL, POSITION, UBYTE4, Group, read_positions
 
 COLOUR = 19
 
@@ -63,8 +63,7 @@ def cell(
     base = 0
     for g in groups:
         sems = {e[0]: e for e in g.elements}
-        o = sems[POSITION][3]
-        positions.append(g.vertices[:, o : o + 6].copy().view("<i2").astype(np.float32) / 64)
+        positions.append(read_positions(g.vertices, sems[POSITION]).astype(np.float32))
         a = np.zeros((len(g.vertices), 7), np.float32)
         a[:, 3:] = 1
         if NORMAL in sems and sems[NORMAL][2] == UBYTE4:

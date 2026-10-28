@@ -145,3 +145,19 @@ def test_fill_keeps_only_uncovered_stock_triangles_lowered():
     pos = g.vertices[np.unique(g.triangles), 0:6].copy().view("<i2").astype(float) / 64
     assert len(g.triangles) == 2  # the right square only
     assert pos[:, 0].min() == 20 and np.all(pos[:, 1] == -2)
+
+
+def test_float16_positions_are_moved_and_stay_float16():
+    elements = [(0, 4, 8, 0), (5, 4, 8, 8)]  # half4 position, half4 normal (foliage layout)
+    rows = [struct.pack("<4e4e", x, y, z, 1, 1, 0, 0, 0) for x, y, z in ((1, 0, 0), (0, 2, 0), (0, 0, 3))]
+    lib = Library()
+    lib.vbs[1] = VertexBuffer(3, 16, elements, b"".join(rows), b"decl")
+    lib.ibs[2] = np.array([0, 1, 2], np.uint16)
+    lib.submodels[3] = SubModel(3, 0xAA, 1, 0, 0, 2, 0, 3)
+    lib.parts[4] = Part(4, np.zeros((4, 4)), [Lod(2, [3], [1])], 1)
+    (g,) = bake.bake_region(Classes(), lib, [Instance(4, 0, yaw(90, (10, 0, 20)))], np.eye(4), {0}).groups
+    pos = g.vertices[:, 0:6].copy().view("<f2").astype(float)
+    np.testing.assert_allclose(pos[0], (10, 0, 21), atol=0.01)  # (1,0,0) turned 90 degrees is (0,0,1)
+    np.testing.assert_allclose(pos[1], (10, 2, 20), atol=0.01)
+    normal = g.vertices[0, 8:14].copy().view("<f2").astype(float)
+    np.testing.assert_allclose(normal, (0, 0, 1), atol=0.01)

@@ -1,9 +1,11 @@
 """Bake one region's geometry into the frame of a stock base part.
 
 Each source submodel placed in the region is copied vertex for vertex: positions
-(int16, 1/64 m) and normals (ubyte4, x * 2 - 1) are moved from the source
-instance's frame into the target part's frame, every other attribute is kept as
-stored. Copies are grouped by material, flag and vertex layout, welded, and
+(int16 in 1/64 m, float16 or float32 in metres, kept in their stored type) and
+normals (ubyte4 as x * 2 - 1, or float16) are moved from the source instance's
+frame into the target part's frame; every other attribute is kept as stored.
+Float16 positions lose precision away from the cell centre (0.25 m beyond 256 m),
+which only foliage uses. Copies are grouped by material, flag and vertex layout, welded, and
 split into submodels of at most 65,535 vertices (16-bit indices).
 """
 
@@ -24,6 +26,56 @@ NORMAL = 5
 COPIED = {8, 9, 19}
 INT16 = 1
 UBYTE4 = 6
+FLOAT16 = 8
+# VDCL type -> (numpy dtype, metres per stored unit) of positions
+POSITION_TYPES = {INT16: ("<i2", 1 / 64), FLOAT16: ("<f2", 1.0), 9: ("<f4", 1.0)}
+
+
+def _span(element) -> tuple[int, str, int]:
+    _, comps, typ, off = element
+    dtype = POSITION_TYPES[typ][0] if typ in POSITION_TYPES else "u1"
+    return off, dtype, np.dtype(dtype).itemsize
+
+
+def read_positions(rows: np.ndarray, element) -> np.ndarray:
+    """(n, 3) metres from vertex rows (n, stride)."""
+    off, dtype, size = _span(element)
+    raw = rows[:, off : off + 3 * size].copy().view(dtype).astype(np.float64)
+    return raw * POSITION_TYPES[element[2]][1]
+
+
+def write_positions(rows: np.ndarray, element, p: np.ndarray) -> bool:
+    """Store (n, 3) metres into rows; False if they don't fit the stored type."""
+    off, dtype, size = _span(element)
+    stored = p / POSITION_TYPES[element[2]][1]
+    if element[2] == INT16:
+        stored = np.round(stored)
+        if np.abs(stored).max(initial=0) > 32767:
+            return False
+    elif element[2] == FLOAT16 and np.abs(stored).max(initial=0) > 65000:
+        return False
+    rows[:, off : off + 3 * size] = stored.astype(dtype).view(np.uint8).reshape(len(rows), 3 * size)
+    return True
+
+
+def read_normals(rows: np.ndarray, element) -> np.ndarray:
+    off = element[3]
+    if element[2] == UBYTE4:
+        return rows[:, off : off + 3].astype(np.float64) / 255 * 2 - 1
+    return rows[:, off : off + 6].copy().view("<f2").astype(np.float64)
+
+
+def write_normals(rows: np.ndarray, element, n: np.ndarray) -> None:
+    off = element[3]
+    if element[2] == UBYTE4:
+        rows[:, off : off + 3] = np.clip(np.round((n + 1) / 2 * 255), 0, 255).astype(np.uint8)
+    else:
+        rows[:, off : off + 6] = n.astype("<f2").view(np.uint8).reshape(len(rows), 6)
+
+
+def positions(g) -> np.ndarray:
+    """(n, 3) metres of a group's vertices."""
+    return read_positions(g.vertices, next(e for e in g.elements if e[0] == POSITION))
 
 
 @dataclass
@@ -81,9 +133,11 @@ def bake_region(
     target: np.ndarray,
     keep: set[int],
     height_offset: float = 0.0,
+    exclude: tuple[str, ...] = (),
 ):
     """Copy the submodels of the given classes placed by instances into the frame of target (a 4x4 matrix),
-    moved up by height_offset metres (world Y; negative moves down)."""
+    moved up by height_offset metres (world Y; negative moves down). Materials whose path starts with
+    one of exclude are left out."""
     a_t, t_t = _frame(target)
     inv_t = np.linalg.inv(a_t)
     pieces: dict[tuple, list] = {}
@@ -105,6 +159,8 @@ def bake_region(
             sub = lib.submodels.get(su)
             if sub is None or world.class_index(sub.material) not in keep:
                 continue
+            if exclude and world.materials.paths.get(sub.material, "").startswith(exclude):
+                continue
             vb = lib.vbs.get(sub.vb)
             if vb is None:
                 skipped["missing vertex buffer"] += 1
@@ -114,33 +170,26 @@ def bake_region(
                 continue
             sems = {e[0]: e for e in vb.elements}
             pos = sems.get(POSITION)
-            if pos is None or pos[1:3] != (4, INT16):
-                skipped["position not int16"] += 1
+            if pos is None or pos[2] not in POSITION_TYPES or pos[1] < 3:
+                skipped["unsupported position type"] += 1
                 continue
             if set(sems) - {POSITION, NORMAL} - COPIED:
                 skipped["unhandled semantic"] += 1
                 continue
-            if NORMAL in sems and sems[NORMAL][1:3] != (4, UBYTE4):
-                skipped["normal not ubyte4"] += 1
+            if NORMAL in sems and sems[NORMAL][2] not in (UBYTE4, FLOAT16):
+                skipped["unsupported normal type"] += 1
                 continue
             idx = lib.ibs[sub.ib][sub.first_index : sub.first_index + sub.index_count].astype(np.int64)
             idx += sub.base_vertex
             used, tri = np.unique(idx, return_inverse=True)
             rows = vb.rows()[used].copy()
-            p_off = pos[3]
-            p = rows[:, p_off : p_off + 6].view("<i2").astype(np.float64) / 64
-            q = p @ linear + offset
-            enc = np.round(q * 64)
-            if np.abs(enc).max(initial=0) > 32767:
+            if not write_positions(rows, pos, read_positions(rows, pos) @ linear + offset):
                 skipped["outside the target frame"] += 1
                 continue
-            rows[:, p_off : p_off + 6] = enc.astype("<i2").view(np.uint8).reshape(len(rows), 6)
             if NORMAL in sems:
-                n_off = sems[NORMAL][3]
-                n = rows[:, n_off : n_off + 3].astype(np.float64) / 255 * 2 - 1
-                n = n @ normal_m
+                n = read_normals(rows, sems[NORMAL]) @ normal_m
                 n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-12
-                rows[:, n_off : n_off + 3] = np.clip(np.round((n + 1) / 2 * 255), 0, 255).astype(np.uint8)
+                write_normals(rows, sems[NORMAL], n)
             tri = tri.reshape(-1, 3)
             if flip:
                 tri = tri[:, ::-1]
@@ -168,11 +217,6 @@ FILL_GRID = 2.0  # metres per coverage cell
 FILL_COVERED = 0.95  # a stock triangle at least this covered by baked geometry is dropped
 
 
-def _positions(g: Group) -> np.ndarray:
-    o = next(e[3] for e in g.elements if e[0] == POSITION)
-    return g.vertices[:, o : o + 6].copy().view("<i2").astype(np.float64) / 64
-
-
 def _samples(tri: np.ndarray, per_area: float, rng: np.random.Generator, cap: int = 4000):
     """Random points on triangles (M, 3, 3): (points, triangle index of each)."""
     area = 0.5 * np.linalg.norm(np.cross(tri[:, 1] - tri[:, 0], tri[:, 2] - tri[:, 0]), axis=1)
@@ -191,7 +235,7 @@ def fill_from_stock(lib: modl.Library, stock: list[tuple[int, int]], baked: list
     rng = np.random.default_rng(0)
     covered: set[tuple[int, int]] = set()
     for g in baked:
-        p, _ = _samples(_positions(g)[g.triangles], 2 / FILL_GRID**2, rng)
+        p, _ = _samples(positions(g)[g.triangles], 2 / FILL_GRID**2, rng)
         covered.update(map(tuple, np.floor(p[:, [0, 2]] / FILL_GRID).astype(np.int64).tolist()))
     out = []
     for su, flag in stock:
@@ -202,8 +246,7 @@ def fill_from_stock(lib: modl.Library, stock: list[tuple[int, int]], baked: list
         used, tri = np.unique(idx, return_inverse=True)
         tri = tri.reshape(-1, 3)
         rows = vb.rows()[used].copy()
-        o = sems[POSITION][3]
-        p = rows[:, o : o + 6].view("<i2").astype(np.float64) / 64
+        p = read_positions(rows, sems[POSITION])
         pts, owner = _samples(p[tri], 1 / FILL_GRID**2, rng)
         cells = np.floor(pts[:, [0, 2]] / FILL_GRID).astype(np.int64)
         hit = np.fromiter((tuple(c) in covered for c in cells.tolist()), bool, len(cells))
@@ -212,7 +255,7 @@ def fill_from_stock(lib: modl.Library, stock: list[tuple[int, int]], baked: list
         if not len(tri):
             continue
         p[:, 1] -= drop
-        rows[:, o : o + 6] = np.round(p * 64).astype("<i2").view(np.uint8).reshape(len(rows), 6)
+        write_positions(rows, sems[POSITION], p)
         keep, remap = np.unique(tri, return_inverse=True)
         out.append(Group(sub.material, flag, vb.stride, tuple(vb.elements), vb.decl, rows[keep], remap.reshape(-1, 3)))
     return out
