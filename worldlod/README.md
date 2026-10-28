@@ -63,10 +63,10 @@ with a comment per setting. To change one, put it in a file and pass it with
 
 ```toml
 [bake]
-min_model_size = { buildings = 4.0 }  # drop building detail smaller than 4 m
+min_model_size = { buildings = 2.0 }  # leave out building detail smaller than 2 m
 
 [simplify]
-error = 1.0  # simplify the ground more (metres)
+error = 0.5  # simplify the ground (metres): lighter, a little less exact
 ```
 
 Tables keyed by class name (`[classes]`, `min_model_size`) replace the default

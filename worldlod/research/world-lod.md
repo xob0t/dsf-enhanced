@@ -302,9 +302,12 @@ Result with these fixes (ground only; 2026-10-28, since superseded): 403 parts
 replaced, 7,995 submodels, 1,049,811 triangles (931k baked ground and 118k stock
 fill; 1.57M before simplification), 30.6 MB of buffers in 20 DRSP groups.
 
-Current default (ground, trees, building detail and road text): 408 parts get
-a bake, 14,409 submodels, 7,637,965 triangles, 32 cloned materials, 239 MB of
-buffers in 116 new DRSP groups. The 12 cells that bake nothing keep their part
+Current default (ground, trees, all building detail and road text, ground not
+simplified): 408 parts get a bake, 14,424 submodels, 8,491,887 triangles, 32
+cloned materials, 260 MB of buffers in 125 new DRSP groups, a 352 MB streamer
+budget. v1.2.0 left out building detail under 2 m and simplified the ground at
+0.5 m: 7,637,965 triangles and 239 MB; keeping the small detail adds 0.21M
+triangles and 7 MB, the exact ground 0.65M and 14 MB. The 12 cells that bake nothing keep their part
 as it is; a cell that bakes no ground (5) keeps its stock terrain submodels
 next to what it bakes.
 

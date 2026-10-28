@@ -57,8 +57,9 @@ exclude = [
 # Per class: leave out placed models whose longest box edge (after instance
 # scale) is below this many metres. "buildings" in the detailed regions are the
 # overlays on the base's building shells and the street furniture: storefronts,
-# rooftop units, fire escapes, containers, pallets, rocks.
-min_model_size = { buildings = 2.0 }
+# rooftop units, fire escapes, containers, pallets, rocks. Empty keeps them all:
+# the ones under 2 m are 0.21M triangles and 7 MB, and fill rooftops and streets.
+min_model_size = {}
 # Leaf-card trees (most trees and bushes) light themselves with a per-object
 # sample that the base LOD never sets, so baked as they are they draw black.
 # "flat" lays each card flat, facing up, and draws it with a clone of
@@ -91,10 +92,10 @@ fill_cover = ["ground"]
 # Classes simplified (leaf cards and other small open meshes don't simplify well).
 classes = ["ground"]
 # Largest geometric error, in metres, allowed when simplifying each baked cell.
-# Upper Shift views the city from hundreds of metres up. 0 turns simplification
-# off. 0.5 keeps about 62% of the
-# ground triangles, 1.0 about 52%.
-error = 0.5
+# 0 (the default) keeps the ground exactly as the detailed regions have it: the
+# full ground costs 0.65M triangles and 14 MB more than at 0.5 m. 0.5 keeps about
+# 62% of the ground triangles, 1.0 about 52%.
+error = 0.0
 # Weights in the error metric of the normals (shading) and the vertex colour
 # (the terrain's texture blend weights). 0 ignores the attribute.
 normal_weight = 0.1
