@@ -121,6 +121,19 @@ def run_stage(cfg: config.Config, world: World, args: argparse.Namespace) -> Non
 
 
 def main(argv: list[str] | None = None) -> None:
+    try:
+        _main(argv)
+    except SystemExit as e:
+        if isinstance(e.code, str):  # a message: say it in red, exit 1
+            ui.fail(e.code)
+            raise SystemExit(1) from None
+        raise
+    except KeyboardInterrupt:
+        ui.fail("Stopped")
+        raise SystemExit(130) from None
+
+
+def _main(argv: list[str] | None) -> None:
     args = parser().parse_args(argv)
     cfg = settings(args)
     if args.command == "config":

@@ -101,6 +101,7 @@ def install(cfg: Config) -> None:
             tmp.replace(backup)
         manifest["original"] = current
         manifest_path.write_text(json.dumps(manifest, indent=2))
+        ui.done("Backed up the original map", str(backup))
     elif sha256(backup) != manifest.get("original"):
         raise SystemExit(f"{backup} doesn't match its recorded hash; not touching anything")
     elif current not in (manifest.get("original"), manifest.get("installed")):
@@ -114,7 +115,8 @@ def install(cfg: Config) -> None:
         shutil.rmtree(cfg.work_dir / "bake", ignore_errors=True)
         shutil.rmtree(packed.parent, ignore_errors=True)
     undo = "install.cmd --uninstall" if os.environ.get("WORLDLOD_LAUNCHER") else "worldlod uninstall"
-    ui.say(f"Installed into {cfg.game_dir}. `{undo}` puts the original back.")
+    ui.done(f"Installed the new map into {cfg.game_dir}")
+    ui.note(f"To put the original back: {undo}")
 
 
 def uninstall(cfg: Config) -> None:
@@ -133,7 +135,8 @@ def uninstall(cfg: Config) -> None:
         with ui.status(f"Restoring the original {target.name}"):
             _swap_in(backup, target)
         manifest["installed"] = None
-        ui.say(f"Restored the original {target}; the backup stays in {backup.parent}")
+        ui.done("Restored the original map", str(target))
+        ui.note(f"The backup stays in {backup.parent}")
     plugin.uninstall(cfg.game_dir, backup.parent, manifest)
     if backup.exists():
         manifest_path.write_text(json.dumps(manifest, indent=2))

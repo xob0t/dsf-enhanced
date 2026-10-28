@@ -11,6 +11,7 @@ from __future__ import annotations
 
 import hashlib
 import struct
+import time
 from pathlib import Path
 
 import numpy as np
@@ -125,22 +126,26 @@ def run(cfg: Config, world: World, *, force: bool = False) -> Path:
     stamp = out.with_name(out.name + ".key")
     key = build_key(cfg, world)
     if not force and out.exists() and stamp.exists() and stamp.read_text() == key:
-        ui.say(f"Up to date: {out}")
+        ui.done("Already built, nothing changed", str(out))
         return out
+    started = time.monotonic()
     a = world.archive
     cells = bake.run(cfg, world, force=force)
+    rows = []
     if cells:
-        with ui.status("Writing the baked cells into GEGR"):
+        with ui.status("Writing the baked cells into the base LOD"):
             g = a.global_region()
             stock_mdxn = kid(g, "MDXN").size
             stats = gegr.apply(a, g, cells, uid.Allocator(uid.existing(a)))
-            mdxn, nonr = gegr.update_budgets(a, a.entries, stock_mdxn)
-        ui.say(
-            f"GEGR: {stats.cells} parts replaced, {stats.submodels:,} submodels, {stats.triangles:,} triangles, "
-            f"{stats.materials} cloned materials, "
-            f"{(stats.vertex_bytes + stats.index_bytes) / 1e6:.1f} MB of buffers in {stats.drsp} new groups; "
-            f"streamer budgets {mdxn / 1e6:.1f} MB and {nonr / 1e3:.0f} KB"
-        )
+            mdxn, _ = gegr.update_budgets(a, a.entries, stock_mdxn)
+        rows = [
+            ("Cells rebuilt", f"{stats.cells}"),
+            ("Triangles", f"{stats.triangles:,}"),
+            ("Submodels", f"{stats.submodels:,}"),
+            ("Tree materials", f"{stats.materials} lit copies for the leaf-card trees"),
+            ("Geometry", f"{(stats.vertex_bytes + stats.index_bytes) / 1e6:.0f} MB in {stats.drsp} new groups"),
+            ("Streamer budget", f"{mdxn / 1e6:.0f} MB for the base LOD"),
+        ]
     out.parent.mkdir(parents=True, exist_ok=True)
     stamp.unlink(missing_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
@@ -148,12 +153,15 @@ def run(cfg: Config, world: World, *, force: bool = False) -> Path:
     with ui.status(f"Writing {out.name}"), tmp.open("w+b") as f:
         size = write_chunk(f, a.f, a.entries, version, pad_end=a.root.pad_end)
     tmp.replace(out)
+    ui.done(f"Wrote {out.name}", f"{size / 1e6:,.0f} MB")
     with ui.status("Checking it"):
         problems = check(out) if cells else ([] if sha256(out) == sha256(a.path) else ["differs from the source"])
     for p in problems[:20]:
-        ui.say("  " + p)
+        ui.fail(p)
     if problems:
         raise SystemExit(f"{out} fails its check ({len(problems)} problems)")
+    ui.done("Checked: every reference resolves and fits the streamer")
     stamp.write_text(key)
-    ui.say(f"Built {out} ({size / 1e6:,.0f} MB), checked")
+    minutes, seconds = divmod(round(time.monotonic() - started), 60)
+    ui.summary("New upper-Shift map", [*rows, ("File", str(out))], footer=f"built in {minutes}:{seconds:02d}")
     return out

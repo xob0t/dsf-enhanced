@@ -25,7 +25,6 @@ from dsfworld.world import World
 SECTIONS = ("game", "classes", "bake", "simplify")
 # Part of the cache key: raise when the bake or simplification output changes for the same settings.
 VERSION = 9
-LISTED = 12  # regions named in the summary's line of regions without a stock part
 
 
 def output_dir(cfg: Config) -> Path:
@@ -237,11 +236,9 @@ def _report(out: Path, rows: list[list], no_target: list[str], skipped: Counter)
     with (out / "summary.tsv").open("w", encoding="utf-8") as f:
         f.write("region\tgroups\tvertices\ttriangles\tskipped_placements\n")
         f.writelines("\t".join(map(str, r)) + "\n" for r in rows)
-    ui.say(f"Baked {len(rows)} cells, {sum(r[3] for r in rows):,} triangles (per region: {out / 'summary.tsv'})")
+    ui.done(f"Baked {len(rows)} regions", f"{sum(r[3] for r in rows):,} triangles")
     if no_target:
-        ui.say(
-            f"{len(no_target)} regions have no stock part to replace (sea, map edge): "
-            f"{', '.join(no_target[:LISTED])}{' ...' if len(no_target) > LISTED else ''}"
-        )
+        ui.note(f"{len(no_target)} regions are open sea or the map edge: nothing to replace there")
     if skipped:
-        ui.say("Skipped submodel placements: " + ", ".join(f"{k} {v}" for k, v in skipped.most_common()))
+        ui.note("Left out: " + ", ".join(f"{v} placements ({k})" for k, v in skipped.most_common()))
+    ui.note(f"Per region: {out / 'summary.tsv'}")

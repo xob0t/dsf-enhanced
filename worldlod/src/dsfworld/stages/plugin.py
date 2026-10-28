@@ -81,7 +81,7 @@ def install(game: Path, backup_dir: Path, manifest: dict, source: Path | None) -
             record["replaced"].append(name)
         target.write_bytes(data)
         record["placed"][name] = hashlib.sha256(data).hexdigest()
-    ui.say(f"Installed DSF Enhanced ({', '.join(record['placed'])})")
+    ui.done("Installed DSF Enhanced", ", ".join(record["placed"]))
 
 
 def uninstall(game: Path, backup_dir: Path, manifest: dict) -> None:
@@ -96,4 +96,4 @@ def uninstall(game: Path, backup_dir: Path, manifest: dict) -> None:
     for name in record["replaced"]:
         if (backup_dir / name).exists() and not (game / name).exists():
             shutil.move(backup_dir / name, game / name)
-    ui.say(f"Removed DSF Enhanced (restored: {', '.join(record['replaced']) or 'nothing'})")
+    ui.done("Removed DSF Enhanced", f"put back: {', '.join(record['replaced'])}" if record["replaced"] else "")
