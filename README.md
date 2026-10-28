@@ -78,7 +78,7 @@ This writes the plugin files, this README, the license, `DSF-Enhanced.zip` and `
 
 ## Releases
 
-Releases are built by GitHub Actions ([.github/workflows/build.yml](.github/workflows/build.yml)). To release, push a version tag:
+Releases are built by GitHub Actions ([.github/workflows/release.yml](.github/workflows/release.yml)). To release, push a version tag:
 
 ```powershell
 git tag v1.2.0
