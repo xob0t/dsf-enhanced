@@ -25,7 +25,9 @@ def test_yaw_record_is_a_rotation_in_its_cell():
     np.testing.assert_allclose(rot @ rot.T, np.eye(3), atol=2e-4)
     assert rot[1, 1] == 1
     x, y, z = inst.matrix[3, :3]
-    assert -1280 <= x < -768 and 768 <= z < 1280 and y > 0
+    assert -1280 <= x < -768
+    assert 768 <= z < 1280
+    assert y > 0
     assert inst.model_uid == 0x42
 
 
@@ -74,4 +76,5 @@ def test_parse_header():
     blob[0x38:0x4C] = R_093
     g = gebi.parse(bytes(blob))
     assert (g.column, g.row) == (6, 3)
-    assert len(g.instances) == 1 and g.instances[0].model_uid == 0xABCDEF
+    assert len(g.instances) == 1
+    assert g.instances[0].model_uid == 0xABCDEF

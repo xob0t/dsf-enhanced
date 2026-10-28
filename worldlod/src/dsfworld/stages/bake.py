@@ -25,6 +25,7 @@ from dsfworld.world import World
 SECTIONS = ("game", "classes", "bake", "simplify")
 # Part of the cache key: raise when the bake or simplification output changes for the same settings.
 VERSION = 8
+LISTED = 12  # regions named in the summary's line of regions without a stock part
 
 
 def output_dir(cfg: Config) -> Path:
@@ -202,8 +203,8 @@ def _report(out: Path, rows: list[list], no_target: list[str], skipped: Counter)
     print(f"{len(rows)} cells baked, {sum(r[3] for r in rows):,} triangles; summary in {out / 'summary.tsv'}")
     if no_target:
         print(
-            f"{len(no_target)} regions have no stock part to replace: {', '.join(no_target[:12])}"
-            f"{' ...' if len(no_target) > 12 else ''}"
+            f"{len(no_target)} regions have no stock part to replace: {', '.join(no_target[:LISTED])}"
+            f"{' ...' if len(no_target) > LISTED else ''}"
         )
     if skipped:
         print("skipped submodel placements: " + ", ".join(f"{k} {v}" for k, v in skipped.most_common()))

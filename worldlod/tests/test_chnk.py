@@ -37,11 +37,13 @@ def test_unpadded_container_end_round_trips():
     ]
     inner_data = io.BytesIO()
     total = write_chunk(inner_data, None, inner, pad_end=False)
-    assert total % 16 == 0 and total % 128 != 0
+    assert total % 16 == 0
+    assert total % 128 != 0
     outer = [Entry("NONR", 0, 0, 0, 12, None, children=inner, pad_end=False)]
     data = build(outer)
     root = read_chunk(io.BytesIO(data))
-    assert root.entries[0].pad_end is False and root.entries[0].size == total
+    assert root.entries[0].pad_end is False
+    assert root.entries[0].size == total
     out = io.BytesIO()
     write_chunk(out, io.BytesIO(data), root.entries, pad_end=root.pad_end)
     assert out.getvalue() == data

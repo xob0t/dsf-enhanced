@@ -25,22 +25,24 @@ build-backend = "uv_build"
 module-name = "dsfworld"
 
 [tool.ruff]
-line-length = 120
-target-version = "py313"
+line-length = 120  # the target version comes from requires-python
 
 [tool.ruff.lint]
 select = [
     "E", "W", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "RET", "PTH", "PERF", "FURB", "RUF", "PIE",
-    "PL", "FBT", "ARG", "ERA", "LOG", "G", "T10", "FLY",
+    "PL", "FBT", "ARG", "ERA", "FLY", "INP", "PT",
 ]
 ignore = [
-    "PLR2004",  # binary formats compare against their own constants (tags, offsets, types)
     "PLR0913",  # pipeline functions take their settings as arguments
     "PLC0415",  # lazy imports keep optional dependencies (meshoptimizer) optional
 ]
 
 [tool.ruff.lint.per-file-ignores]
-"tests/*" = ["PLR0917"]  # vertex builders take coordinates
+# Binary formats compare against their own constants (sizes, limits, types, sentinels).
+"src/dsfworld/formats/*" = ["PLR2004"]
+"src/dsfworld/bake.py" = ["PLR2004"]
+# Tests: vertex builders take coordinates; expected values are literals; tests/ is no package.
+"tests/*" = ["PLR0917", "PLR2004", "INP001"]
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

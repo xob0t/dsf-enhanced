@@ -20,6 +20,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from dsfworld.formats.archive import Archive, SubModel, kid, walk
+from dsfworld.formats.chnk import Entry
 
 # VDCL element semantics
 POSITION = 0
@@ -163,9 +164,15 @@ def load(a: Archive, res, lib: Library | None = None) -> Library:
             off += comps * np.dtype(DTYPES[typ]).itemsize
         lib.vbs[uid] = VertexBuffer(n, stride, elements, a.read(kid(v, "VXDT")), decl)
     for i in walk(res, "IXCK"):
-        uid, n, size = struct.unpack_from("<QII", a.read(kid(i, "IXHD")))
-        lib.ibs[uid] = np.frombuffer(a.read(kid(i, "IXDT")), "<u2" if size == 2 else "<u4", n)
+        uid, indices = read_index_buffer(a, i)
+        lib.ibs[uid] = indices
     return lib
+
+
+def read_index_buffer(a: Archive, ixck: Entry) -> tuple[int, np.ndarray]:
+    """An IXCK's UID and indices. IXHD: {u64 uid, u32 count, u32 bytes per index (2 or 4), ...}."""
+    uid, n, size = struct.unpack_from("<QII", a.read(kid(ixck, "IXHD")))
+    return uid, np.frombuffer(a.read(kid(ixck, "IXDT")), "<u2" if size == 2 else "<u4", n)
 
 
 def submodel_indices(lib: Library, sub: SubModel) -> tuple[np.ndarray, np.ndarray]:

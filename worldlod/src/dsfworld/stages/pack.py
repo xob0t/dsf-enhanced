@@ -41,8 +41,8 @@ def _buffers(a: Archive, g: Entry, problems: list[str]) -> tuple[dict[int, int],
         if kid(v, "VXDT").size != n * stride:
             problems.append(f"VXCK {u:#x}: data size {kid(v, 'VXDT').size} != {n} x {stride}")
     for i in walk(g, "IXCK"):
-        u, n, size = struct.unpack_from("<QII", a.read(kid(i, "IXHD")))
-        ibs[u] = np.frombuffer(a.read(kid(i, "IXDT")), "<u2" if size == 2 else "<u4", n)
+        u, indices = modl.read_index_buffer(a, i)
+        ibs[u] = indices
     return vbs, ibs
 
 

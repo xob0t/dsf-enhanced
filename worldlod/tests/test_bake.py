@@ -67,7 +67,8 @@ def test_welds_identical_vertices_across_instances():
     target = np.eye(4)
     same = Instance(4, 0, np.eye(4))
     (g,) = bake.bake_region(Classes(), lib, [same, same], target, {0}).groups
-    assert len(g.vertices) == 3 and len(g.triangles) == 2
+    assert len(g.vertices) == 3
+    assert len(g.triangles) == 2
 
 
 def test_mirrored_instance_flips_winding():
@@ -90,7 +91,8 @@ def test_chunks_stay_within_16_bit_indices():
     assert len(chunks) == 2
     assert sum(len(t) for _, t in chunks) == n
     for v, t in chunks:
-        assert len(v) <= bake.MAX_VERTICES and t.max() < len(v)
+        assert len(v) <= bake.MAX_VERTICES
+        assert t.max() < len(v)
 
 
 def test_height_offset_moves_in_world_space():
@@ -146,7 +148,8 @@ def test_fill_keeps_only_uncovered_stock_triangles_lowered():
     (g,) = bake.fill_from_stock(stock, [(3, 5)], [lower, upper], drop=2.0)
     pos = g.vertices[np.unique(g.triangles), 0:6].copy().view("<i2").astype(float) / 64
     assert len(g.triangles) == 2  # the right square only
-    assert pos[:, 0].min() == 20 and np.all(pos[:, 1] == -2)
+    assert pos[:, 0].min() == 20
+    assert np.all(pos[:, 1] == -2)
 
 
 def test_leaf_card_pivot_is_moved_and_card_data_kept():
@@ -180,9 +183,11 @@ def test_second_stream_is_folded_into_the_vertex():
     lib.vbs[1].decl = struct.pack("<I12I", 3, 0, 4, 1, 0xA0, 8, 2, 8, 0xA1, 5, 4, 6, 0xA2)
     lib.submodels[3] = SubModel(3, 0xAA, 1, 7, 0, 2, 0, 3, vb2_base=5)
     (g,) = bake.bake_region(Classes(), lib, [Instance(4, 0, np.eye(4))], np.eye(4), {0}).groups
-    assert g.stride == 20 and g.elements[-1] == (19, 4, 6, 16)
+    assert g.stride == 20
+    assert g.elements[-1] == (19, 4, 6, 16)
     assert g.vertices[:, 16:20].tolist() == [[10, 0, 0, 255], [0, 20, 0, 255], [0, 0, 30, 255]]
-    assert struct.unpack_from("<I", g.decl)[0] == 4 and g.decl.endswith(struct.pack("<4I", 19, 4, 6, 0xC0))
+    assert struct.unpack_from("<I", g.decl)[0] == 4
+    assert g.decl.endswith(struct.pack("<4I", 19, 4, 6, 0xC0))
 
 
 def test_flat_leaf_cards_become_upward_quads_in_the_template_layout():
@@ -243,8 +248,10 @@ def test_material_clone_takes_the_source_texture():
     clone = gegr.clone_material(None, palm, leaf, 3)
     assert struct.unpack_from("<QII", clone.children[0].payload) == (3, 1, 0)
     alpha, diffuse = clone.children[1].children[1:]
-    assert struct.unpack_from("<f", alpha.payload, 32)[0] == 0.75 and diffuse.payload[32:40] == b"L" * 8
-    assert diffuse.payload[:15] == b"g_texDiffuseMap" and struct.unpack_from("<I", diffuse.payload, 48)[0] == 9
+    assert struct.unpack_from("<f", alpha.payload, 32)[0] == 0.75
+    assert diffuse.payload[32:40] == b"L" * 8
+    assert diffuse.payload[:15] == b"g_texDiffuseMap"
+    assert struct.unpack_from("<I", diffuse.payload, 48)[0] == 9
     assert palm.children[1].children[2].payload[32:40] == b"P" * 8  # the template is unchanged
 
 
@@ -263,4 +270,5 @@ def test_fill_without_cover_keeps_the_stock_terrain_in_place():
         [0, 1, 2],
     )
     (g,) = bake.fill_from_stock(stock, [(3, 5)], [], drop=0.0)
-    assert len(g.triangles) == 1 and np.all(bake.positions(g)[:, 1] == 0)
+    assert len(g.triangles) == 1
+    assert np.all(bake.positions(g)[:, 1] == 0)
