@@ -302,10 +302,11 @@ Result with these fixes (ground only; 2026-10-28, since superseded): 403 parts
 replaced, 7,995 submodels, 1,049,811 triangles (931k baked ground and 118k stock
 fill; 1.57M before simplification), 30.6 MB of buffers in 20 DRSP groups.
 
-Current default (ground, trees, building detail and road text; a cell that
-bakes no ground keeps its stock terrain submodels next to what it bakes, so
-every one of the 420 terrain parts gets a bake): 420 parts, 14,426 submodels, 7,638,372 triangles,
-32 cloned materials, 239 MB of buffers in 116 new DRSP groups.
+Current default (ground, trees, building detail and road text): 408 parts get
+a bake, 14,409 submodels, 7,637,965 triangles, 32 cloned materials, 239 MB of
+buffers in 116 new DRSP groups. The 12 cells that bake nothing keep their part
+as it is; a cell that bakes no ground (5) keeps its stock terrain submodels
+next to what it bakes.
 
 ## Trees and building detail (2026-10-28)
 
