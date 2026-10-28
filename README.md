@@ -17,6 +17,7 @@ Each release has a ZIP for each:
 - Forces anisotropic and trilinear texture filtering. It also has mip and LOD-bias settings.
 - Draws traffic cars at full detail out to their draw distance, raises other gameplay LOD thresholds, and lets you extend how far away civilian traffic spawns.
 - Shrinks the distant brake and position lamp flares to small dots.
+- Draws the passengers of the car you drive in the in-car camera. The game hides everyone in your car in that view, so after a Shift into a traffic car its passengers vanish from the cockpit view but show in the chase view (`[Quality] CockpitPassengers`).
 - In the garage's vehicles screen, Up/Down switch to the previous or next maker while a maker's cars are open, so every maker's cars can be browsed without going back to the maker list.
 - Skips the legal-screen wait and dismisses the prompt about Ubisoft's servers, which no longer exist.
 - Lifts three engine limits that bigger world or car archives run into and crash on: 45,000 resources loaded at once (`[Limits] ResourceArenaExtraNodes`, 135,000 more by default, about 3 MB), 16,384 resource references waiting to be resolved (`[Limits] PendingResourceReferences`, 131,072 by default, 1.5 MB), and 15,000 submodels loaded at once (`[Limits] SubmodelTableExtraNodes`, 60,000 more by default, about 1.4 MB).
@@ -35,6 +36,7 @@ Settings live in `dsf_enhanced.ini`. The defaults turn on borderless mode, 16x a
 - `VehicleFullDetail=0` restores the game's vehicle LOD steps; `VehicleLODThresholdScale` then scales them.
 - `LODEngineThresholdScale` (terrain, pedestrians, drivers) and `MapDetailLODThresholdScale` at `1.0` restore the native LOD thresholds.
 - Clear `DRLFlareScale` and `DRLFlareBrightness` in `[Lights]` to keep the game's lamp flares.
+- `CockpitPassengers=0` hides your car's passengers in the in-car camera again, as the game does.
 - `[General] Log=0` stops the plugin from writing `dsf_enhanced.log`.
 
 To uninstall, delete the three files. If the game already has a `winmm.dll`, from another ASI loader for example, back it up before installing. Nothing here touches `Driver.exe` or `gameconfig.txt`.
