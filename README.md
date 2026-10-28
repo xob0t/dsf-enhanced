@@ -20,6 +20,7 @@ Each release has a ZIP for each:
 - In the garage's vehicles screen, Up/Down switch to the previous or next maker while a maker's cars are open, so every maker's cars can be browsed without going back to the maker list.
 - Skips the legal-screen wait and dismisses the prompt about Ubisoft's servers, which no longer exist.
 - Lifts three engine limits that bigger world or car archives run into and crash on: 45,000 resources loaded at once (`[Limits] ResourceArenaExtraNodes`, 135,000 more by default, about 3 MB), 16,384 resource references waiting to be resolved (`[Limits] PendingResourceReferences`, 131,072 by default, 1.5 MB), and 15,000 submodels loaded at once (`[Limits] SubmodelTableExtraNodes`, 60,000 more by default, about 1.4 MB).
+- Raises the engine's limit of 16,384 draws per frame, which a heavy frame (worldlod's map, a wide screen, full-detail traffic) can pass and crash on (`[Limits] DrawQueueEntries`, 65,536 by default, about 18 MB with the draw data). If a frame still has more draws, the extra ones are dropped and logged rather than crashing the game.
 
 ### Install
 

@@ -135,6 +135,39 @@ constexpr PendingSite kPendingSites[] = {
     {0x007AEADF, 3, 0x00137AC8, kPendingPairs, 0, true},   // mov ebp, [esi+eax*8+0x137AC8]
     {0x007AEAE8, 3, 0x00137ACC, kPendingPairs, 4, true},   // mov eax, [esi+eax*8+0x137ACC]
 };
+// The frame's draw queue. RenderQueueHolder_Construct (0xBB6580, and 0xBB6530) allocates one
+// 0x130158-byte manager (pointer at 0x19B6434) and RenderQueueManager_Construct (0xBB5960) embeds
+// two queues in it, used in turn: one is filled while the other, last frame's, is sorted in place
+// (0xBB6390) and handed to the filter job (0xBAAEA0 -> 0xBBC0C0) and the submit loop. A queue
+// header is {count, capacity, constants block, entries}, 32-byte entries, 16,384 of them; queue A's
+// header is at manager+0x14 and its entries end at +0x980A8, where queue B's header begins
+// (+0x980B0). Every reader takes the entries pointer and count from the header. Appends:
+// FUN_00BB5710 (lock cmpxchg on the count, no bound), called by FUN_00BB5A50 (0xBB5B4C, after a
+// count == capacity check that ends in an int3), FUN_00BB5B70 (0xBB5BB5, skips when equal), the
+// render cache's replay (0xBB7301, unchecked) and its copy into a cache list (0xBB6FC3, its own
+// header with a size-class capacity); and the job-side append at 0x6C21F0, which inlines the same
+// compare-exchange against a constant 0x4000. Once a frame passes 16,384, the equality checks
+// never fire again and entries overwrite queue B's header: the game then traps at 0xBB5B5A or
+// writes through a null entries pointer at 0xBB5737.
+// The filter job writes each frame's draw data into a fixed 3.5 MB area (0x19C66C0..0x1D466C0);
+// past its end it sets "Filter output buffer overflow" and the frame stops drawing there.
+constexpr DWORD kDrawQueueHolderRva = 0x015B6434;
+constexpr DWORD kDrawQueuePushRva = 0x007B5710;
+constexpr DWORD kDrawQueueConstructRva = 0x007B5960;
+constexpr DWORD kDrawQueueConstructCallRvas[] = {0x007B6546, 0x007B65B2};
+constexpr DWORD kDrawQueueTrapRva = 0x007B5B5A;       // int3; pop edi; pop ebx; add esp,28h; ret 18h
+constexpr DWORD kDrawQueueTrapJumpRva = 0x007B5A95;   // jz 0xBB5B5A: DSF Forza's drop_full NOPs it
+constexpr DWORD kDrawQueueJobBoundRva = 0x002C21F9;   // cmp esi, 0x4000 in the job-side append
+constexpr DWORD kFilterOutputBeginRva = 0x007BC134;   // mov eax, 0x19C66C0
+constexpr DWORD kFilterOutputEndRva = 0x007BC143;     // mov dword [0x1D46710], 0x1D466C0
+constexpr DWORD kFilterOutputAreaRva = 0x015C66C0;
+constexpr DWORD kFilterOutputLimitRva = 0x019466C0;
+constexpr DWORD kFilterOutputCursorRva = 0x0194670C;
+constexpr DWORD kDrawQueueHeaderOffsets[] = {0x14, 0x980B0};
+// DSF Forza's [render] drop_full calls its own bounded append from these three sites.
+constexpr DWORD kDrawQueuePushCallRvas[] = {0x007B5B4C, 0x007B5BB5, 0x007B7301};
+constexpr int kDrawQueueStockEntries = 16384;
+constexpr DWORD kFilterOutputStockBytes = 0x380000;
 constexpr DWORD kErrorMessageUpdateRva = 0x0032AD80;
 constexpr DWORD kEngineSingletonRva = 0x00BE7228;
 constexpr DWORD kLodDirtyFlagRva = 0x00D8D6E0;
@@ -249,6 +282,21 @@ void* g_submodel_pool_alloc = nullptr;
 DWORD g_submodel_table_logged_peak = 0;
 bool g_pending_reference_patch_applied = false;
 DWORD g_pending_reference_logged_peak = 0;
+int g_draw_queue_entries = 65536;
+int g_draw_queue_test_entries = 0;
+LONG g_draw_queue_capacity = 0;               // written into both headers; 0 until the patch is on
+std::uint8_t* g_draw_queue_arrays[2] = {};
+void* g_draw_queue_construct = nullptr;
+std::uint8_t* volatile g_draw_queue_manager = nullptr;  // the manager the arrays were put into
+volatile LONG g_draw_queue_peak = 0;          // highest multiple of 1,024 a frame queue reached
+volatile LONG g_draw_queue_drops = 0;
+LONG g_draw_queue_logged_peak = 0;
+LONG g_draw_queue_logged_drops = 0;
+DWORD g_draw_queue_drop_log_tick = 0;
+std::uint8_t* g_filter_output = nullptr;
+DWORD g_filter_output_bytes = 0;
+DWORD g_filter_output_logged_kb = 0;
+HANDLE g_draw_queue_marker = nullptr;
 void* g_error_message_update_continue = nullptr;
 volatile LONG g_ubisoft_server_lost_prompt_log_count = 0;
 
@@ -438,6 +486,9 @@ void LoadConfig()
         ClampInt(GetPrivateProfileIntA("Limits", "PendingResourceReferences", 131072, ini_path), 0, 4194304);
     g_submodel_table_extra_nodes =
         ClampInt(GetPrivateProfileIntA("Limits", "SubmodelTableExtraNodes", 60000, ini_path), 0, 2000000);
+    g_draw_queue_entries = ClampInt(GetPrivateProfileIntA("Limits", "DrawQueueEntries", 65536, ini_path), 0, 262144);
+    g_draw_queue_test_entries =
+        ClampInt(GetPrivateProfileIntA("Limits", "DrawQueueTestEntries", 0, ini_path), 0, kDrawQueueStockEntries);
     LoadFlareConfig(ini_path);
 }
 
@@ -2637,6 +2688,339 @@ void LogPendingReferencePeak(const ModuleRange& range)
     }
 }
 
+struct DrawQueueHeader
+{
+    volatile LONG count;
+    LONG capacity;
+    void* block;
+    std::uint8_t* entries;
+};
+
+bool IsFrameDrawQueue(const DrawQueueHeader* queue)
+{
+    const auto* manager = g_draw_queue_manager;
+    return manager != nullptr && (reinterpret_cast<const std::uint8_t*>(queue) == manager + kDrawQueueHeaderOffsets[0] ||
+                                  reinterpret_cast<const std::uint8_t*>(queue) == manager + kDrawQueueHeaderOffsets[1]);
+}
+
+// FUN_00BB5710 with a bound (thiscall: ecx = the queue, the entry on the stack). A slot is taken
+// with the same compare-exchange, but only while count < capacity, so threads can't overshoot;
+// past that the draw is dropped and counted. Every caller's header holds its real capacity: the
+// frame queues (written by ProxyDrawQueueConstruct), and the render cache's lists.
+void __fastcall BoundedDrawQueuePush(DrawQueueHeader* queue, void*, const std::uint8_t* entry)
+{
+    LONG index = queue->count;
+    for (;;) {
+        if (index >= queue->capacity) {
+            InterlockedIncrement(&g_draw_queue_drops);
+            return;
+        }
+        const LONG seen = InterlockedCompareExchange(&queue->count, index + 1, index);
+        if (seen == index) {
+            break;
+        }
+        index = seen;
+    }
+    std::memcpy(queue->entries + static_cast<size_t>(index) * 32, entry, 32);
+    // Each count is claimed by one push only, so each multiple of 1,024 is seen once a frame.
+    const LONG used = index + 1;
+    if ((used & 1023) == 0 && used > g_draw_queue_peak && IsFrameDrawQueue(queue)) {
+        LONG peak = g_draw_queue_peak;
+        while (used > peak) {
+            const LONG seen = InterlockedCompareExchange(&g_draw_queue_peak, used, peak);
+            if (seen == peak) {
+                break;
+            }
+            peak = seen;
+        }
+    }
+}
+
+// The int3 FUN_00BB5A50 jumps to when the queue is full: the draw is skipped instead, through the
+// epilogue that follows the int3.
+__declspec(naked) void ProxyDrawQueueFullSkip()
+{
+    __asm {
+        lock inc dword ptr [g_draw_queue_drops]
+        pop edi
+        pop ebx
+        add esp, 0x28
+        ret 0x18
+    }
+}
+
+// Both queues of every manager built get the bigger arrays; the manager's own ones go unused.
+using DrawQueueConstructFn = void* (__thiscall*)(void*);
+void* __fastcall ProxyDrawQueueConstruct(void* memory)
+{
+    auto* manager = static_cast<std::uint8_t*>(reinterpret_cast<DrawQueueConstructFn>(g_draw_queue_construct)(memory));
+    if (manager == nullptr) {
+        return manager;
+    }
+    for (int i = 0; i < 2; ++i) {
+        std::memset(g_draw_queue_arrays[i], 0, static_cast<size_t>(g_draw_queue_entries) * 32);
+        auto* header = reinterpret_cast<DrawQueueHeader*>(manager + kDrawQueueHeaderOffsets[i]);
+        header->entries = g_draw_queue_arrays[i];
+        header->capacity = g_draw_queue_capacity;
+    }
+    g_draw_queue_manager = manager;
+    Log("DrawQueue: render queue manager 0x%p built; both queues hold %ld entries", manager, g_draw_queue_capacity);
+    return manager;
+}
+
+struct CodePatch
+{
+    std::uint8_t* site;
+    std::uint8_t original[10];
+    std::uint8_t patched[10];
+    size_t size;
+};
+
+CodePatch MakeCodePatch(std::uint8_t* site, size_t size)
+{
+    CodePatch patch{site, {}, {}, size};
+    std::memcpy(patch.original, site, size);
+    std::memcpy(patch.patched, site, size);
+    return patch;
+}
+
+void SetRel32(CodePatch& patch, std::uint8_t opcode, const void* target)
+{
+    patch.patched[0] = opcode;
+    const auto relative = static_cast<std::int32_t>(
+        reinterpret_cast<const std::uint8_t*>(target) - (patch.site + 5));
+    std::memcpy(&patch.patched[1], &relative, sizeof(relative));
+}
+
+void SetDword(CodePatch& patch, size_t offset, DWORD value)
+{
+    std::memcpy(&patch.patched[offset], &value, sizeof(value));
+}
+
+bool CallsTarget(const std::uint8_t* site, const std::uint8_t* target)
+{
+    std::int32_t relative = 0;
+    std::memcpy(&relative, site + 1, sizeof(relative));
+    return site[0] == 0xE8 && site + 5 + relative == target;
+}
+
+// Writes the patches in order; if one fails, the ones already written are put back.
+bool WriteCodePatches(CodePatch* patches, int count, const char* what)
+{
+    for (int i = 0; i < count; ++i) {
+        if (!WriteMemory(patches[i].site, patches[i].patched, patches[i].size)) {
+            for (int j = i - 1; j >= 0; --j) {
+                WriteMemory(patches[j].site, patches[j].original, patches[j].size);
+            }
+            Log("DrawQueue: failed to patch 0x%p (%s); the %d sites already patched were restored", patches[i].site, what, i);
+            return false;
+        }
+    }
+    return true;
+}
+
+// DSF Forza (dsfforza.asi [render] drop_full) bounds the same queue from the three calls into
+// FUN_00BB5710 and NOPs the jump to the int3; none of those bytes are touched here, and its bound
+// reads the capacity from the queue header, so it follows the bigger queue whichever loads first.
+bool g_dsf_forza_draw_queue_guard_logged = false;
+void LogDsfForzaDrawQueueGuard(const ModuleRange& range)
+{
+    if (g_dsf_forza_draw_queue_guard_logged) {
+        return;
+    }
+    static const std::uint8_t nops[6] = {0x90, 0x90, 0x90, 0x90, 0x90, 0x90};
+    int rerouted = 0;
+    for (const DWORD rva : kDrawQueuePushCallRvas) {
+        if (!CallsTarget(range.base + rva, range.base + kDrawQueuePushRva)) {
+            ++rerouted;
+        }
+    }
+    const bool trap_off = std::memcmp(range.base + kDrawQueueTrapJumpRva, nops, sizeof(nops)) == 0;
+    if (rerouted != 0 || trap_off) {
+        g_dsf_forza_draw_queue_guard_logged = true;
+        Log(
+            "DrawQueue: another guard is active (%d of 3 append calls rerouted, int3 jump %s), DSF Forza's drop_full likely; "
+            "it reads the capacity from the queue header, so both stay on",
+            rerouted,
+            trap_off ? "removed" : "kept"
+        );
+    }
+}
+
+// Raises the frame's draw queue from 16,384 entries to [Limits] DrawQueueEntries and bounds every
+// append. Arrays and the filter's output area (scaled with the queue) end before a guard page.
+// All sites are checked first; on any mismatch nothing is patched.
+void ApplyDrawQueuePatch(const ModuleRange& range)
+{
+    if (g_draw_queue_entries <= kDrawQueueStockEntries) {
+        Log("DrawQueue: DrawQueueEntries=%d; the engine's 16384-entry queue is left alone", g_draw_queue_entries);
+        return;
+    }
+    const DWORD sites[] = {
+        kDrawQueuePushRva, kDrawQueueConstructCallRvas[0], kDrawQueueConstructCallRvas[1], kDrawQueueTrapRva,
+        kDrawQueueTrapJumpRva, kDrawQueueJobBoundRva, kFilterOutputBeginRva, kFilterOutputEndRva,
+        kDrawQueuePushCallRvas[0], kDrawQueuePushCallRvas[1], kDrawQueuePushCallRvas[2],
+    };
+    for (const DWORD rva : sites) {
+        if (!IsRvaInRange(range, rva, 10)) {
+            Log("DrawQueue: site RVA 0x%08lX outside the loaded image; not patched", static_cast<unsigned long>(rva));
+            return;
+        }
+    }
+    if (!IsRvaInRange(range, kDrawQueueHolderRva, 4) || !IsRvaInRange(range, kFilterOutputCursorRva, 4)) {
+        Log("DrawQueue: queue holder outside the loaded image; not patched");
+        return;
+    }
+    auto va = [&](DWORD rva) { return static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(range.base + rva)); };
+    constexpr std::uint8_t push_bytes[10] = {0x56, 0x57, 0x33, 0xD2, 0x8B, 0xC1, 0xF0, 0x0F, 0xC1, 0x10};
+    constexpr std::uint8_t trap_bytes[9] = {0xCC, 0x5F, 0x5B, 0x83, 0xC4, 0x28, 0xC2, 0x18, 0x00};
+    constexpr std::uint8_t job_bound_bytes[6] = {0x81, 0xFE, 0x00, 0x40, 0x00, 0x00};
+    std::uint8_t output_begin_bytes[5] = {0xB8};
+    std::uint8_t output_end_bytes[10] = {0xC7, 0x05};
+    const DWORD output_area = va(kFilterOutputAreaRva);
+    const DWORD output_limit = va(kFilterOutputLimitRva);
+    const DWORD output_limit_slot = va(kFilterOutputCursorRva + 4);
+    std::memcpy(&output_begin_bytes[1], &output_area, 4);
+    std::memcpy(&output_end_bytes[2], &output_limit_slot, 4);
+    std::memcpy(&output_end_bytes[6], &output_limit, 4);
+    const char* differs = nullptr;
+    if (std::memcmp(range.base + kDrawQueuePushRva, push_bytes, sizeof(push_bytes)) != 0) {
+        differs = "the append 0xBB5710";
+    } else if (!CallsTarget(range.base + kDrawQueueConstructCallRvas[0], range.base + kDrawQueueConstructRva) ||
+               !CallsTarget(range.base + kDrawQueueConstructCallRvas[1], range.base + kDrawQueueConstructRva)) {
+        differs = "the manager construct calls 0xBB6546/0xBB65B2";
+    } else if (std::memcmp(range.base + kDrawQueueTrapRva, trap_bytes, sizeof(trap_bytes)) != 0) {
+        differs = "the int3 0xBB5B5A";
+    } else if (std::memcmp(range.base + kDrawQueueJobBoundRva, job_bound_bytes, sizeof(job_bound_bytes)) != 0) {
+        differs = "the job-side bound 0x6C21F9";
+    } else if (std::memcmp(range.base + kFilterOutputBeginRva, output_begin_bytes, sizeof(output_begin_bytes)) != 0 ||
+               std::memcmp(range.base + kFilterOutputEndRva, output_end_bytes, sizeof(output_end_bytes)) != 0) {
+        differs = "the filter output setup 0xBBC134/0xBBC143";
+    }
+    if (differs != nullptr) {
+        Log("DrawQueue: unexpected bytes at %s; not patched", differs);
+        return;
+    }
+    LogDsfForzaDrawQueueGuard(range);
+
+    const size_t entries = static_cast<size_t>(g_draw_queue_entries);
+    // The filter's output, 224 bytes per stock entry, in whole pages.
+    const size_t output_bytes = (static_cast<size_t>(kFilterOutputStockBytes) * entries / kDrawQueueStockEntries + 0xFFF) & ~size_t{0xFFF};
+    g_draw_queue_arrays[0] = AllocateGuarded(entries * 32);
+    g_draw_queue_arrays[1] = AllocateGuarded(entries * 32);
+    g_filter_output = AllocateGuarded(output_bytes);
+    if (g_draw_queue_arrays[0] == nullptr || g_draw_queue_arrays[1] == nullptr || g_filter_output == nullptr) {
+        Log("DrawQueue: could not allocate %lu entries and %lu KB of filter output", static_cast<unsigned long>(entries),
+            static_cast<unsigned long>(output_bytes / 1024));
+        FreeGuarded(g_draw_queue_arrays[0]);
+        FreeGuarded(g_draw_queue_arrays[1]);
+        FreeGuarded(g_filter_output);
+        g_draw_queue_arrays[0] = g_draw_queue_arrays[1] = g_filter_output = nullptr;
+        return;
+    }
+    g_filter_output_bytes = static_cast<DWORD>(output_bytes);
+    g_draw_queue_capacity = g_draw_queue_test_entries > 0 ? g_draw_queue_test_entries : g_draw_queue_entries;
+    g_draw_queue_construct = range.base + kDrawQueueConstructRva;
+
+    // The guard (the bound in the append, the int3 skipped) and the construct hooks first: each
+    // is safe on its own.
+    CodePatch guard[4] = {
+        MakeCodePatch(range.base + kDrawQueueTrapRva, 5),
+        MakeCodePatch(range.base + kDrawQueuePushRva, 6),
+        MakeCodePatch(range.base + kDrawQueueConstructCallRvas[0], 5),
+        MakeCodePatch(range.base + kDrawQueueConstructCallRvas[1], 5),
+    };
+    SetRel32(guard[0], 0xE9, reinterpret_cast<const void*>(&ProxyDrawQueueFullSkip));
+    SetRel32(guard[1], 0xE9, reinterpret_cast<const void*>(&BoundedDrawQueuePush));
+    guard[1].patched[5] = 0x90;
+    SetRel32(guard[2], 0xE8, reinterpret_cast<const void*>(&ProxyDrawQueueConstruct));
+    SetRel32(guard[3], 0xE8, reinterpret_cast<const void*>(&ProxyDrawQueueConstruct));
+    if (!WriteCodePatches(guard, 4, "guard")) {
+        g_draw_queue_capacity = 0;
+        // A construct hook may have run before a later write failed, so the arrays stay.
+        return;
+    }
+
+    // A manager built before the hooks keeps its stock queues, and the job-side append must keep
+    // its stock bound for it; the filter output stays too, as frames may already be drawing.
+    const auto holder = *reinterpret_cast<std::uint8_t* const volatile*>(range.base + kDrawQueueHolderRva);
+    if (holder != nullptr && holder != g_draw_queue_manager) {
+        Log("DrawQueue: the render queue manager was built before the patch; its queues keep 16384 entries (the full-queue guard is on)");
+    } else {
+        CodePatch sized[3] = {
+            MakeCodePatch(range.base + kDrawQueueJobBoundRva, 6),
+            MakeCodePatch(range.base + kFilterOutputBeginRva, 5),
+            MakeCodePatch(range.base + kFilterOutputEndRva, 10),
+        };
+        SetDword(sized[0], 2, static_cast<DWORD>(g_draw_queue_capacity));
+        SetDword(sized[1], 1, static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(g_filter_output)));
+        SetDword(sized[2], 6, static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(g_filter_output + output_bytes)));
+        if (WriteCodePatches(sized, 3, "job bound and filter output")) {
+            Log(
+                "DrawQueue: %ld entries per queue (stock %d) at 0x%p / 0x%p, filter output %lu KB at 0x%p (stock %lu KB)",
+                g_draw_queue_capacity,
+                kDrawQueueStockEntries,
+                g_draw_queue_arrays[0],
+                g_draw_queue_arrays[1],
+                static_cast<unsigned long>(output_bytes / 1024),
+                g_filter_output,
+                static_cast<unsigned long>(kFilterOutputStockBytes / 1024)
+            );
+            if (g_draw_queue_capacity < g_draw_queue_entries) {
+                Log("DrawQueue: DrawQueueTestEntries=%ld: frames past it drop draws", g_draw_queue_capacity);
+            }
+        } else {
+            Log("DrawQueue: the queue keeps 16384 entries per frame where the job-side bound is concerned (the full-queue guard is on)");
+        }
+    }
+
+    // DSF Forza checks this to leave the queue to DSF Enhanced: Local\DSFEnhanced.DrawQueue.<pid>.
+    char marker[64] = {};
+    std::snprintf(marker, sizeof(marker), "Local\\DSFEnhanced.DrawQueue.%lu", static_cast<unsigned long>(GetCurrentProcessId()));
+    g_draw_queue_marker = CreateEventA(nullptr, TRUE, TRUE, marker);
+    Log("DrawQueue: full-queue guard on (0xBB5710 bounded, int3 0xBB5B5A skipped); marker %s", marker);
+}
+
+// The highest multiple of 1,024 a frame queue reached, from 8,192 up (pushes through 0xBB5710
+// note them; the two counts are also polled, for the appends that bypass it), the draws dropped
+// at most every 10 s, and the filter output's use each new 256 KB from 1 MB up.
+void LogDrawQueueUse(const ModuleRange& range)
+{
+    if (g_draw_queue_capacity == 0) {
+        return;
+    }
+    LogDsfForzaDrawQueueGuard(range);
+    LONG peak = g_draw_queue_peak;
+    if (auto* manager = g_draw_queue_manager) {
+        for (const DWORD offset : kDrawQueueHeaderOffsets) {
+            peak = std::max(peak, reinterpret_cast<const DrawQueueHeader*>(manager + offset)->count & ~1023L);
+        }
+    }
+    if (peak >= 8192 && peak > g_draw_queue_logged_peak) {
+        g_draw_queue_logged_peak = peak;
+        Log("DrawQueue: a frame queued %ld draws (capacity %ld, stock %d)", peak, g_draw_queue_capacity, kDrawQueueStockEntries);
+    }
+    const LONG drops = g_draw_queue_drops;
+    const DWORD now = GetTickCount();
+    if (drops != g_draw_queue_logged_drops && (g_draw_queue_logged_drops == 0 || now - g_draw_queue_drop_log_tick >= 10000)) {
+        g_draw_queue_logged_drops = drops;
+        g_draw_queue_drop_log_tick = now;
+        Log("DrawQueue: queue full; %ld draws dropped so far (capacity %ld)", drops, g_draw_queue_capacity);
+    }
+    if (g_filter_output != nullptr) {
+        const auto cursor = *reinterpret_cast<const volatile DWORD*>(range.base + kFilterOutputCursorRva);
+        const auto begin = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(g_filter_output));
+        if (cursor >= begin && cursor - begin <= g_filter_output_bytes) {
+            const DWORD kb = (cursor - begin) / (256 * 1024) * 256;
+            if (kb >= 1024 && kb > g_filter_output_logged_kb) {
+                g_filter_output_logged_kb = kb;
+                Log("DrawQueue: filter output reached %lu KB of %lu KB (stock %lu KB)", static_cast<unsigned long>(kb),
+                    static_cast<unsigned long>(g_filter_output_bytes / 1024), static_cast<unsigned long>(kFilterOutputStockBytes / 1024));
+            }
+        }
+    }
+}
+
 // When the legal screen ends, state 4 calls the loading screen's begin function 0x4A20C0, which
 // ends by clearing the resource manager's list of unresolved resource references (count at
 // 0x188A6B8: mov dword [0x188A6B8],0 at 0x4A2153). After the stock 5 s wait the startup packages
@@ -3454,7 +3838,6 @@ void ApplyPatches()
 
 DWORD WINAPI InitThread(LPVOID)
 {
-    LoadConfig();
     ApplyPatches();
     for (unsigned tick = 0;; ++tick) {
         const ModuleRange exe = GetExeRange();
@@ -3464,6 +3847,7 @@ DWORD WINAPI InitThread(LPVOID)
         ApplyDrlFlareCurves(exe);
         LogTrafficDiagnostics(exe);
         LogPendingReferencePeak(exe);
+        LogDrawQueueUse(exe);
         if (tick % 4 == 0) {
             LogResourceArenaUse();
             LogSubmodelTableUse(exe);
@@ -3487,6 +3871,10 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
 {
     if (reason == DLL_PROCESS_ATTACH) {
         DisableThreadLibraryCalls(module);
+        // The draw queue is patched here rather than in the thread: DSF Forza decides in its own
+        // DllMain whether to leave the queue to this plugin, from the marker this creates.
+        LoadConfig();
+        ApplyDrawQueuePatch(GetExeRange());
         const HANDLE thread = CreateThread(nullptr, 0, InitThread, nullptr, 0, nullptr);
         if (thread != nullptr) {
             CloseHandle(thread);
