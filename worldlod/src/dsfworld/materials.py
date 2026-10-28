@@ -49,7 +49,7 @@ class Materials:
 def load(a: Archive, classes: dict[str, list[str]]) -> Materials:
     paths, diffuse = {}, {}
     for m in walk(a.global_region(), "MACO"):
-        uid = struct.unpack_from("<Q", a.read(kid(m, "MAHE")))[0]
+        uid = a.uid(m)
         paths[uid] = short_path(a.read(kid(m, "MATX")).decode("latin-1").rstrip("\0"))
         # MARC/MARP: {char name[32], u8 value[16], u32 type}; type 9 holds a texture UID
         for marc in (c for c in m.children if c.tag == "MARC"):

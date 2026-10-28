@@ -11,9 +11,8 @@ from __future__ import annotations
 
 import struct
 
-from dsfworld.formats.archive import Archive, kid, walk
+from dsfworld.formats.archive import UID_HEADERS, Archive, walk
 
-HEADERS = {"SBMC": "SBBH", "VXCK": "VXHD", "IXCK": "IXHD", "MACO": "MAHE", "TEXC": "UIDC", "GPCH": "GPCI"}
 PREFIX = 0x574C44  # "WLD"
 
 
@@ -21,9 +20,8 @@ def existing(a: Archive) -> set[int]:
     """Every UID the archive defines or lists: resources, MODL parts, MDID and GEBI tables."""
     seen: set[int] = set()
     for res in a.entries:
-        for tag, header in HEADERS.items():
-            for e in walk(res, tag):
-                seen.add(struct.unpack_from("<Q", a.read(kid(e, header)))[0])
+        for tag in UID_HEADERS:
+            seen.update(a.uid(e) for e in walk(res, tag))
         for e in walk(res, "MDID"):
             b = a.read(e)
             seen.update(struct.unpack_from(f"<{len(b) // 8}Q", b))

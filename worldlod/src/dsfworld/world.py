@@ -2,7 +2,6 @@
 
 from __future__ import annotations
 
-import struct
 from dataclasses import dataclass, field
 
 import numpy as np
@@ -74,10 +73,7 @@ class World:
         from dsfworld.formats import dds
 
         if max_size not in self._textures:
-            images = {}
-            for t in walk(self.archive.global_region(), "TEXC"):
-                uid = struct.unpack_from("<Q", self.archive.read(kid(t, "UIDC")))[0]
-                images[uid] = t
+            images = {self.archive.uid(t): t for t in walk(self.archive.global_region(), "TEXC")}
             decoded: dict[int, np.ndarray] = {}
             out: dict[int, np.ndarray | None] = {}
             for material, tex in self.materials.diffuse.items():

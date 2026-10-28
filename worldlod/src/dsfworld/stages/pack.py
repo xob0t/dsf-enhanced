@@ -16,7 +16,7 @@ import numpy as np
 from dsfworld import gegr
 from dsfworld.config import Config
 from dsfworld.formats import modl, uid
-from dsfworld.formats.archive import Archive, SubModel, kid, walk
+from dsfworld.formats.archive import Archive, SubModel, gesi, kid, walk
 from dsfworld.formats.chnk import ENTRY_LIMIT, Entry, write_chunk
 from dsfworld.stages import bake
 from dsfworld.world import World
@@ -62,7 +62,7 @@ def _submodel_problems(s: SubModel, mats: set[int], vbs: dict[int, int], ibs: di
 
 def _budget_problems(a: Archive, g: Entry) -> list[str]:
     """The streamer's buffers (GEGL/GESI) must hold GEGR and the largest region."""
-    b = gegr.budgets(a, kid(next(e for e in a.entries if e.tag == "GEGL"), "GESI"))
+    b = gegr.budgets(a, gesi(a.entries))
     regions = [r for r in a.entries if r.tag == "GEIR"]
     needs = {
         gegr.GESI_GLOBAL_MDXN: kid(g, "MDXN").size,
@@ -80,7 +80,7 @@ def check(path: Path) -> list[str]:
         g = a.global_region()
         subs = {s.uid: s for s in a.submodels(g)}
         vbs, ibs = _buffers(a, g, problems)
-        mats = {struct.unpack_from("<Q", a.read(kid(m, "MAHE")))[0] for m in walk(g, "MACO")}
+        mats = {a.uid(m) for m in walk(g, "MACO")}
         for p in modl.parse_modl(a.nonr(g, "MODL")):
             for lod in p.lods:
                 missing = [s for s in lod.submodels if s not in subs]

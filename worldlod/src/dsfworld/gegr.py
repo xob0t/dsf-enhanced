@@ -36,7 +36,7 @@ import numpy as np
 
 from dsfworld.bake import Group, position_slot, read_positions
 from dsfworld.formats import modl
-from dsfworld.formats.archive import Archive, kid, walk
+from dsfworld.formats.archive import Archive, gesi, kid, walk
 from dsfworld.formats.chnk import ENTRY_LIMIT, Entry, entry_size
 from dsfworld.formats.uid import Allocator
 
@@ -56,13 +56,10 @@ class Stats:
     cells: int = 0
     materials: int = 0
     submodels: int = 0
-    vertex_buffers: int = 0
-    index_buffers: int = 0
     triangles: int = 0
     vertex_bytes: int = 0
     index_bytes: int = 0
     drsp: int = 0
-    notes: list[str] = field(default_factory=list)
 
 
 def _like(template: Entry, payload: bytes | None = None, children: list[Entry] | None = None) -> Entry:
@@ -127,7 +124,6 @@ def clone_material(a: Archive, template: Entry, source: Entry, uid: int) -> Entr
 
 
 KINDS = ("MACO", "SBMC", "VXCK", "IXCK")  # new resources, in the order they go into DRSP groups
-HEADERS = {"MACO": "MAHE", "SBMC": "SBBH", "VXCK": "VXHD", "IXCK": "IXHD"}  # the child that starts with the UID
 
 
 @dataclass
@@ -154,8 +150,8 @@ class _Writer:
         self.a, self.uids = a, uids
         self.templates = {kind: next(walk(gegr, kind)) for kind in KINDS}
         self.ixhd_tail = a.read(kid(self.templates["IXCK"], "IXHD"))[16:]
-        self.macos = {_uid(a, e, "MAHE"): e for e in walk(gegr, "MACO")}
-        self.stock = {kind: {_uid(a, e, HEADERS[kind]) for e in walk(gegr, kind)} for kind in KINDS}
+        self.macos = {a.uid(e): e for e in walk(gegr, "MACO")}
+        self.stock = {kind: {a.uid(e) for e in walk(gegr, kind)} for kind in KINDS}
         self.new: dict[str, list[tuple[int, Entry]]] = {kind: [] for kind in KINDS}
         self.clones: dict[tuple[int, int], int] = {}  # (template, material) -> clone UID
         self.stats = Stats()
@@ -238,10 +234,6 @@ class _Writer:
         self.stats.index_bytes += len(data)
 
 
-def _uid(a: Archive, e: Entry, header: str) -> int:
-    return struct.unpack_from("<Q", a.read(kid(e, header)))[0]
-
-
 def drsp_groups(entries: list[Entry]) -> list[list[Entry]]:
     """entries in order, split into groups within the stock limits (children and bytes)."""
     groups: list[list[Entry]] = []
@@ -276,7 +268,7 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
         if cell.groups:
             writer.cell(cell, by_uid[cell.part_uid])
     stats, new = writer.stats, writer.new
-    stats.materials, stats.vertex_buffers, stats.index_buffers = (len(new[k]) for k in ("MACO", "VXCK", "IXCK"))
+    stats.materials = len(new["MACO"])
     if not new["SBMC"]:
         return stats
 
@@ -297,26 +289,28 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
 
 
 GESI_GLOBAL_MDXN, GESI_GLOBAL_NONR, GESI_REGION_MDXN, GESI_REGION_NONR = 0x24, 0x28, 0x2C, 0x30
+GESI_BUDGETS = (GESI_GLOBAL_MDXN, GESI_GLOBAL_NONR, GESI_REGION_MDXN, GESI_REGION_NONR)
 
 
 def _page(n: int) -> int:
     return -(-n // 0x1000) * 0x1000
 
 
-def budgets(a: Archive, gesi: Entry) -> dict[int, int]:
-    blob = gesi.payload if gesi.payload is not None else a.read(gesi)
-    return {o: struct.unpack_from("<I", blob, o)[0] for o in (0x24, 0x28, 0x2C, 0x30)}
+def budgets(a: Archive, info: Entry) -> dict[int, int]:
+    """GESI's budgets by offset."""
+    blob = _read(a, info)
+    return {o: struct.unpack_from("<I", blob, o)[0] for o in GESI_BUDGETS}
 
 
 def update_budgets(a: Archive, entries: list[Entry], stock_mdxn: int) -> tuple[int, int]:
     """Raise GESI's GEGR budgets by what GEGR's MDXN and NONR grew. Returns the new (MDXN, NONR) budgets."""
     gegr = next(e for e in entries if e.tag == "GEGR")
-    gesi = kid(next(e for e in entries if e.tag == "GEGL"), "GESI")
-    blob = bytearray(gesi.payload if gesi.payload is not None else a.read(gesi))
-    old = budgets(a, gesi)
+    info = gesi(entries)
+    blob = bytearray(_read(a, info))
+    old = budgets(a, info)
     mdxn = _page(entry_size(kid(gegr, "MDXN"))) - _page(stock_mdxn) + old[GESI_GLOBAL_MDXN]
     nonr = max(old[GESI_GLOBAL_NONR], _page(entry_size(kid(gegr, "NONR"))))
     mdxn = max(old[GESI_GLOBAL_MDXN], mdxn)
     struct.pack_into("<II", blob, GESI_GLOBAL_MDXN, mdxn, nonr)
-    gesi.payload = bytes(blob)
+    info.payload = bytes(blob)
     return mdxn, nonr

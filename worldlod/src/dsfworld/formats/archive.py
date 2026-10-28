@@ -13,6 +13,9 @@ from pathlib import Path
 
 from dsfworld.formats.chnk import Entry, read_chunk
 
+# Resource kinds with a UID, and the child whose payload starts with it (u64).
+UID_HEADERS = {"SBMC": "SBBH", "VXCK": "VXHD", "IXCK": "IXHD", "MACO": "MAHE", "TEXC": "UIDC", "GPCH": "GPCI"}
+
 
 def kid(e: Entry, tag: str) -> Entry | None:
     return next((c for c in e.children or [] if c.tag == tag), None)
@@ -23,6 +26,11 @@ def walk(e: Entry, tag: str):
         yield e
     for c in e.children or []:
         yield from walk(c, tag)
+
+
+def gesi(entries: list[Entry]) -> Entry:
+    """GEGL/GESI among an archive's root entries: the streamer's buffer budgets (dsfworld.gegr)."""
+    return kid(next(e for e in entries if e.tag == "GEGL"), "GESI")
 
 
 @dataclass
@@ -72,6 +80,10 @@ class Archive:
     def read(self, e: Entry) -> bytes:
         self.f.seek(e.offset)
         return self.f.read(e.size)
+
+    def uid(self, e: Entry) -> int:
+        """The UID of a resource entry of one of the UID_HEADERS kinds, as stored in the source file."""
+        return struct.unpack_from("<Q", self.read(kid(e, UID_HEADERS[e.tag])))[0]
 
     def resource(self, name: str) -> Entry:
         for e in self.entries:
