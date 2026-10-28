@@ -41,6 +41,7 @@ from dsfworld.formats.chnk import ENTRY_LIMIT, Entry, entry_size
 from dsfworld.formats.uid import Allocator
 
 DRSP_BUDGET = 2_600_000  # bytes, about the stock group size
+VERTEX_BUFFER_BUDGET = 2_000_000  # bytes of vertex data in one VXCK, so that it fits a group
 
 
 @dataclass
@@ -181,12 +182,15 @@ class _Writer:
         indices: list[np.ndarray] = []
         n_indices = 0
         t_sbmc = self.templates["SBMC"]
+        full: list[tuple[int, _VertexBuffer]] = []
         for g in cell.groups:
-            vb = vbs.get((g.stride, g.elements))
-            if vb is None:
-                vb = vbs[g.stride, g.elements] = _VertexBuffer(self.uids.new(), g.decl)
             material, pos_el = self.material(g), position_slot(g.elements)
             for verts, tris in g.chunks():
+                vb = vbs.get((g.stride, g.elements))
+                if vb is None or (vb.count + len(verts)) * g.stride > VERTEX_BUFFER_BUDGET:
+                    if vb is not None:
+                        full.append((g.stride, vb))
+                    vb = vbs[g.stride, g.elements] = _VertexBuffer(self.uids.new(), g.decl)
                 sub = self.uids.new()
                 flat = tris.astype("<u2").ravel()
                 base = vb.add(verts, sub)
@@ -200,7 +204,7 @@ class _Writer:
                 lo, hi = np.minimum(lo, p.min(0)), np.maximum(hi, p.max(0))
                 self.stats.submodels += 1
                 self.stats.triangles += len(tris)
-        for (stride, _), vb in vbs.items():
+        for stride, vb in full + [(stride, vb) for (stride, _), vb in vbs.items()]:
             self._vertex_buffer(vb, stride)
         self._index_buffer(ib_uid, sub_uids, np.concatenate(indices))
         lod.submodels, lod.flags = sub_uids, sub_flags

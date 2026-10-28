@@ -89,7 +89,9 @@ def main(argv: list[str] | None = None) -> None:
     args = parser().parse_args(argv)
     cfg = config.load(args.config)
     if args.archive:
-        cfg.data["game"]["archive"] = str(args.archive.resolve())
+        if args.command in ("install", "uninstall"):
+            raise SystemExit(f"--archive doesn't apply to {args.command}: it always replaces the game's file")
+        cfg = cfg.reading(args.archive.resolve())
     if args.command == "config":
         print(dump_toml(cfg.data), end="")
         return

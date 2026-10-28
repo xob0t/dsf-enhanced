@@ -44,7 +44,7 @@ def _paths(cfg: Config) -> tuple[Path, Path, Path]:
 
 def install(cfg: Config) -> None:
     target, backup, manifest_path = _paths(cfg)
-    packed = cfg.work_dir / "pack" / target.name
+    packed = cfg.packed_archive
     if not packed.exists():
         raise SystemExit(f"no packed archive at {packed}: run `worldlod pack` first")
     if _game_running():
@@ -59,8 +59,11 @@ def install(cfg: Config) -> None:
             raise SystemExit(f"{target} is a worldlod build but the backup is missing; restore the original first")
         backup.parent.mkdir(exist_ok=True)
         print(f"backing up {target} -> {backup}")
-        shutil.copyfile(target, backup)
+        tmp = backup.with_name(backup.name + ".worldlod-tmp")
+        shutil.copyfile(target, tmp)
+        tmp.replace(backup)
         manifest["original"] = current
+        manifest_path.write_text(json.dumps(manifest, indent=2))
     elif sha256(backup) != manifest.get("original"):
         raise SystemExit(f"{backup} doesn't match its recorded hash; not touching anything")
     elif current not in (manifest.get("original"), manifest.get("installed")):
@@ -81,6 +84,8 @@ def uninstall(cfg: Config) -> None:
     manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
     if manifest.get("original") and sha256(backup) != manifest["original"]:
         raise SystemExit(f"{backup} doesn't match its recorded hash; not restoring")
+    if target.exists() and sha256(target) not in (manifest.get("installed"), manifest.get("original")):
+        raise SystemExit(f"{target} isn't the build worldlod installed (another mod?); not overwriting it")
     _swap_in(backup, target)
     manifest["installed"] = None
     manifest_path.write_text(json.dumps(manifest, indent=2))

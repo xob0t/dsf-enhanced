@@ -43,3 +43,16 @@ def test_material_classes():
         config.load(None).section("classes"),
     )
     assert [mats.class_of(u) for u in (1, 2, 3, 4)] == ["ground", "ground", "buildings", "other"]
+
+
+def test_class_tables_replace_the_default(tmp_path):
+    user = tmp_path / "worldlod.toml"
+    user.write_text("[bake]\nmin_model_size = { props = 1.0 }\n")
+    assert config.load(user).section("bake")["min_model_size"] == {"props": 1.0}
+
+
+def test_archive_override_is_a_separate_source(tmp_path, monkeypatch):
+    monkeypatch.delenv("DSF_GAME_DIR", raising=False)
+    cfg = config.load(None).reading(tmp_path / "x.dngc")
+    assert cfg.archive == tmp_path / "x.dngc"  # no game folder needed to read it
+    assert cfg.packed_archive.name == "san_francisco.dngc"

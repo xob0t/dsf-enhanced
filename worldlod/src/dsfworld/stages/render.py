@@ -10,7 +10,6 @@ from __future__ import annotations
 
 import numpy as np
 
-from dsfworld import config as config_mod
 from dsfworld import render
 from dsfworld.config import Config
 from dsfworld.world import World, clip_to_box
@@ -40,7 +39,7 @@ def run(cfg: Config, world: World, *, area=None, size=None, view=None, name=None
         cx, cz = (box[0] + box[2]) / 2, (box[1] + box[3]) / 2
         box = (cx - side / 2, cz - side / 2, cx + side / 2, cz + side / 2)
     name = name or ("city" if area == "city" else "area")
-    packed = cfg.work_dir / "pack" / world.archive.path.name
+    packed = cfg.packed_archive
     if not packed.exists():
         raise SystemExit(f"no packed archive at {packed}: run `worldlod pack` first")
     out = cfg.work_dir / "render"
@@ -48,7 +47,7 @@ def run(cfg: Config, world: World, *, area=None, size=None, view=None, name=None
 
     stock, n_stock = draw(world, box, size, view, settings["texture_size"])
     render.write_png(out / f"{name}_{view}_stock.png", stock)
-    baked_cfg = config_mod.Config({**cfg.data, "game": {**cfg.data["game"], "archive": str(packed)}}, cfg.folder)
+    baked_cfg = cfg.reading(packed)
     baked_world = World.open(baked_cfg)
     with baked_world.archive:
         baked, n_baked = draw(baked_world, box, size, view, settings["texture_size"])

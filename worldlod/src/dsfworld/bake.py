@@ -134,7 +134,7 @@ class Group:
             used: dict[int, int] = {}
             end = start
             while end < len(self.triangles):
-                new = [v for v in self.triangles[end] if v not in used]
+                new = [v for v in dict.fromkeys(self.triangles[end].tolist()) if v not in used]
                 if len(used) + len(new) > MAX_VERTICES:
                     break
                 for v in new:

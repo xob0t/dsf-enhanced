@@ -246,3 +246,21 @@ def test_material_clone_takes_the_source_texture():
     assert struct.unpack_from("<f", alpha.payload, 32)[0] == 0.75 and diffuse.payload[32:40] == b"L" * 8
     assert diffuse.payload[:15] == b"g_texDiffuseMap" and struct.unpack_from("<I", diffuse.payload, 48)[0] == 9
     assert palm.children[1].children[2].payload[32:40] == b"P" * 8  # the template is unchanged
+
+
+def test_chunks_keep_a_triangle_that_repeats_a_vertex():
+    n = bake.MAX_VERTICES + 10
+    verts = np.arange(n + 2, dtype=np.uint8).repeat(16).reshape(-1, 16)
+    tris = np.array([[5, 5, 7], [5, 8, 9]] + [[i, i + 1, i + 2] for i in range(n)], np.int64)
+    g = bake.Group(1, 5, 16, tuple(ELEMENTS), b"", verts, tris)
+    out = [v[t] for v, t in g.chunks()]
+    assert np.array_equal(np.vstack(out), verts[tris])  # every corner keeps its own vertex
+
+
+def test_fill_without_cover_keeps_the_stock_terrain_in_place():
+    stock = library(
+        [vertex(x, 0, z, 0, 0, (0, 1, 0)) for x, z in ((0, 0), (0, 20), (20, 0))],
+        [0, 1, 2],
+    )
+    (g,) = bake.fill_from_stock(stock, [(3, 5)], [], drop=0.0)
+    assert len(g.triangles) == 1 and np.all(bake.positions(g)[:, 1] == 0)

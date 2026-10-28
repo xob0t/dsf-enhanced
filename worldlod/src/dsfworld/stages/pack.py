@@ -114,7 +114,7 @@ def run(cfg: Config, world: World, *, verify: bool = False) -> Path:
         )
         mdxn, nonr = gegr.update_budgets(a, a.entries, stock_mdxn)
         print(f"GESI: GEGR budgets {mdxn / 1e6:.1f} MB renderer data, {nonr / 1e3:.0f} KB non-renderer data")
-    out = cfg.work_dir / "pack" / a.path.name
+    out = cfg.packed_archive
     out.parent.mkdir(parents=True, exist_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
     version = a.root.version | (0x80000000 if a.root.compressed else 0)

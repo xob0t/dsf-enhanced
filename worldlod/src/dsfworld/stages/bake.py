@@ -21,7 +21,7 @@ from dsfworld.world import World
 
 SECTIONS = ("game", "classes", "bake", "simplify")
 # Part of the cache key: raise when the bake or simplification output changes for the same settings.
-VERSION = 7
+VERSION = 8
 
 
 def output_dir(cfg: Config) -> Path:
@@ -111,7 +111,9 @@ def bake_cell(
     result.groups = to_simplify + rest
     cover_classes = _classes(world, settings["fill_cover"])
     cover = [x for x in result.groups if world.class_index(x.material) in cover_classes]
-    if cover and settings["fill_drop"] >= 0:
+    if not cover:  # nothing replaces the stock terrain: keep all of it where it is
+        result.groups += bake.fill_from_stock(world.library, stock_terrain, [], 0.0)
+    elif settings["fill_drop"] >= 0:
         result.groups += bake.fill_from_stock(world.library, stock_terrain, cover, settings["fill_drop"])
     return result
 

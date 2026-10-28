@@ -14,12 +14,15 @@ USER_FILE = "worldlod.toml"
 BACKUP_DIR = "worldlod-backup"  # in the game folder, written by `worldlod install`
 
 
+FREE_TABLES = {"classes", "min_model_size"}  # keyed by class names: a user table replaces the default
+
+
 def merge(base: dict, over: dict) -> dict:
     out = dict(base)
     for key, value in over.items():
         if key not in base:
             raise KeyError(f"unknown setting {key!r}")
-        if isinstance(value, dict) and isinstance(base[key], dict) and key != "classes":
+        if isinstance(value, dict) and isinstance(base[key], dict) and key not in FREE_TABLES:
             out[key] = merge(base[key], value)
         else:
             out[key] = value
@@ -30,6 +33,7 @@ def merge(base: dict, over: dict) -> dict:
 class Config:
     data: dict
     folder: Path  # paths in the file are relative to this
+    source: Path | None = None  # an archive to read instead of the game's (--archive)
 
     @property
     def game_dir(self) -> Path:
@@ -45,13 +49,22 @@ class Config:
 
     @property
     def archive(self) -> Path:
-        """The world archive the pipeline reads: the original. After `worldlod install` the game's
-        file is a build, so the backup install made (checked against its hash then) is read instead."""
+        """The world archive the pipeline reads: source if set, else the original. After `worldlod
+        install` the game's file is a build, so the backup install made is read instead."""
+        if self.source is not None:
+            return self.source
         game = self.game_archive
         backup = self.game_dir / BACKUP_DIR / game.name
-        if not Path(self.data["game"]["archive"]).is_absolute() and backup.exists():
-            return backup
-        return game
+        return backup if backup.exists() else game
+
+    @property
+    def packed_archive(self) -> Path:
+        """Where `worldlod pack` writes."""
+        return self.work_dir / "pack" / Path(self.data["game"]["archive"]).name
+
+    def reading(self, source: Path) -> Config:
+        """These settings, reading source instead."""
+        return Config(self.data, self.folder, source)
 
     @property
     def work_dir(self) -> Path:
