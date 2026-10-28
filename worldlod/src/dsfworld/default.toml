@@ -41,15 +41,19 @@ min_model_size = 0.0
 # Classes from the detailed regions that go into the base LOD, replacing the
 # stock submodels below. An empty list turns the bake off; pack then writes the
 # stock archive.
-classes = ["ground", "foliage", "buildings"]
+classes = ["ground", "foliage", "buildings", "props"]
 # Materials left out of the bake: their path starts with one of these. Grass
 # cards (1.45M triangles) can't be seen from Shift height; the Bay and
-# Carquinez bridges' girders are 4.3M triangles of lines.
+# Carquinez bridges' girders are 4.3M triangles of lines, the tram and power
+# wires 0.35M. Of the props, that leaves the painted road text.
 exclude = [
     "trees/foliage_grass",
     "trees/misc_grasses",
     "buildings/specular/bridge_baybridge",
     "buildings/specular/bridge_carquinez",
+    "misc/tram_wire",
+    "misc/pylon_wire",
+    "misc/trafficlight",
 ]
 # Per class: leave out placed models whose longest box edge (after instance
 # scale) is below this many metres. "buildings" in the detailed regions are the
