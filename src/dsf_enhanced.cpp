@@ -2519,9 +2519,31 @@ void LogSubmodelTableUse(const ModuleRange& range)
     }
 }
 
+// size bytes that end right before an inaccessible page, so that writing past them faults at once
+// instead of corrupting whatever was allocated next.
+std::uint8_t* AllocateGuarded(size_t size)
+{
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const size_t page = info.dwPageSize;
+    const size_t data = (size + page - 1) / page * page;
+    auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, data + page, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (block == nullptr) {
+        return nullptr;
+    }
+    DWORD old_protect = 0;
+    if (!VirtualProtect(block + data, page, PAGE_NOACCESS, &old_protect)) {
+        VirtualFree(block, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    return block + (data - size);
+}
+
 // Moves the pending-reference list to bigger arrays by rewriting the disp32 of every instruction
 // that addresses it; the count stays where it is. All sites are checked first: on any mismatch
-// nothing is patched.
+// nothing is patched. If a write fails, the sites already rewritten are put back: an appender
+// writing one array in the new place and the other in the stock place would break the consumer.
+// The engine still doesn't check the count; past the new capacity the guard page faults.
 void ApplyPendingReferencePatch(const ModuleRange& range)
 {
     if (g_pending_reference_capacity <= kPendingStockCapacity) {
@@ -2545,8 +2567,8 @@ void ApplyPendingReferencePatch(const ModuleRange& range)
         }
     }
     const size_t capacity = static_cast<size_t>(g_pending_reference_capacity);
-    auto* ptrs = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, capacity * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
-    auto* pairs = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, capacity * 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    auto* ptrs = AllocateGuarded(capacity * 4);
+    auto* pairs = AllocateGuarded(capacity * 8);
     if (ptrs == nullptr || pairs == nullptr) {
         Log("PendingReferences: could not allocate %lu entries", static_cast<unsigned long>(capacity));
         return;
@@ -2562,11 +2584,24 @@ void ApplyPendingReferencePatch(const ModuleRange& range)
         if (site.relative) {
             value -= manager;
         }
-        if (WriteMemory(range.base + site.rva + site.disp_offset, &value, sizeof(value))) {
-            ++patched;
+        if (!WriteMemory(range.base + site.rva + site.disp_offset, &value, sizeof(value))) {
+            break;
         }
+        ++patched;
     }
-    g_pending_reference_patch_applied = patched == total;
+    if (patched != total) {
+        for (int i = 0; i < patched; ++i) {
+            const auto& site = kPendingSites[i];
+            WriteMemory(range.base + site.rva + site.disp_offset, &site.expected, sizeof(site.expected));
+        }
+        Log(
+            "PendingReferences: failed to patch RVA 0x%08lX; the %d sites already patched were restored",
+            static_cast<unsigned long>(kPendingSites[patched].rva),
+            patched
+        );
+        return;
+    }
+    g_pending_reference_patch_applied = true;
     Log(
         "PendingReferences: %d of %d sites patched; %lu entries at 0x%p / 0x%p (stock %d)",
         patched,
