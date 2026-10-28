@@ -7,6 +7,7 @@ from dsfworld import bake
 from dsfworld.formats.archive import SubModel
 from dsfworld.formats.gebi import Instance
 from dsfworld.formats.modl import Library, Lod, Part, VertexBuffer
+from dsfworld.materials import Materials
 
 # stride 16: int16 x4 position, float16 x2 UV (semantic 8), ubyte4 normal
 ELEMENTS = [(0, 4, 1, 0), (8, 2, 8, 8), (5, 4, 6, 12)]
@@ -272,3 +273,35 @@ def test_fill_without_cover_keeps_the_stock_terrain_in_place():
     (g,) = bake.fill_from_stock(stock, [(3, 5)], [], drop=0.0)
     assert len(g.triangles) == 1
     assert np.all(bake.positions(g)[:, 1] == 0)
+
+
+class FakeWorld:
+    """Materials 1-3 with paths and classes (0 ground, 1 buildings, 2 other)."""
+
+    def __init__(self):
+        self.class_names = ["ground", "buildings", "other"]
+        self.materials = Materials({1: "roads/lane.matxml", 2: "buildings/a.matxml", 3: "misc/x.matxml"}, {})
+
+    def class_index(self, material):
+        return {1: 0, 2: 1, 3: 2}[material]
+
+
+def test_model_filter_honours_classes_exclusions_and_sizes():
+    world = FakeWorld()
+    options = bake.BakeOptions(exclude=("roads/lane",), min_size={1: 2.0})
+    assert not bake._wanted(world, 1, {0, 1}, options, 10.0)  # excluded by path
+    assert bake._wanted(world, 1, {0, 1}, bake.BakeOptions(), 10.0)
+    assert not bake._wanted(world, 2, {0, 1}, options, 1.5)  # a building model below 2 m
+    assert bake._wanted(world, 2, {0, 1}, options, 2.0)
+    assert not bake._wanted(world, 3, {0, 1}, options, 10.0)  # class not baked
+
+
+def test_unknown_class_names_stop_the_bake():
+    from dsfworld import config
+    from dsfworld.stages import bake as stage
+
+    cfg = config.load(None)
+    cfg.data["simplify"]["classes"] = ["ground", "grund"]
+    with pytest.raises(SystemExit, match=r"\[simplify\] classes: unknown class grund"):
+        stage.class_indices(cfg, FakeWorld(), "simplify", "classes")
+    assert stage.class_indices(cfg, FakeWorld(), "bake", "min_model_size") == [1]
