@@ -64,6 +64,77 @@ constexpr DWORD kLegalScreenBeginLoadingCallRva = 0x00399C92;   // call 0x4A20C0
 constexpr DWORD kLoadingScreenBeginRva = 0x000A20C0;
 constexpr DWORD kPendingResourceReferenceClearRva = 0x000A2153; // mov dword [0x188A6B8],0
 constexpr DWORD kPendingResourceReferenceCountRva = 0x0148A6B8; // resource manager 0x1732BF0 + 0x157AC8
+// Resource manager 0x1732BF0: ResourceHashPool_Acquire (0xBAED90) takes a 24-byte node from the
+// free list at +0x127AC0, else bumps +0x127AC4 through 45,000 nodes stored at +0x20000..+0x127AC0,
+// with no end check. The 45,001st resident resource overwrites the free-list head and the bump
+// pointer, and the next acquire faults reading garbage (0xBAEDC7).
+constexpr DWORD kResourceHashBumpRva = 0x007AEDB6;          // mov eax,[ecx+0x127AC4]; lea ebx,[eax+18h]; mov [ecx+0x127AC4],ebx; jmp
+constexpr DWORD kResourceHashBumpContinueRva = 0x007AEDD0;  // fills the node in eax
+// The same manager's list of pending resource references: a slot pointer at +0x127AC8 (0x185A6B8)
+// and the referenced UID at +0x137AC8 (0x186A6B8) per entry, count at +0x157AC8 (0x188A6B8), 16,384
+// entries with no bound check. Loading a model appends every submodel UID of its MODL; FUN_00BAE790
+// resolves them later. Entry 16,385 writes its UID over the count, and the next append faults
+// (0x6A594F). A world archive whose global region holds more than about 16,000 submodels hits it.
+constexpr DWORD kResourceManagerRva = 0x01332BF0;
+// The submodel table (owner pointer at 0x19BBA74, table at owner+0x30): SBMC UID -> submodel, filled
+// by the SBMC loader (0xBBB6C5 -> 0xBBBE40) and emptied as submodels are released (0xBBBCA0). Its
+// nodes come from a pool of 15,000 24-byte nodes at table+0x10..table+0x57E50, taken by
+// 0x8CCAA0 from the free list (head and count at table+0, +4) or by bumping table+0 with no end
+// check; the bucket array (15,013 heads) follows the nodes. Node 15,001 is written over the
+// buckets, and the next lookup faults (0xBBBE70).
+constexpr DWORD kSubmodelOwnerRva = 0x015BBA74;
+constexpr DWORD kSubmodelNodeAllocCallRva = 0x007BBE9B;  // call 0x8CCAA0 in the table's insert
+constexpr DWORD kPoolAllocRva = 0x004CCAA0;
+constexpr DWORD kSubmodelTableOffset = 0x30;
+constexpr DWORD kPendingPtrsRva = 0x0145A6B8;
+constexpr DWORD kPendingPairsRva = 0x0146A6B8;
+constexpr int kPendingStockCapacity = 16384;
+enum PendingArray { kPendingPtrs, kPendingPairs };
+struct PendingSite
+{
+    DWORD rva;
+    std::uint8_t disp_offset;  // of the instruction's disp32
+    DWORD expected;            // its stock value
+    PendingArray array;
+    std::uint8_t plus;         // 4 for the UID's high dword
+    bool relative;             // disp32 is added to the manager pointer (always 0x1732BF0), not absolute
+};
+// Every instruction that addresses the two arrays (static disassembly of Driver.exe 1.04): the
+// appenders 0x6A51B0, 0x6A58F0, 0x6A59F0, 0x6CC640, 0xBA9FD0, 0xBAA270 and 0xBAA300, and the
+// consumers 0xBAE790 and 0xBAEA80, whose callers all pass the manager in ecx.
+constexpr PendingSite kPendingSites[] = {
+    {0x002A51BD, 3, 0x00137AC8, kPendingPairs, 0, true},   // mov [ecx+eax*8+0x137AC8], esi
+    {0x002A51C7, 3, 0x00137ACC, kPendingPairs, 4, true},   // mov [ecx+eax*8+0x137ACC], esi
+    {0x002A51D4, 3, 0x00127AC8, kPendingPtrs, 0, true},    // mov [ecx+eax*4+0x127AC8], edx
+    {0x002A593F, 3, 0x0186A6B8, kPendingPairs, 0, false},  // mov [edi*8+0x186A6B8], edx
+    {0x002A594F, 3, 0x0186A6BC, kPendingPairs, 4, false},  // mov [edi*8+0x186A6BC], edx
+    {0x002A595C, 3, 0x0185A6B8, kPendingPtrs, 0, false},   // mov [edx*4+0x185A6B8], eax
+    {0x002A5A19, 3, 0x0186A6B8, kPendingPairs, 0, false},  // mov [ecx*8+0x186A6B8], edx
+    {0x002A5A29, 3, 0x0186A6BC, kPendingPairs, 4, false},  // mov [ecx*8+0x186A6BC], edx
+    {0x002A5A36, 3, 0x0185A6B8, kPendingPtrs, 0, false},   // mov [edx*4+0x185A6B8], eax
+    {0x002CC661, 3, 0x0186A6B8, kPendingPairs, 0, false},  // mov [edx*8+0x186A6B8], ecx
+    {0x002CC671, 3, 0x0186A6BC, kPendingPairs, 4, false},  // mov [ecx*8+0x186A6BC], eax
+    {0x002CC683, 3, 0x0185A6B8, kPendingPtrs, 0, false},   // mov [edx*4+0x185A6B8], esi
+    {0x007AA038, 3, 0x0186A6B8, kPendingPairs, 0, false},  // mov [edx*8+0x186A6B8], ecx
+    {0x007AA048, 3, 0x0186A6BC, kPendingPairs, 4, false},  // mov [edx*8+0x186A6BC], ecx
+    {0x007AA055, 3, 0x0185A6B8, kPendingPtrs, 0, false},   // mov [ecx*4+0x185A6B8], eax
+    {0x007AA2CB, 3, 0x0186A6B8, kPendingPairs, 0, false},  // mov [ecx*8+0x186A6B8], eax
+    {0x007AA2DA, 3, 0x0186A6BC, kPendingPairs, 4, false},  // mov [eax*8+0x186A6BC], edx
+    {0x007AA2E7, 3, 0x0185A6B8, kPendingPtrs, 0, false},   // mov [ecx*4+0x185A6B8], esi
+    {0x007AA342, 3, 0x0186A6B8, kPendingPairs, 0, false},  // mov [ecx*8+0x186A6B8], eax
+    {0x007AA351, 3, 0x0186A6BC, kPendingPairs, 4, false},  // mov [eax*8+0x186A6BC], edx
+    {0x007AA35E, 3, 0x0185A6B8, kPendingPtrs, 0, false},   // mov [ecx*4+0x185A6B8], esi
+    {0x007AE7AE, 2, 0x00137AC8, kPendingPairs, 0, true},   // lea eax, [esi+0x137AC8]
+    {0x007AE7B9, 2, 0x00127AC8, kPendingPtrs, 0, true},    // lea ebp, [esi+0x127AC8]
+    {0x007AE8D9, 3, 0x00127AC8, kPendingPtrs, 0, true},    // mov eax, [esi+eax*4+0x127AC8]
+    {0x007AE8ED, 3, 0x00137AC8, kPendingPairs, 0, true},   // mov edx, [esi+eax*8+0x137AC8]
+    {0x007AE8F6, 3, 0x00137ACC, kPendingPairs, 4, true},   // mov eax, [esi+eax*8+0x137ACC]
+    {0x007AEAAD, 2, 0x00137AC8, kPendingPairs, 0, true},   // lea ecx, [esi+0x137AC8]
+    {0x007AEAB3, 2, 0x00127AC8, kPendingPtrs, 0, true},    // lea edx, [esi+0x127AC8]
+    {0x007AEAD0, 3, 0x00127AC8, kPendingPtrs, 0, true},    // mov eax, [esi+eax*4+0x127AC8]
+    {0x007AEADF, 3, 0x00137AC8, kPendingPairs, 0, true},   // mov ebp, [esi+eax*8+0x137AC8]
+    {0x007AEAE8, 3, 0x00137ACC, kPendingPairs, 4, true},   // mov eax, [esi+eax*8+0x137ACC]
+};
 constexpr DWORD kErrorMessageUpdateRva = 0x0032AD80;
 constexpr DWORD kEngineSingletonRva = 0x00BE7228;
 constexpr DWORD kLodDirtyFlagRva = 0x00D8D6E0;
@@ -162,6 +233,22 @@ volatile LONG g_interesting_vehicle_log_count = 0;
 void* g_traffic_last_interesting_manager = nullptr;
 bool g_interesting_vehicle_patch_applied = false;
 void* g_movie_draw_continue = nullptr;
+int g_resource_arena_extra_nodes = 135000;
+int g_resource_arena_stock_nodes = 45000;
+DWORD g_arena_stock_end_offset = 0x127AC0;  // manager offset where the stock nodes the hook uses end
+std::uint8_t* g_arena_extension_begin = nullptr;
+std::uint8_t* volatile g_arena_extension_next = nullptr;
+std::uint8_t* g_arena_extension_end = nullptr;
+void* g_arena_bump_continue = nullptr;
+DWORD g_arena_extension_logged_nodes = 0;
+int g_pending_reference_capacity = 131072;
+int g_submodel_table_extra_nodes = 60000;
+std::uint8_t* g_submodel_extension_begin = nullptr;
+std::uint8_t* g_submodel_extension_end = nullptr;
+void* g_submodel_pool_alloc = nullptr;
+DWORD g_submodel_table_logged_peak = 0;
+bool g_pending_reference_patch_applied = false;
+DWORD g_pending_reference_logged_peak = 0;
 void* g_error_message_update_continue = nullptr;
 volatile LONG g_ubisoft_server_lost_prompt_log_count = 0;
 
@@ -343,6 +430,14 @@ void LoadConfig()
     g_skip_legal_screen = GetPrivateProfileIntA("Startup", "SkipLegalScreen", 1, ini_path) != 0;
     g_suppress_ubisoft_server_lost_prompt = GetPrivateProfileIntA("Startup", "SuppressUbisoftServerLostPrompt", 1, ini_path) != 0;
     g_updown_switches_maker = GetPrivateProfileIntA("Garage", "UpDownSwitchesMaker", 1, ini_path) != 0;
+    g_resource_arena_extra_nodes =
+        ClampInt(GetPrivateProfileIntA("Limits", "ResourceArenaExtraNodes", 135000, ini_path), 0, 2000000);
+    g_resource_arena_stock_nodes =
+        ClampInt(GetPrivateProfileIntA("Limits", "ResourceArenaStockNodes", 45000, ini_path), 1, 45000);
+    g_pending_reference_capacity =
+        ClampInt(GetPrivateProfileIntA("Limits", "PendingResourceReferences", 131072, ini_path), 0, 4194304);
+    g_submodel_table_extra_nodes =
+        ClampInt(GetPrivateProfileIntA("Limits", "SubmodelTableExtraNodes", 60000, ini_path), 0, 2000000);
     LoadFlareConfig(ini_path);
 }
 
@@ -2219,6 +2314,329 @@ bool ApplyMovieDrawPatch(const ModuleRange& range)
     return true;
 }
 
+// The resource hash arena's 45,000 stock nodes stay in use; once the bump pointer reaches their
+// end, nodes come from an extension block instead. Nodes are linked by absolute pointers (hash
+// chains and the free list at +0x127AC0), so they can live anywhere. A reset of the arena
+// (0xBAEE50) moves the stock bump pointer back to the start; the next stock acquire then rewinds
+// the extension as well.
+void __stdcall ResourceArenaExtensionFull()
+{
+    Log("ResourceArena: extension full (%d nodes); raise [Limits] ResourceArenaExtraNodes", g_resource_arena_extra_nodes);
+    FatalAppExitA(0, "DSF Enhanced: resource arena full. Raise [Limits] ResourceArenaExtraNodes in dsf_enhanced.ini.");
+}
+
+__declspec(naked) void ProxyResourceHashBump()
+{
+    __asm {
+        mov eax, dword ptr [ecx + 0x127AC4]
+        mov ebx, ecx
+        add ebx, dword ptr [g_arena_stock_end_offset]
+        cmp eax, ebx
+        jae extension
+        mov ebx, dword ptr [g_arena_extension_begin]
+        cmp dword ptr [g_arena_extension_next], ebx
+        je stock
+        mov dword ptr [g_arena_extension_next], ebx
+
+    stock:
+        lea ebx, [eax + 0x18]
+        mov dword ptr [ecx + 0x127AC4], ebx
+        jmp dword ptr [g_arena_bump_continue]
+
+    extension:
+        mov eax, dword ptr [g_arena_extension_next]
+        lea ebx, [eax + 0x18]
+        cmp ebx, dword ptr [g_arena_extension_end]
+        ja full
+        mov dword ptr [g_arena_extension_next], ebx
+        jmp dword ptr [g_arena_bump_continue]
+
+    full:
+        call ResourceArenaExtensionFull
+    }
+}
+
+void ApplyResourceArenaPatch(const ModuleRange& range)
+{
+    if (g_resource_arena_extra_nodes <= 0) {
+        return;
+    }
+    constexpr size_t patch_size = 17;
+    constexpr std::uint8_t expected[patch_size] = {
+        0x8B, 0x81, 0xC4, 0x7A, 0x12, 0x00,  // mov eax, [ecx+0x127AC4]
+        0x8D, 0x58, 0x18,                    // lea ebx, [eax+0x18]
+        0x89, 0x99, 0xC4, 0x7A, 0x12, 0x00,  // mov [ecx+0x127AC4], ebx
+        0xEB, 0x09                           // jmp 0xBAEDD0
+    };
+    if (!IsRvaInRange(range, kResourceHashBumpRva, patch_size)) {
+        Log("ResourceArena: patch site outside the loaded image");
+        return;
+    }
+    auto* target = range.base + kResourceHashBumpRva;
+    if (std::memcmp(target, expected, patch_size) != 0) {
+        Log("ResourceArena: unexpected bytes at RVA 0x%08lX; not patched", static_cast<unsigned long>(kResourceHashBumpRva));
+        return;
+    }
+    const size_t bytes = static_cast<size_t>(g_resource_arena_extra_nodes) * 0x18;
+    auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (block == nullptr) {
+        Log("ResourceArena: could not allocate %lu bytes for the extension", static_cast<unsigned long>(bytes));
+        return;
+    }
+    g_arena_extension_begin = block;
+    g_arena_extension_next = block;
+    g_arena_extension_end = block + bytes;
+    g_arena_bump_continue = range.base + kResourceHashBumpContinueRva;
+    g_arena_stock_end_offset = 0x20000 + static_cast<DWORD>(g_resource_arena_stock_nodes) * 0x18;
+
+    std::uint8_t patch[patch_size];
+    std::memset(patch, 0x90, sizeof(patch));
+    patch[0] = 0xE9;
+    const auto relative = static_cast<std::int32_t>(
+        reinterpret_cast<std::uint8_t*>(&ProxyResourceHashBump) - (target + 5)
+    );
+    std::memcpy(&patch[1], &relative, sizeof(relative));
+    if (!WriteMemory(target, patch, sizeof(patch))) {
+        Log("ResourceArena: failed to patch RVA 0x%08lX", static_cast<unsigned long>(kResourceHashBumpRva));
+        return;
+    }
+    Log(
+        "ResourceArena: %d stock nodes, then %d extension nodes at 0x%p (%lu KB)",
+        g_resource_arena_stock_nodes,
+        g_resource_arena_extra_nodes,
+        block,
+        static_cast<unsigned long>(bytes / 1024)
+    );
+}
+
+void LogResourceArenaUse()
+{
+    if (g_arena_extension_begin == nullptr) {
+        return;
+    }
+    const auto used = static_cast<DWORD>((g_arena_extension_next - g_arena_extension_begin) / 0x18);
+    if (used > g_arena_extension_logged_nodes) {
+        g_arena_extension_logged_nodes = used;
+        Log("ResourceArena: stock nodes full; extension high water %lu of %d", static_cast<unsigned long>(used), g_resource_arena_extra_nodes);
+    }
+}
+
+// Once the bump pointer of the submodel table's pool reaches the end of its 15,000 stock nodes,
+// it is moved to an extension block, and the pool bumps on through that. Freed nodes go on the
+// pool's free list, whose last entry holds the bump pointer, wherever the nodes live. The bucket
+// count stays 15,013: chains just get longer.
+void __stdcall SubmodelTableExtensionFull()
+{
+    Log("SubmodelTable: extension full (%d nodes); raise [Limits] SubmodelTableExtraNodes", g_submodel_table_extra_nodes);
+    FatalAppExitA(0, "DSF Enhanced: submodel table full. Raise [Limits] SubmodelTableExtraNodes in dsf_enhanced.ini.");
+}
+
+__declspec(naked) void ProxySubmodelNodeAlloc()
+{
+    __asm {
+        cmp dword ptr [ecx + 4], 0
+        jne original
+        push eax
+        lea eax, [ecx + 0x57E50]  // where the 15,000 stock nodes end
+        cmp dword ptr [ecx], eax
+        jne in_extension
+        mov eax, dword ptr [g_submodel_extension_begin]
+        mov dword ptr [ecx], eax
+        pop eax
+        jmp original
+
+    in_extension:
+        mov eax, dword ptr [g_submodel_extension_end]
+        cmp dword ptr [ecx], eax
+        pop eax
+        je full
+
+    original:
+        jmp dword ptr [g_submodel_pool_alloc]
+
+    full:
+        call SubmodelTableExtensionFull
+    }
+}
+
+void ApplySubmodelTablePatch(const ModuleRange& range)
+{
+    if (g_submodel_table_extra_nodes <= 0) {
+        return;
+    }
+    if (!IsRvaInRange(range, kSubmodelNodeAllocCallRva, 5)) {
+        Log("SubmodelTable: patch site outside the loaded image");
+        return;
+    }
+    auto* site = range.base + kSubmodelNodeAllocCallRva;
+    std::int32_t stock_relative = 0;
+    std::memcpy(&stock_relative, site + 1, sizeof(stock_relative));
+    if (site[0] != 0xE8 || site + 5 + stock_relative != range.base + kPoolAllocRva) {
+        Log("SubmodelTable: unexpected bytes at RVA 0x%08lX; not patched", static_cast<unsigned long>(kSubmodelNodeAllocCallRva));
+        return;
+    }
+    const size_t bytes = static_cast<size_t>(g_submodel_table_extra_nodes) * 0x18;
+    auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (block == nullptr) {
+        Log("SubmodelTable: could not allocate %lu bytes for the extension", static_cast<unsigned long>(bytes));
+        return;
+    }
+    g_submodel_extension_begin = block;
+    g_submodel_extension_end = block + bytes;
+    g_submodel_pool_alloc = range.base + kPoolAllocRva;
+    std::uint8_t patch[5] = {0xE8};
+    const auto relative = static_cast<std::int32_t>(
+        reinterpret_cast<std::uint8_t*>(&ProxySubmodelNodeAlloc) - (site + 5)
+    );
+    std::memcpy(&patch[1], &relative, sizeof(relative));
+    if (!WriteMemory(site, patch, sizeof(patch))) {
+        Log("SubmodelTable: failed to patch RVA 0x%08lX", static_cast<unsigned long>(kSubmodelNodeAllocCallRva));
+        return;
+    }
+    Log(
+        "SubmodelTable: 15000 stock nodes, then %d extension nodes at 0x%p (%lu KB)",
+        g_submodel_table_extra_nodes,
+        block,
+        static_cast<unsigned long>(bytes / 1024)
+    );
+}
+
+// The table's live node count (pool +8), logged when it passes its highest so far by 1,000.
+void LogSubmodelTableUse(const ModuleRange& range)
+{
+    if (!IsRvaInRange(range, kSubmodelOwnerRva, 4)) {
+        return;
+    }
+    const auto owner = *reinterpret_cast<const DWORD*>(range.base + kSubmodelOwnerRva);
+    if (owner == 0) {
+        return;
+    }
+    const auto live = *reinterpret_cast<const DWORD*>(owner + kSubmodelTableOffset + 8);
+    if (live >= g_submodel_table_logged_peak + 1000) {
+        g_submodel_table_logged_peak = live;
+        Log("SubmodelTable: %lu submodels loaded (stock limit 15000)", static_cast<unsigned long>(live));
+    }
+}
+
+// size bytes that end right before an inaccessible page, so that writing past them faults at once
+// instead of corrupting whatever was allocated next.
+std::uint8_t* AllocateGuarded(size_t size)
+{
+    SYSTEM_INFO info{};
+    GetSystemInfo(&info);
+    const size_t page = info.dwPageSize;
+    const size_t data = (size + page - 1) / page * page;
+    auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, data + page, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (block == nullptr) {
+        return nullptr;
+    }
+    DWORD old_protect = 0;
+    if (!VirtualProtect(block + data, page, PAGE_NOACCESS, &old_protect)) {
+        VirtualFree(block, 0, MEM_RELEASE);
+        return nullptr;
+    }
+    return block + (data - size);
+}
+
+void FreeGuarded(void* p)
+{
+    MEMORY_BASIC_INFORMATION info{};
+    if (p != nullptr && VirtualQuery(p, &info, sizeof(info)) != 0) {
+        VirtualFree(info.AllocationBase, 0, MEM_RELEASE);
+    }
+}
+
+// Moves the pending-reference list to bigger arrays by rewriting the disp32 of every instruction
+// that addresses it; the count stays where it is. All sites are checked first: on any mismatch
+// nothing is patched. If a write fails, the sites already rewritten are put back: an appender
+// writing one array in the new place and the other in the stock place would break the consumer.
+// The engine still doesn't check the count; past the new capacity the guard page faults.
+void ApplyPendingReferencePatch(const ModuleRange& range)
+{
+    if (g_pending_reference_capacity <= kPendingStockCapacity) {
+        return;
+    }
+    for (const auto& site : kPendingSites) {
+        if (!IsRvaInRange(range, site.rva + site.disp_offset, 4)) {
+            Log("PendingReferences: site RVA 0x%08lX outside the loaded image; not patched", static_cast<unsigned long>(site.rva));
+            return;
+        }
+        DWORD current = 0;
+        std::memcpy(&current, range.base + site.rva + site.disp_offset, sizeof(current));
+        if (current != site.expected) {
+            Log(
+                "PendingReferences: RVA 0x%08lX holds 0x%08lX, expected 0x%08lX; not patched",
+                static_cast<unsigned long>(site.rva),
+                static_cast<unsigned long>(current),
+                static_cast<unsigned long>(site.expected)
+            );
+            return;
+        }
+    }
+    const size_t capacity = static_cast<size_t>(g_pending_reference_capacity);
+    auto* ptrs = AllocateGuarded(capacity * 4);
+    auto* pairs = AllocateGuarded(capacity * 8);
+    if (ptrs == nullptr || pairs == nullptr) {
+        Log("PendingReferences: could not allocate %lu entries", static_cast<unsigned long>(capacity));
+        FreeGuarded(ptrs);
+        FreeGuarded(pairs);
+        return;
+    }
+    std::memcpy(ptrs, range.base + kPendingPtrsRva, kPendingStockCapacity * 4);
+    std::memcpy(pairs, range.base + kPendingPairsRva, kPendingStockCapacity * 8);
+    const auto manager = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(range.base + kResourceManagerRva));
+    const int total = static_cast<int>(sizeof(kPendingSites) / sizeof(kPendingSites[0]));
+    int patched = 0;
+    for (const auto& site : kPendingSites) {
+        const auto* array = site.array == kPendingPtrs ? ptrs : pairs;
+        DWORD value = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(array)) + site.plus;
+        if (site.relative) {
+            value -= manager;
+        }
+        if (!WriteMemory(range.base + site.rva + site.disp_offset, &value, sizeof(value))) {
+            break;
+        }
+        ++patched;
+    }
+    if (patched != total) {
+        for (int i = 0; i < patched; ++i) {
+            const auto& site = kPendingSites[i];
+            WriteMemory(range.base + site.rva + site.disp_offset, &site.expected, sizeof(site.expected));
+        }
+        Log(
+            "PendingReferences: failed to patch RVA 0x%08lX; the %d sites already patched were restored",
+            static_cast<unsigned long>(kPendingSites[patched].rva),
+            patched
+        );
+        FreeGuarded(ptrs);
+        FreeGuarded(pairs);
+        return;
+    }
+    g_pending_reference_patch_applied = true;
+    Log(
+        "PendingReferences: %d of %d sites patched; %lu entries at 0x%p / 0x%p (stock %d)",
+        patched,
+        total,
+        static_cast<unsigned long>(capacity),
+        ptrs,
+        pairs,
+        kPendingStockCapacity
+    );
+}
+
+void LogPendingReferencePeak(const ModuleRange& range)
+{
+    if (!g_pending_reference_patch_applied) {
+        return;
+    }
+    DWORD count = 0;
+    std::memcpy(&count, range.base + kPendingResourceReferenceCountRva, sizeof(count));
+    if (count > static_cast<DWORD>(kPendingStockCapacity) && count > g_pending_reference_logged_peak) {
+        g_pending_reference_logged_peak = count;
+        Log("PendingReferences: %lu pending (stock limit %d)", static_cast<unsigned long>(count), kPendingStockCapacity);
+    }
+}
+
 // When the legal screen ends, state 4 calls the loading screen's begin function 0x4A20C0, which
 // ends by clearing the resource manager's list of unresolved resource references (count at
 // 0x188A6B8: mov dword [0x188A6B8],0 at 0x4A2153). After the stock 5 s wait the startup packages
@@ -3010,6 +3428,9 @@ void ApplyPatches()
 
     PatchDirect3DCreate9Import(exe);
     PatchBinkImports(exe);
+    ApplyPendingReferencePatch(exe);
+    ApplyResourceArenaPatch(exe);
+    ApplySubmodelTablePatch(exe);
     ApplyStartupPatches(exe);
     ApplyUbisoftServerLostPromptPatch(exe);
     ApplyGarageMakerSwitchPatch(exe);
@@ -3042,6 +3463,11 @@ DWORD WINAPI InitThread(LPVOID)
         ApplyLodThresholds(exe, "Loop");
         ApplyDrlFlareCurves(exe);
         LogTrafficDiagnostics(exe);
+        LogPendingReferencePeak(exe);
+        if (tick % 4 == 0) {
+            LogResourceArenaUse();
+            LogSubmodelTableUse(exe);
+        }
         if (tick % 4 == 0) {
             ApplyAspectConstantPatch(exe, "Loop");
             ApplyGlobalFovScalarPatch(exe, "Loop");

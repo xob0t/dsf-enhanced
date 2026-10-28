@@ -1,0 +1,115 @@
+# Default settings. A worldlod.toml in the working folder, or the file given with
+# --config, overrides any of these keys. `worldlod config` prints the merged result.
+# Tables keyed by class name ([classes], [bake] min_model_size) are replaced as a
+# whole, not merged.
+
+[game]
+# Game folder (the one with Driver.exe). Empty: --game, else the DSF_GAME_DIR
+# environment variable, else the current folder if it holds the game, else the
+# folder worldlod last installed into.
+dir = ""
+# World archive, relative to the game folder.
+archive = "Install/san_francisco.dngc"
+
+[run]
+# Work folder (bake cache and the built archive), relative to the config file's
+# folder. Empty: work\ beside install.cmd (the release), else out\ in worldlod's
+# folder (a checkout). install deletes the build files in it once it is done.
+work_dir = ""
+# Process priority: "idle", "below_normal" or "normal". Idle keeps the PC usable.
+priority = "idle"
+
+[regions]
+# Regions to process: "all", or a list of region names such as ["R_360"].
+select = "all"
+
+# Material classes. A material belongs to the first class with a prefix that its
+# source path (below Levels/San_Francisco/{Materials,Textures}/[Permanent/],
+# lower case, '/' separators) starts with. Materials that match no prefix are
+# class "other". "skip" (occluders, tool materials) is in no [bake] classes.
+[classes]
+# The low-poly terrain material is ground too: 119 detailed regions draw it themselves.
+skip = ["occludermaterial", "r:/toolchain/"]
+ground = ["terrain/", "roads/", "ground/"]
+buildings = ["buildings/"]
+foliage = ["trees/", "hyperlowtree"]
+water = ["water/"]
+props = ["misc/"]
+
+[bake]
+# Classes from the detailed regions that go into the base LOD, replacing the
+# stock submodels below. An empty list turns the bake off; pack then writes the
+# stock archive.
+classes = ["ground", "foliage", "buildings", "props"]
+# Materials left out of the bake: their path starts with one of these. Grass
+# cards (1.45M triangles) can't be seen from Shift height; the Bay and
+# Carquinez bridges' girders are 4.3M triangles of lines, the tram and power
+# wires 0.35M. Of the props, that leaves the painted road text.
+exclude = [
+    "trees/foliage_grass",
+    "trees/misc_grasses",
+    "buildings/specular/bridge_baybridge",
+    "buildings/specular/bridge_carquinez",
+    "misc/tram_wire",
+    "misc/pylon_wire",
+    "misc/trafficlight",
+]
+# Per class: leave out placed models whose longest box edge (after instance
+# scale) is below this many metres. "buildings" in the detailed regions are the
+# overlays on the base's building shells and the street furniture: storefronts,
+# rooftop units, fire escapes, containers, pallets, rocks.
+min_model_size = { buildings = 2.0 }
+# Leaf-card trees (most trees and bushes) light themselves with a per-object
+# sample that the base LOD never sets, so baked as they are they draw black.
+# "flat" lays each card flat, facing up, and draws it with a clone of
+# leaf_card_material that holds the tree's texture; "keep" copies the cards as
+# they are; "drop" leaves them out.
+leaf_cards = "flat"
+leaf_card_material = "trees/palm_02.matxml"
+# The stock submodels to replace: those whose material path starts with this
+# prefix (the vertex-coloured low-poly terrain). The part holding them, one at
+# the centre of 420 of the 532 detailed cells, receives the baked cell; its
+# other submodels (the shared sea, low-detail trees) stay.
+replace = "terrain/vertcolourlowpolyterrrain"
+# Move the baked geometry up by this many metres (negative: down). Above, the
+# base wins over detail cells loaded near the Shift cursor, so upper Shift looks
+# the same everywhere. If the engine also draws the base where detail is loaded
+# in gameplay (not known yet), it would cover the real ground by this much; a
+# negative value lets the detail win instead.
+height_offset = 0.05
+# Where the baked ground leaves a gap that the stock terrain covered (a cell
+# whose detail has little ground, the map edges), keep those stock terrain
+# triangles, moved down by this many metres so that they stay under the baked
+# ground where the two meet. A negative value turns the fill off. A cell whose
+# bake has no ground at all keeps its stock terrain as it is either way.
+fill_drop = 2.0
+# Baked classes that count as covering the stock terrain (seen from above) for
+# that fill. Trees don't: the ground under them still needs filling.
+fill_cover = ["ground"]
+
+[simplify]
+# Classes simplified (leaf cards and other small open meshes don't simplify well).
+classes = ["ground"]
+# Largest geometric error, in metres, allowed when simplifying each baked cell.
+# Upper Shift views the city from hundreds of metres up. 0 turns simplification
+# off. 0.5 keeps about 62% of the
+# ground triangles, 1.0 about 52%.
+error = 0.5
+# Weights in the error metric of the normals (shading) and the vertex colour
+# (the terrain's texture blend weights). 0 ignores the attribute.
+normal_weight = 0.1
+colour_weight = 1.0
+# Keep each cell's outer edges in place so that neighbouring cells meet without
+# cracks. Material boundaries inside a cell stay closed either way.
+lock_border = true
+
+[render]
+# Area for `worldlod render`: "city" (every cell), or [min_x, min_z, max_x, max_z]
+# in metres (made square around its centre).
+area = "city"
+# Image width and height in pixels.
+size = 2048
+# "top" (orthographic, looking down) or "oblique" (45 degrees, from the south).
+view = "top"
+# Largest texture side, in texels, decoded for drawing.
+texture_size = 256

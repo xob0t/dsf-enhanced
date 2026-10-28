@@ -1,0 +1,48 @@
+[project]
+name = "dsf-worldlod"
+version = "0.1.0"
+description = "Builds a high-detail base LOD for Driver: San Francisco's upper Shift levels from the game's detailed regions"
+readme = "README.md"
+license = "MIT"
+requires-python = ">=3.13"
+dependencies = ["numpy>=2.1", "rich>=13"]
+
+[project.scripts]
+worldlod = "dsfworld.cli:main"
+
+[dependency-groups]
+dev = ["pytest>=8.3", "ruff>=0.8"]
+
+[build-system]
+requires = ["uv_build>=0.8,<0.14"]
+build-backend = "uv_build"
+
+[tool.uv.build-backend]
+module-name = "dsfworld"
+
+[tool.uv]
+# Rebuild when the code changes, not only pyproject.toml (uvx --from <this folder> caches the build).
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }, { file = "src/**/*.toml" }, { file = "src/**/*.dll" }]
+
+[tool.ruff]
+line-length = 120  # the target version comes from requires-python
+
+[tool.ruff.lint]
+select = [
+    "E", "W", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "RET", "PTH", "PERF", "FURB", "RUF", "PIE",
+    "PL", "FBT", "ARG", "ERA", "FLY", "INP", "PT",
+]
+ignore = [
+    "PLR0913",  # pipeline functions take their settings as arguments
+    "PLC0415",  # the CLI imports a stage only when it runs it
+]
+
+[tool.ruff.lint.per-file-ignores]
+# Binary formats compare against their own constants (sizes, limits, types, sentinels).
+"src/dsfworld/formats/*" = ["PLR2004"]
+"src/dsfworld/bake.py" = ["PLR2004"]
+# Tests: vertex builders take coordinates; expected values are literals; tests/ is no package.
+"tests/*" = ["PLR0917", "PLR2004", "INP001"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
