@@ -106,4 +106,3 @@ size = 2048
 view = "top"
 # Largest texture side, in texels, decoded for drawing.
 texture_size = 256
-
