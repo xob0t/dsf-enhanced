@@ -47,7 +47,8 @@ For example, in a terminal in worldlod's folder: `.\install.cmd --no-buildings`.
 The roads and paving are always in. `.\install.cmd --help` lists every option.
 
 A build runs at idle priority, so the PC stays usable meanwhile. Its files
-(about 1 GB, in `%LOCALAPPDATA%\worldlod`) are deleted once it is installed.
+(about 1 GB, in `work` beside `install.cmd`) are deleted once it is installed;
+deleting worldlod's folder removes everything it put on your PC except uv.
 
 ## Settings
 

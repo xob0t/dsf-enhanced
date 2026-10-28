@@ -13,9 +13,9 @@ DEFAULTS = Path(__file__).with_name("default.toml")
 USER_FILE = "worldlod.toml"
 BACKUP_DIR = "worldlod-backup"  # in the game folder, written by `worldlod install`
 GAME_EXE = "Driver.exe"
-# Work files and the game folder worldlod last installed into ([run] work_dir empty).
-DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "worldlod"
-STATE_FILE = DATA_DIR / "state.json"
+WORK_ENV = "WORLDLOD_WORK"  # the work folder when [run] work_dir is empty (install.cmd: work\ beside it)
+PROJECT = Path(__file__).resolve().parents[2]  # src/dsfworld -> worldlod/ in a checkout, app\ in the release
+STATE = "state.json"  # in the work folder: the game folder worldlod last installed into
 # --no-<name> flags: the [bake] class each leaves out, and what that is
 OPTIONAL = {
     "trees": ("foliage", "trees and bushes"),
@@ -24,16 +24,21 @@ OPTIONAL = {
 }
 
 
-def remembered_game() -> str:
+def default_work_dir() -> Path:
+    """WORLDLOD_WORK, else out\\ in the project folder (a checkout, or the release's app\\)."""
+    return Path(os.environ[WORK_ENV]) if os.environ.get(WORK_ENV) else PROJECT / "out"
+
+
+def remembered_game(work_dir: Path) -> str:
     try:
-        return json.loads(STATE_FILE.read_text()).get("game", "")
+        return json.loads((work_dir / STATE).read_text()).get("game", "")
     except (OSError, ValueError):
         return ""
 
 
-def remember_game(game: Path) -> None:
-    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
-    STATE_FILE.write_text(json.dumps({"game": str(game)}, indent=2))
+def remember_game(work_dir: Path, game: Path) -> None:
+    work_dir.mkdir(parents=True, exist_ok=True)
+    (work_dir / STATE).write_text(json.dumps({"game": str(game)}, indent=2))
 
 
 FREE_TABLES = {"classes", "min_model_size"}  # keyed by class names: a user table replaces the default
@@ -62,7 +67,7 @@ class Config:
         """[game] dir (or --game), else DSF_GAME_DIR, else the current folder if it holds the game, else
         the folder worldlod last installed into."""
         here = Path.cwd() if (Path.cwd() / GAME_EXE).exists() else ""
-        d = self.data["game"]["dir"] or os.environ.get("DSF_GAME_DIR", "") or here or remembered_game()
+        d = self.data["game"]["dir"] or os.environ.get("DSF_GAME_DIR", "") or here or remembered_game(self.work_dir)
         if not d:
             raise SystemExit(
                 f"Where is the game? Run worldlod in the game folder (the one with {GAME_EXE}), or pass "
@@ -97,7 +102,7 @@ class Config:
     @property
     def work_dir(self) -> Path:
         d = self.data["run"]["work_dir"]
-        return (self.folder / d).resolve() if d else DATA_DIR
+        return (self.folder / d).resolve() if d else default_work_dir()
 
     def section(self, name: str) -> dict:
         return self.data[name]

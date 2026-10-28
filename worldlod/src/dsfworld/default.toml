@@ -13,7 +13,8 @@ archive = "Install/san_francisco.dngc"
 
 [run]
 # Work folder (bake cache and the built archive), relative to the config file's
-# folder. Empty: %LOCALAPPDATA%\worldlod.
+# folder. Empty: work\ beside install.cmd (the release), else out\ in worldlod's
+# folder (a checkout). install deletes the build files in it once it is done.
 work_dir = ""
 # Process priority: "idle", "below_normal" or "normal". Idle keeps the PC usable.
 priority = "idle"

@@ -46,7 +46,7 @@ def summary(title: str, rows: list[tuple[str, str]], footer: str = "") -> None:
     """A panel of label: value rows."""
     table = Table.grid(padding=(0, 2))
     table.add_column(style="cyan", no_wrap=True)
-    table.add_column()
+    table.add_column(overflow="fold")  # long paths wrap, not cut
     for label, value in rows:
         table.add_row(escape(label), escape(value))
     console.print(

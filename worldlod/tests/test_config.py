@@ -12,7 +12,7 @@ def test_user_file_overrides_defaults(tmp_path):
     assert cfg.section("regions")["select"] == ["R_360"]
     assert cfg.section("classes") == {"ground": ["terrain/"]}  # classes are replaced, not merged
     assert cfg.section("run")["priority"] == "idle"
-    assert cfg.work_dir == config.DATA_DIR  # [run] work_dir empty
+    assert cfg.work_dir == config.default_work_dir()  # [run] work_dir empty
 
 
 def test_work_dir_is_relative_to_the_settings_file(tmp_path):
@@ -24,7 +24,7 @@ def test_work_dir_is_relative_to_the_settings_file(tmp_path):
 def test_game_folder_from_the_current_folder_then_the_remembered_one(tmp_path, monkeypatch):
     with pytest.raises(SystemExit, match="Where is the game"):
         _ = config.load(None).game_dir
-    config.remember_game(tmp_path / "remembered")
+    config.remember_game(config.default_work_dir(), tmp_path / "remembered")
     assert config.load(None).game_dir == tmp_path / "remembered"
     game = tmp_path / "game"
     game.mkdir()

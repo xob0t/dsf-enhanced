@@ -110,7 +110,7 @@ def install(cfg: Config) -> None:
         _swap_in(packed, target)
         manifest["installed"] = sha256(target)
     manifest_path.write_text(json.dumps(manifest, indent=2))
-    remember_game(cfg.game_dir)
+    remember_game(cfg.work_dir, cfg.game_dir)
     if not cfg.data["run"]["work_dir"]:  # the default work folder: a one-time run leaves nothing behind
         shutil.rmtree(cfg.work_dir / "bake", ignore_errors=True)
         shutil.rmtree(packed.parent, ignore_errors=True)

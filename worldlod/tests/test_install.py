@@ -57,7 +57,7 @@ def test_install_remembers_the_game_folder(game):
     from dsfworld import config
 
     install.install(game)
-    assert config.remembered_game() == str(game.game_dir)
+    assert config.remembered_game(game.work_dir) == str(game.game_dir)
 
 
 def test_install_deletes_the_build_files_from_the_default_work_folder(game):

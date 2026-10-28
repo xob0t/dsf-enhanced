@@ -81,6 +81,7 @@ if ($command -eq 'install') { $Forward = @('--plugin', (Join-Path $Root 'plugin'
 
 # uv reports progress on stderr; Windows PowerShell must not treat that as an error.
 $env:WORLDLOD_LAUNCHER = 'install.cmd'   # the summary names install.cmd --uninstall
+$env:WORLDLOD_WORK = Join-Path $Root 'work'   # build files beside install.cmd (deleted after install)
 $ErrorActionPreference = 'Continue'
 & $uv run --project $App --frozen --no-dev --quiet worldlod $command @Forward
 exit $LASTEXITCODE
