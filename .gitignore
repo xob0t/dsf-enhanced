@@ -9,6 +9,7 @@ reverse_engineering/
 # worldlod pipeline
 worldlod/.venv/
 worldlod/out/
+worldlod/worldlod.toml
 __pycache__/
 .pytest_cache/
 .ruff_cache/

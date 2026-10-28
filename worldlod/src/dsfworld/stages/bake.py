@@ -3,7 +3,7 @@
 Writes <work_dir>/bake/<region>.pkl (the baked groups) and bake/summary.tsv.
 A region is rebuilt when its file is missing or its cache key changed: VERSION,
 the [game], [classes], [bake] and [simplify] settings, and the source archive's
-path and size. Regions whose cell has no stock part to replace are listed and
+name and size. Regions whose cell has no stock part to replace are listed and
 skipped.
 """
 
@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dsfworld import bake, simplify
+from dsfworld import bake, config, simplify
 from dsfworld.config import Config
 from dsfworld.formats.modl import POSITION, UV0, Lod
 from dsfworld.gegr import CellBake
@@ -24,7 +24,7 @@ from dsfworld.world import World
 
 SECTIONS = ("game", "classes", "bake", "simplify")
 # Part of the cache key: raise when the bake or simplification output changes for the same settings.
-VERSION = 8
+VERSION = 9
 LISTED = 12  # regions named in the summary's line of regions without a stock part
 
 
@@ -68,14 +68,16 @@ def card_template(world: World, path: str) -> bake.CardTemplate:
     raise SystemExit(f"[bake] leaf_card_material: no GEGR submodel draws {path!r} with a position and UV")
 
 
-def class_indices(cfg: Config, world: World, section: str, key: str) -> list[int]:
-    """The classes that [section] key names (a list, or a table keyed by class) as indices into
-    world.class_names. An unknown name is an error: ignored, a typo would turn a step off."""
+def class_indices(cfg: Config, world: World, section: str, key: str) -> dict[str, int]:
+    """The classes that [section] key names (a list, or a table keyed by class), by name, as indices
+    into world.class_names. An unknown name the user set is an error (ignored, a typo would turn a
+    step off); in the packaged value it is skipped, since a user [classes] table replaces the default
+    classes."""
     names = list(cfg.section(section)[key])
     unknown = sorted(set(names) - set(world.class_names))
-    if unknown:
+    if unknown and names != list(config.defaults()[section][key]):
         raise SystemExit(f"[{section}] {key}: unknown class {', '.join(unknown)}")
-    return [world.class_names.index(c) for c in names]
+    return {c: world.class_names.index(c) for c in names if c in world.class_names}
 
 
 @dataclass(frozen=True)
@@ -102,17 +104,17 @@ def settings(cfg: Config, world: World) -> Settings:
     options = bake.BakeOptions(
         height_offset=b["height_offset"],
         exclude=tuple(b["exclude"]),
-        min_size=dict(zip(min_size, b["min_model_size"].values(), strict=True)),
+        min_size={i: b["min_model_size"][c] for c, i in min_size.items()},
         leaf_cards=b["leaf_cards"],
         cards=card_template(world, b["leaf_card_material"]) if b["leaf_cards"] == "flat" else None,
     )
     return Settings(
-        keep=frozenset(class_indices(cfg, world, "bake", "classes")),
+        keep=frozenset(class_indices(cfg, world, "bake", "classes").values()),
         options=options,
         replace=b["replace"],
         fill_drop=b["fill_drop"],
-        fill_cover=frozenset(class_indices(cfg, world, "bake", "fill_cover")),
-        simplified=frozenset(class_indices(cfg, world, "simplify", "classes")),
+        fill_cover=frozenset(class_indices(cfg, world, "bake", "fill_cover").values()),
+        simplified=frozenset(class_indices(cfg, world, "simplify", "classes").values()),
         error=s["error"],
         normal_weight=s["normal_weight"],
         colour_weight=s["colour_weight"],
@@ -122,9 +124,10 @@ def settings(cfg: Config, world: World) -> Settings:
 
 def bake_cell(
     world: World, name: str, target: np.ndarray, *, stock_terrain: list[tuple[int, int]], settings: Settings
-) -> bake.Result:
+) -> tuple[bake.Result, bool]:
     """One region baked into the frame of target, simplified by class, with the stock terrain it leaves
-    uncovered kept as fill."""
+    uncovered kept as fill. Also whether the bake covers the stock terrain at all: if not, the cell keeps
+    its stock terrain submodels as they are."""
     s = settings
     lib, g = world.region(name)
     result = bake.bake_region(world, lib, g.instances, target, s.keep, options=s.options)
@@ -133,11 +136,9 @@ def bake_cell(
     to_simplify = simplify.cell(to_simplify, s.error, s.normal_weight, s.colour_weight, lock_border=s.lock_border)
     result.groups = to_simplify + rest
     cover = [x for x in result.groups if world.class_index(x.material) in s.fill_cover]
-    if not cover:  # nothing replaces the stock terrain: keep all of it where it is
-        result.groups += bake.fill_from_stock(world.library, stock_terrain, [], 0.0)
-    elif s.fill_drop >= 0:
+    if cover and s.fill_drop >= 0:
         result.groups += bake.fill_from_stock(world.library, stock_terrain, cover, s.fill_drop)
-    return result
+    return result, bool(cover)
 
 
 def _load(path: Path, digest: str) -> dict | None:
@@ -161,8 +162,8 @@ def run(cfg: Config, world: World, *, force: bool = False) -> list[CellBake]:
     chosen = settings(cfg, world)
     out = output_dir(cfg)
     out.mkdir(parents=True, exist_ok=True)
-    source = world.archive.path
-    digest = f"{VERSION}:{cfg.digest(*SECTIONS)}:{source}:{source.stat().st_size}"
+    source = world.archive.path  # by name and size: install moves the reading from the game file to its backup
+    digest = f"{VERSION}:{cfg.digest(*SECTIONS)}:{source.name}:{source.stat().st_size}"
     stock = targets(world, chosen.replace)
     names = world.region_names(cfg.section("regions")["select"])
     cells, rows, no_target = [], [], []
@@ -182,14 +183,21 @@ def run(cfg: Config, world: World, *, force: bool = False) -> list[CellBake]:
         state = "cached"
         if cached is None:
             terrain = [(s, flags[s]) for s in lod.submodels if s in replaced]
-            result = bake_cell(world, name, matrix, stock_terrain=terrain, settings=chosen)
-            cached = {"digest": digest, "part": part_uid, "groups": result.groups, "skipped": result.skipped}
+            result, covered = bake_cell(world, name, matrix, stock_terrain=terrain, settings=chosen)
+            cached = {
+                "digest": digest,
+                "part": part_uid,
+                "groups": result.groups,
+                "skipped": result.skipped,
+                "covered": covered,
+            }
             _save(path, cached)
             state = "built"
         groups = cached["groups"]
         tris = sum(len(g.triangles) for g in groups)
         skipped_total.update(cached["skipped"])
-        cells.append(CellBake(part_uid, groups, [s for s in lod.submodels if s not in replaced]))
+        kept = [s for s in lod.submodels if s not in replaced or not cached["covered"]]
+        cells.append(CellBake(part_uid, groups, kept))
         rows.append([name, len(groups), sum(len(g.vertices) for g in groups), tris, sum(cached["skipped"].values())])
         print(f"[{n}/{len(names)}] {name} {state}: {tris:,} triangles in {len(groups)} groups")
     _report(out, rows, no_target, skipped_total)

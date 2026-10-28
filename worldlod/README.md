@@ -63,7 +63,7 @@ The pipeline lowers its own process priority (`[run] priority`, default
 | `worldlod install` | backs up the game's `san_francisco.dngc` once to `<game>/worldlod-backup/` (with its SHA-256) and puts the packed one in its place |
 | `worldlod uninstall` | puts the backed-up original back |
 
-A stage reuses its earlier output while the settings it depends on are unchanged.
+`bake` reuses a region's earlier output while the settings it depends on are unchanged.
 `--archive <file>` reads another world archive, e.g. `uv run worldlod --archive
 out/pack/san_francisco.dngc info` summarises the packed one.
 

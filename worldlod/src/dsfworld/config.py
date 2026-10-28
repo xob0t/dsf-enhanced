@@ -79,6 +79,12 @@ class Config:
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 
+def defaults() -> dict:
+    """The packaged settings."""
+    with DEFAULTS.open("rb") as f:
+        return tomllib.load(f)
+
+
 def load(path: Path | None = None) -> Config:
     with DEFAULTS.open("rb") as f:
         data = tomllib.load(f)

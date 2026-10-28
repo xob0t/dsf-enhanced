@@ -86,7 +86,6 @@ constexpr DWORD kSubmodelOwnerRva = 0x015BBA74;
 constexpr DWORD kSubmodelNodeAllocCallRva = 0x007BBE9B;  // call 0x8CCAA0 in the table's insert
 constexpr DWORD kPoolAllocRva = 0x004CCAA0;
 constexpr DWORD kSubmodelTableOffset = 0x30;
-constexpr DWORD kSubmodelStockEnd = 0x57E50;  // table offset where the stock nodes end
 constexpr DWORD kPendingPtrsRva = 0x0145A6B8;
 constexpr DWORD kPendingPairsRva = 0x0146A6B8;
 constexpr int kPendingStockCapacity = 16384;
@@ -2438,7 +2437,7 @@ __declspec(naked) void ProxySubmodelNodeAlloc()
         cmp dword ptr [ecx + 4], 0
         jne original
         push eax
-        lea eax, [ecx + 0x57E50]  // kSubmodelStockEnd
+        lea eax, [ecx + 0x57E50]  // where the 15,000 stock nodes end
         cmp dword ptr [ecx], eax
         jne in_extension
         mov eax, dword ptr [g_submodel_extension_begin]
@@ -2539,6 +2538,14 @@ std::uint8_t* AllocateGuarded(size_t size)
     return block + (data - size);
 }
 
+void FreeGuarded(void* p)
+{
+    MEMORY_BASIC_INFORMATION info{};
+    if (p != nullptr && VirtualQuery(p, &info, sizeof(info)) != 0) {
+        VirtualFree(info.AllocationBase, 0, MEM_RELEASE);
+    }
+}
+
 // Moves the pending-reference list to bigger arrays by rewriting the disp32 of every instruction
 // that addresses it; the count stays where it is. All sites are checked first: on any mismatch
 // nothing is patched. If a write fails, the sites already rewritten are put back: an appender
@@ -2571,6 +2578,8 @@ void ApplyPendingReferencePatch(const ModuleRange& range)
     auto* pairs = AllocateGuarded(capacity * 8);
     if (ptrs == nullptr || pairs == nullptr) {
         Log("PendingReferences: could not allocate %lu entries", static_cast<unsigned long>(capacity));
+        FreeGuarded(ptrs);
+        FreeGuarded(pairs);
         return;
     }
     std::memcpy(ptrs, range.base + kPendingPtrsRva, kPendingStockCapacity * 4);
@@ -2599,6 +2608,8 @@ void ApplyPendingReferencePatch(const ModuleRange& range)
             static_cast<unsigned long>(kPendingSites[patched].rva),
             patched
         );
+        FreeGuarded(ptrs);
+        FreeGuarded(pairs);
         return;
     }
     g_pending_reference_patch_applied = true;

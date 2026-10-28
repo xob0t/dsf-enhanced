@@ -1,5 +1,7 @@
 # Default settings. A worldlod.toml in the working folder, or the file given with
 # --config, overrides any of these keys. `worldlod config` prints the merged result.
+# Tables keyed by class name ([classes], [bake] min_model_size) are replaced as a
+# whole, not merged.
 
 [game]
 # Game folder (the one with Driver.exe). Empty: the DSF_GAME_DIR environment variable.
@@ -74,7 +76,8 @@ height_offset = 0.05
 # Where the baked ground leaves a gap that the stock terrain covered (a cell
 # whose detail has little ground, the map edges), keep those stock terrain
 # triangles, moved down by this many metres so that they stay under the baked
-# ground where the two meet. A negative value turns the fill off.
+# ground where the two meet. A negative value turns the fill off. A cell whose
+# bake has no ground at all keeps its stock terrain as it is either way.
 fill_drop = 2.0
 # Baked classes that count as covering the stock terrain (seen from above) for
 # that fill. Trees don't: the ground under them still needs filling.

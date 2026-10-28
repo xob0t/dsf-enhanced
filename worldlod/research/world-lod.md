@@ -212,7 +212,7 @@ What the bake needs to know, and how `dsfworld/gegr.py` uses it:
   `(0, 5, 8)` (position, normal, two UV sets) or `(0, 8, 19)` (colour in the
   buffer). Semantic 9 is a second tiling UV, not a lightmap UV. Only 7 ground
   placements in the city use the separate per-region stream (`SBBH +0x18`);
-  the bake skips them.
+  the bake folds that stream into the copied vertices.
 - **Part trailer = per-cell binding mode** (`FUN_006BA750`): bit 2 (4) looks up
   a per-cell material binding (passed whether the cell is resident), bit 3 (8)
   a per-model binding, bit 5 (0x20) a cached command list. Stock terrain parts
@@ -236,7 +236,7 @@ What the bake needs to know, and how `dsfworld/gegr.py` uses it:
 Stock terrain coverage: 420 of the 532 detailed cells have exactly one terrain
 part centred on the cell. 136 of those bake no ground: sea, bay bridge and
 container yards, whose detail uses the same low-poly terrain material; they keep
-the stock part. The 112 cells without a terrain part hold 2,784 ground
+their stock terrain. The 112 cells without a terrain part hold 2,784 ground
 triangles in all (sea edge and the map border).
 
 Result of the first bake (ground only, not simplified, no fill; 2026-10-28,
@@ -303,8 +303,8 @@ replaced, 7,995 submodels, 1,049,811 triangles (931k baked ground and 118k stock
 fill; 1.57M before simplification), 30.6 MB of buffers in 20 DRSP groups.
 
 Current default (ground, trees, building detail and road text; a cell that
-bakes no ground keeps all its stock terrain in place, so every one of the 420
-terrain parts is replaced): 420 parts, 14,426 submodels, 7,638,372 triangles,
+bakes no ground keeps its stock terrain submodels next to what it bakes, so
+every one of the 420 terrain parts gets a bake): 420 parts, 14,426 submodels, 7,638,372 triangles,
 32 cloned materials, 239 MB of buffers in 116 new DRSP groups.
 
 ## Trees and building detail (2026-10-28)
@@ -333,5 +333,5 @@ terrain parts is replaced): 420 parts, 14,426 submodels, 7,638,372 triangles,
   a submodel erases (0xBBBCA0). The full build (21,845 GEGR submodels) faulted
   at 0xBBBE70 while loading; DSF Enhanced `[Limits] SubmodelTableExtraNodes`
   continues the pool in an extension block. With it, the VM run loaded, drove
-  and Shifted; the table peaked at about 15,400. Peak process memory: 1,873 MB
+  and Shifted; the table peaked at 15,523. Peak process memory: 1,873 MB
   virtual (ground only 1,432 MB); Driver.exe is large-address-aware.

@@ -304,4 +304,15 @@ def test_unknown_class_names_stop_the_bake():
     cfg.data["simplify"]["classes"] = ["ground", "grund"]
     with pytest.raises(SystemExit, match=r"\[simplify\] classes: unknown class grund"):
         stage.class_indices(cfg, FakeWorld(), "simplify", "classes")
-    assert stage.class_indices(cfg, FakeWorld(), "bake", "min_model_size") == [1]
+    assert stage.class_indices(cfg, FakeWorld(), "bake", "min_model_size") == {"buildings": 1}
+
+
+def test_packaged_class_names_missing_from_a_user_classes_table_are_skipped():
+    from dsfworld import config
+    from dsfworld.stages import bake as stage
+
+    world = FakeWorld()
+    world.class_names = ["ground", "other"]  # a user [classes] table without buildings, props, foliage
+    cfg = config.load(None)
+    assert stage.class_indices(cfg, world, "bake", "min_model_size") == {}
+    assert stage.class_indices(cfg, world, "bake", "classes") == {"ground": 0}
