@@ -157,7 +157,7 @@ constexpr DWORD kDrawQueueConstructRva = 0x007B5960;
 constexpr DWORD kDrawQueueConstructCallRvas[] = {0x007B6546, 0x007B65B2};
 constexpr DWORD kDrawQueueTrapRva = 0x007B5B5A;       // int3; pop edi; pop ebx; add esp,28h; ret 18h
 constexpr DWORD kDrawQueueTrapJumpRva = 0x007B5A95;   // jz 0xBB5B5A: DSF Forza's drop_full NOPs it
-constexpr DWORD kDrawQueueJobBoundRva = 0x002C21F9;   // cmp esi, 0x4000 in the job-side append
+constexpr DWORD kDrawQueueJobBoundRva = 0x002C21F9;   // cmp esi, 0x4000 in the job-side append (eax = its queue)
 constexpr DWORD kFilterOutputBeginRva = 0x007BC134;   // mov eax, 0x19C66C0
 constexpr DWORD kFilterOutputEndRva = 0x007BC143;     // mov dword [0x1D46710], 0x1D466C0
 constexpr DWORD kFilterOutputAreaRva = 0x015C66C0;
@@ -166,8 +166,20 @@ constexpr DWORD kFilterOutputCursorRva = 0x0194670C;
 constexpr DWORD kDrawQueueHeaderOffsets[] = {0x14, 0x980B0};
 // DSF Forza's [render] drop_full calls its own bounded append from these three sites.
 constexpr DWORD kDrawQueuePushCallRvas[] = {0x007B5B4C, 0x007B5BB5, 0x007B7301};
+// The draw data behind the queue: two 4 MB frame arenas (headers at 0x19B0C9C and 0x19B0CB0, the
+// current one at 0x19B0CC4; {base, size, bottom offset, flag, top offset}), malloc'd at renderer
+// init (0xBAEF10). Most allocations from them are checked (0xBAEF80 fails when bottom passes top),
+// but the job-side draw path takes 64 bytes and more per draw through 0xBB78A0, which bumps the
+// bottom with no check: a frame of about 13,000 such draws wrote past the block (faults at 0xC2A59A
+// from 0x6C21B2 and 0xC389A2 from 0x6C22F0), with or without a bigger queue. Draw data can't be
+// put anywhere else (the engine tells frame data from other data by its address, 0xBAF0C0), so the
+// arenas grow with the queue.
+constexpr DWORD kFrameArenaSizeRva = 0x007AEF1D;      // mov ebx, 0x400000 (each arena's size)
+constexpr DWORD kFrameArenaAllocRva = 0x007B78A0;     // the unchecked bump: (arena, size, align)
+constexpr DWORD kFrameArenaCurrentRva = 0x015B0CC4;
 constexpr int kDrawQueueStockEntries = 16384;
 constexpr DWORD kFilterOutputStockBytes = 0x380000;
+constexpr DWORD kFrameArenaStockBytes = 0x400000;
 constexpr DWORD kErrorMessageUpdateRva = 0x0032AD80;
 constexpr DWORD kEngineSingletonRva = 0x00BE7228;
 constexpr DWORD kLodDirtyFlagRva = 0x00D8D6E0;
@@ -288,6 +300,10 @@ LONG g_draw_queue_capacity = 0;               // written into both headers; 0 un
 std::uint8_t* g_draw_queue_arrays[2] = {};
 void* g_draw_queue_construct = nullptr;
 std::uint8_t* volatile g_draw_queue_manager = nullptr;  // the manager the arrays were put into
+std::uint8_t* volatile g_draw_queue_headers[2] = {};    // its two queue headers
+volatile LONG g_draw_queue_job_frame = 0;     // the job-side append has filled a frame queue
+volatile LONG g_draw_queue_job_other = 0;     // appends it made to any other queue
+bool g_draw_queue_job_logged[2] = {};
 volatile LONG g_draw_queue_peak = 0;          // highest multiple of 1,024 a frame queue reached
 volatile LONG g_draw_queue_drops = 0;
 LONG g_draw_queue_logged_peak = 0;
@@ -297,6 +313,8 @@ std::uint8_t* g_filter_output = nullptr;
 DWORD g_filter_output_bytes = 0;
 DWORD g_filter_output_logged_kb = 0;
 HANDLE g_draw_queue_marker = nullptr;
+DWORD g_frame_arena_bytes = 0;
+DWORD g_frame_arena_logged_mb = 0;
 void* g_error_message_update_continue = nullptr;
 volatile LONG g_ubisoft_server_lost_prompt_log_count = 0;
 
@@ -2749,6 +2767,56 @@ __declspec(naked) void ProxyDrawQueueFullSkip()
     }
 }
 
+// The job-side append's bound (cmp esi, 0x4000 with esi = the index it is about to claim, eax =
+// the queue; jae skips the draw): the new capacity for the two frame queues, the stock one for
+// anything else. Flags are the result.
+__declspec(naked) void ProxyDrawQueueJobBound()
+{
+    __asm {
+        cmp eax, dword ptr [g_draw_queue_headers]
+        je frame
+        cmp eax, dword ptr [g_draw_queue_headers + 4]
+        je frame
+        lock inc dword ptr [g_draw_queue_job_other]
+        cmp esi, 0x4000
+        ret
+
+    frame:
+        mov dword ptr [g_draw_queue_job_frame], 1
+        cmp esi, dword ptr [g_draw_queue_capacity]
+        ret
+    }
+}
+
+void __stdcall FrameArenaFull(DWORD arena_bytes)
+{
+    Log("DrawQueue: a frame's draw data passed its %lu KB arena; raise [Limits] DrawQueueEntries", static_cast<unsigned long>(arena_bytes / 1024));
+    FatalAppExitA(0, "DSF Enhanced: a frame's draw data is full. Raise [Limits] DrawQueueEntries in dsf_enhanced.ini.");
+}
+
+// 0xBB78A0 with a bound: the bottom of the frame arena only moves while the allocation stays below
+// the arena's top, where 0xBA96B0 takes constant blocks from. The stock bump would write past the
+// arena or over those blocks; neither can be undone, and a draw can't do without its data, so a
+// full arena ends the game with a message, like the other [Limits].
+void* __cdecl BoundedFrameArenaAlloc(DWORD* arena, DWORD size, DWORD align)
+{
+    auto* bottom = reinterpret_cast<volatile LONG*>(arena + 2);
+    const DWORD mask = ~(align - 1);
+    LONG old = *bottom;
+    for (;;) {
+        const DWORD aligned = (static_cast<DWORD>(old) + align - 1) & mask;
+        if (aligned + size > arena[4] || aligned + size < aligned) {
+            FrameArenaFull(arena[1]);
+            return nullptr;
+        }
+        const LONG seen = InterlockedCompareExchange(bottom, static_cast<LONG>(aligned + size), old);
+        if (seen == old) {
+            return reinterpret_cast<void*>(arena[0] + aligned);
+        }
+        old = seen;
+    }
+}
+
 // Both queues of every manager built get the bigger arrays; the manager's own ones go unused.
 using DrawQueueConstructFn = void* (__thiscall*)(void*);
 void* __fastcall ProxyDrawQueueConstruct(void* memory)
@@ -2762,6 +2830,7 @@ void* __fastcall ProxyDrawQueueConstruct(void* memory)
         auto* header = reinterpret_cast<DrawQueueHeader*>(manager + kDrawQueueHeaderOffsets[i]);
         header->entries = g_draw_queue_arrays[i];
         header->capacity = g_draw_queue_capacity;
+        g_draw_queue_headers[i] = manager + kDrawQueueHeaderOffsets[i];
     }
     g_draw_queue_manager = manager;
     Log("DrawQueue: render queue manager 0x%p built; both queues hold %ld entries", manager, g_draw_queue_capacity);
@@ -2847,6 +2916,7 @@ void LogDsfForzaDrawQueueGuard(const ModuleRange& range)
     }
 }
 
+
 // Raises the frame's draw queue from 16,384 entries to [Limits] DrawQueueEntries and bounds every
 // append. Arrays and the filter's output area (scaled with the queue) end before a guard page.
 // All sites are checked first; on any mismatch nothing is patched.
@@ -2860,6 +2930,7 @@ void ApplyDrawQueuePatch(const ModuleRange& range)
         kDrawQueuePushRva, kDrawQueueConstructCallRvas[0], kDrawQueueConstructCallRvas[1], kDrawQueueTrapRva,
         kDrawQueueTrapJumpRva, kDrawQueueJobBoundRva, kFilterOutputBeginRva, kFilterOutputEndRva,
         kDrawQueuePushCallRvas[0], kDrawQueuePushCallRvas[1], kDrawQueuePushCallRvas[2],
+        kFrameArenaSizeRva, kFrameArenaAllocRva,
     };
     for (const DWORD rva : sites) {
         if (!IsRvaInRange(range, rva, 10)) {
@@ -2867,7 +2938,8 @@ void ApplyDrawQueuePatch(const ModuleRange& range)
             return;
         }
     }
-    if (!IsRvaInRange(range, kDrawQueueHolderRva, 4) || !IsRvaInRange(range, kFilterOutputCursorRva, 4)) {
+    if (!IsRvaInRange(range, kDrawQueueHolderRva, 4) || !IsRvaInRange(range, kFilterOutputCursorRva, 4) ||
+        !IsRvaInRange(range, kFrameArenaCurrentRva, 4)) {
         Log("DrawQueue: queue holder outside the loaded image; not patched");
         return;
     }
@@ -2875,6 +2947,8 @@ void ApplyDrawQueuePatch(const ModuleRange& range)
     constexpr std::uint8_t push_bytes[10] = {0x56, 0x57, 0x33, 0xD2, 0x8B, 0xC1, 0xF0, 0x0F, 0xC1, 0x10};
     constexpr std::uint8_t trap_bytes[9] = {0xCC, 0x5F, 0x5B, 0x83, 0xC4, 0x28, 0xC2, 0x18, 0x00};
     constexpr std::uint8_t job_bound_bytes[6] = {0x81, 0xFE, 0x00, 0x40, 0x00, 0x00};
+    constexpr std::uint8_t arena_size_bytes[5] = {0xBB, 0x00, 0x00, 0x40, 0x00};
+    constexpr std::uint8_t arena_alloc_bytes[8] = {0x53, 0x55, 0x56, 0x8B, 0x74, 0x24, 0x10, 0x57};
     std::uint8_t output_begin_bytes[5] = {0xB8};
     std::uint8_t output_end_bytes[10] = {0xC7, 0x05};
     const DWORD output_area = va(kFilterOutputAreaRva);
@@ -2896,6 +2970,9 @@ void ApplyDrawQueuePatch(const ModuleRange& range)
     } else if (std::memcmp(range.base + kFilterOutputBeginRva, output_begin_bytes, sizeof(output_begin_bytes)) != 0 ||
                std::memcmp(range.base + kFilterOutputEndRva, output_end_bytes, sizeof(output_end_bytes)) != 0) {
         differs = "the filter output setup 0xBBC134/0xBBC143";
+    } else if (std::memcmp(range.base + kFrameArenaSizeRva, arena_size_bytes, sizeof(arena_size_bytes)) != 0 ||
+               std::memcmp(range.base + kFrameArenaAllocRva, arena_alloc_bytes, sizeof(arena_alloc_bytes)) != 0) {
+        differs = "the frame arenas 0xBAEF1D/0xBB78A0";
     }
     if (differs != nullptr) {
         Log("DrawQueue: unexpected bytes at %s; not patched", differs);
@@ -2905,7 +2982,7 @@ void ApplyDrawQueuePatch(const ModuleRange& range)
 
     const size_t entries = static_cast<size_t>(g_draw_queue_entries);
     // The filter's output, 224 bytes per stock entry, in whole pages.
-    const size_t output_bytes = (static_cast<size_t>(kFilterOutputStockBytes) * entries / kDrawQueueStockEntries + 0xFFF) & ~size_t{0xFFF};
+    const size_t output_bytes = (kFilterOutputStockBytes / kDrawQueueStockEntries * entries + 0xFFF) & ~size_t{0xFFF};
     g_draw_queue_arrays[0] = AllocateGuarded(entries * 32);
     g_draw_queue_arrays[1] = AllocateGuarded(entries * 32);
     g_filter_output = AllocateGuarded(output_bytes);
@@ -2919,43 +2996,59 @@ void ApplyDrawQueuePatch(const ModuleRange& range)
         return;
     }
     g_filter_output_bytes = static_cast<DWORD>(output_bytes);
+    // Each frame arena, 256 bytes per stock entry, in whole 64 KB.
+    g_frame_arena_bytes = static_cast<DWORD>((kFrameArenaStockBytes / kDrawQueueStockEntries * entries + 0xFFFF) & ~size_t{0xFFFF});
     g_draw_queue_capacity = g_draw_queue_test_entries > 0 ? g_draw_queue_test_entries : g_draw_queue_entries;
     g_draw_queue_construct = range.base + kDrawQueueConstructRva;
 
-    // The guard (the bound in the append, the int3 skipped) and the construct hooks first: each
-    // is safe on its own.
-    CodePatch guard[4] = {
+    // The guard (the bounds of both appends and of the arena bump, the int3 skipped), the bigger
+    // arenas and the construct hooks first: each is safe on its own.
+    CodePatch guard[7] = {
+        MakeCodePatch(range.base + kFrameArenaAllocRva, 5),
+        MakeCodePatch(range.base + kFrameArenaSizeRva, 5),
         MakeCodePatch(range.base + kDrawQueueTrapRva, 5),
         MakeCodePatch(range.base + kDrawQueuePushRva, 6),
+        MakeCodePatch(range.base + kDrawQueueJobBoundRva, 6),
         MakeCodePatch(range.base + kDrawQueueConstructCallRvas[0], 5),
         MakeCodePatch(range.base + kDrawQueueConstructCallRvas[1], 5),
     };
-    SetRel32(guard[0], 0xE9, reinterpret_cast<const void*>(&ProxyDrawQueueFullSkip));
-    SetRel32(guard[1], 0xE9, reinterpret_cast<const void*>(&BoundedDrawQueuePush));
-    guard[1].patched[5] = 0x90;
-    SetRel32(guard[2], 0xE8, reinterpret_cast<const void*>(&ProxyDrawQueueConstruct));
-    SetRel32(guard[3], 0xE8, reinterpret_cast<const void*>(&ProxyDrawQueueConstruct));
-    if (!WriteCodePatches(guard, 4, "guard")) {
+    SetRel32(guard[0], 0xE9, reinterpret_cast<const void*>(&BoundedFrameArenaAlloc));
+    SetDword(guard[1], 1, g_frame_arena_bytes);
+    SetRel32(guard[2], 0xE9, reinterpret_cast<const void*>(&ProxyDrawQueueFullSkip));
+    SetRel32(guard[3], 0xE9, reinterpret_cast<const void*>(&BoundedDrawQueuePush));
+    guard[3].patched[5] = 0x90;
+    SetRel32(guard[4], 0xE8, reinterpret_cast<const void*>(&ProxyDrawQueueJobBound));
+    guard[4].patched[5] = 0x90;
+    SetRel32(guard[5], 0xE8, reinterpret_cast<const void*>(&ProxyDrawQueueConstruct));
+    SetRel32(guard[6], 0xE8, reinterpret_cast<const void*>(&ProxyDrawQueueConstruct));
+    if (!WriteCodePatches(guard, 7, "guard")) {
         g_draw_queue_capacity = 0;
         // A construct hook may have run before a later write failed, so the arrays stay.
         return;
     }
 
-    // A manager built before the hooks keeps its stock queues, and the job-side append must keep
-    // its stock bound for it; the filter output stays too, as frames may already be drawing.
+    const auto* arena = *reinterpret_cast<const DWORD* const volatile*>(range.base + kFrameArenaCurrentRva);
+    if (arena != nullptr && arena[0] != 0) {
+        Log("DrawQueue: the frame arenas were allocated before the patch; they keep %lu KB each",
+            static_cast<unsigned long>(arena[1] / 1024));
+    } else {
+        Log("DrawQueue: frame arenas of %lu KB each (stock %lu KB)",
+            static_cast<unsigned long>(g_frame_arena_bytes / 1024), static_cast<unsigned long>(kFrameArenaStockBytes / 1024));
+    }
+
+    // A manager built before the hooks keeps its stock queues, and the filter output stays as it
+    // is, as frames may already be drawing.
     const auto holder = *reinterpret_cast<std::uint8_t* const volatile*>(range.base + kDrawQueueHolderRva);
     if (holder != nullptr && holder != g_draw_queue_manager) {
         Log("DrawQueue: the render queue manager was built before the patch; its queues keep 16384 entries (the full-queue guard is on)");
     } else {
-        CodePatch sized[3] = {
-            MakeCodePatch(range.base + kDrawQueueJobBoundRva, 6),
+        CodePatch output[2] = {
             MakeCodePatch(range.base + kFilterOutputBeginRva, 5),
             MakeCodePatch(range.base + kFilterOutputEndRva, 10),
         };
-        SetDword(sized[0], 2, static_cast<DWORD>(g_draw_queue_capacity));
-        SetDword(sized[1], 1, static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(g_filter_output)));
-        SetDword(sized[2], 6, static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(g_filter_output + output_bytes)));
-        if (WriteCodePatches(sized, 3, "job bound and filter output")) {
+        SetDword(output[0], 1, static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(g_filter_output)));
+        SetDword(output[1], 6, static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(g_filter_output + output_bytes)));
+        if (WriteCodePatches(output, 2, "filter output")) {
             Log(
                 "DrawQueue: %ld entries per queue (stock %d) at 0x%p / 0x%p, filter output %lu KB at 0x%p (stock %lu KB)",
                 g_draw_queue_capacity,
@@ -2970,7 +3063,8 @@ void ApplyDrawQueuePatch(const ModuleRange& range)
                 Log("DrawQueue: DrawQueueTestEntries=%ld: frames past it drop draws", g_draw_queue_capacity);
             }
         } else {
-            Log("DrawQueue: the queue keeps 16384 entries per frame where the job-side bound is concerned (the full-queue guard is on)");
+            Log("DrawQueue: the filter output keeps its stock %lu KB; frames past it stop drawing there",
+                static_cast<unsigned long>(kFilterOutputStockBytes / 1024));
         }
     }
 
@@ -2978,18 +3072,26 @@ void ApplyDrawQueuePatch(const ModuleRange& range)
     char marker[64] = {};
     std::snprintf(marker, sizeof(marker), "Local\\DSFEnhanced.DrawQueue.%lu", static_cast<unsigned long>(GetCurrentProcessId()));
     g_draw_queue_marker = CreateEventA(nullptr, TRUE, TRUE, marker);
-    Log("DrawQueue: full-queue guard on (0xBB5710 bounded, int3 0xBB5B5A skipped); marker %s", marker);
+    Log("DrawQueue: full-queue guard on (0xBB5710 and 0x6C21F9 bounded, int3 0xBB5B5A skipped); marker %s", marker);
 }
 
 // The highest multiple of 1,024 a frame queue reached, from 8,192 up (pushes through 0xBB5710
 // note them; the two counts are also polled, for the appends that bypass it), the draws dropped
-// at most every 10 s, and the filter output's use each new 256 KB from 1 MB up.
+// at most every 10 s, the filter output's use each new 256 KB from 1 MB up, and the frame arenas'.
 void LogDrawQueueUse(const ModuleRange& range)
 {
     if (g_draw_queue_capacity == 0) {
         return;
     }
     LogDsfForzaDrawQueueGuard(range);
+    if (g_draw_queue_job_frame != 0 && !g_draw_queue_job_logged[0]) {
+        g_draw_queue_job_logged[0] = true;
+        Log("DrawQueue: the job-side append (0x6C21F0) fills the frame queue");
+    }
+    if (g_draw_queue_job_other != 0 && !g_draw_queue_job_logged[1]) {
+        g_draw_queue_job_logged[1] = true;
+        Log("DrawQueue: the job-side append (0x6C21F0) also fills another queue (%ld appends), bound kept at 16384", g_draw_queue_job_other);
+    }
     LONG peak = g_draw_queue_peak;
     if (auto* manager = g_draw_queue_manager) {
         for (const DWORD offset : kDrawQueueHeaderOffsets) {
@@ -3006,6 +3108,17 @@ void LogDrawQueueUse(const ModuleRange& range)
         g_draw_queue_logged_drops = drops;
         g_draw_queue_drop_log_tick = now;
         Log("DrawQueue: queue full; %ld draws dropped so far (capacity %ld)", drops, g_draw_queue_capacity);
+    }
+    // The current arena's use (bottom plus what was taken from the top), each new 1 MB from 2 MB up.
+    if (const auto* arena = *reinterpret_cast<const DWORD* const volatile*>(range.base + kFrameArenaCurrentRva)) {
+        if (arena[0] != 0 && arena[4] <= arena[1] && arena[2] <= arena[4]) {
+            const DWORD mb = (arena[2] + arena[1] - arena[4]) >> 20;
+            if (mb >= 2 && mb > g_frame_arena_logged_mb) {
+                g_frame_arena_logged_mb = mb;
+                Log("DrawQueue: a frame arena reached %lu MB of %lu MB (stock %lu MB)", static_cast<unsigned long>(mb),
+                    static_cast<unsigned long>(arena[1] >> 20), static_cast<unsigned long>(kFrameArenaStockBytes >> 20));
+            }
+        }
     }
     if (g_filter_output != nullptr) {
         const auto cursor = *reinterpret_cast<const volatile DWORD*>(range.base + kFilterOutputCursorRva);
