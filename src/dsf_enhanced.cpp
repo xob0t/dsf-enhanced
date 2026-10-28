@@ -64,6 +64,12 @@ constexpr DWORD kLegalScreenBeginLoadingCallRva = 0x00399C92;   // call 0x4A20C0
 constexpr DWORD kLoadingScreenBeginRva = 0x000A20C0;
 constexpr DWORD kPendingResourceReferenceClearRva = 0x000A2153; // mov dword [0x188A6B8],0
 constexpr DWORD kPendingResourceReferenceCountRva = 0x0148A6B8; // resource manager 0x1732BF0 + 0x157AC8
+// Resource manager 0x1732BF0: ResourceHashPool_Acquire (0xBAED90) takes a 24-byte node from the
+// free list at +0x127AC0, else bumps +0x127AC4 through 45,000 nodes stored at +0x20000..+0x127AC0,
+// with no end check. The 45,001st resident resource overwrites the free-list head and the bump
+// pointer, and the next acquire faults reading garbage (0xBAEDC7).
+constexpr DWORD kResourceHashBumpRva = 0x007AEDB6;          // mov eax,[ecx+0x127AC4]; lea ebx,[eax+18h]; mov [ecx+0x127AC4],ebx; jmp
+constexpr DWORD kResourceHashBumpContinueRva = 0x007AEDD0;  // fills the node in eax
 constexpr DWORD kErrorMessageUpdateRva = 0x0032AD80;
 constexpr DWORD kEngineSingletonRva = 0x00BE7228;
 constexpr DWORD kLodDirtyFlagRva = 0x00D8D6E0;
@@ -162,6 +168,14 @@ volatile LONG g_interesting_vehicle_log_count = 0;
 void* g_traffic_last_interesting_manager = nullptr;
 bool g_interesting_vehicle_patch_applied = false;
 void* g_movie_draw_continue = nullptr;
+int g_resource_arena_extra_nodes = 135000;
+int g_resource_arena_stock_nodes = 45000;
+DWORD g_arena_stock_end_offset = 0x127AC0;  // manager offset where the stock nodes the hook uses end
+std::uint8_t* g_arena_extension_begin = nullptr;
+std::uint8_t* volatile g_arena_extension_next = nullptr;
+std::uint8_t* g_arena_extension_end = nullptr;
+void* g_arena_bump_continue = nullptr;
+DWORD g_arena_extension_logged_nodes = 0;
 void* g_error_message_update_continue = nullptr;
 volatile LONG g_ubisoft_server_lost_prompt_log_count = 0;
 
@@ -343,6 +357,10 @@ void LoadConfig()
     g_skip_legal_screen = GetPrivateProfileIntA("Startup", "SkipLegalScreen", 1, ini_path) != 0;
     g_suppress_ubisoft_server_lost_prompt = GetPrivateProfileIntA("Startup", "SuppressUbisoftServerLostPrompt", 1, ini_path) != 0;
     g_updown_switches_maker = GetPrivateProfileIntA("Garage", "UpDownSwitchesMaker", 1, ini_path) != 0;
+    g_resource_arena_extra_nodes =
+        ClampInt(GetPrivateProfileIntA("Limits", "ResourceArenaExtraNodes", 135000, ini_path), 0, 2000000);
+    g_resource_arena_stock_nodes =
+        ClampInt(GetPrivateProfileIntA("Limits", "ResourceArenaStockNodes", 45000, ini_path), 1, 45000);
     LoadFlareConfig(ini_path);
 }
 
@@ -2219,6 +2237,113 @@ bool ApplyMovieDrawPatch(const ModuleRange& range)
     return true;
 }
 
+// The resource hash arena's 45,000 stock nodes stay in use; once the bump pointer reaches their
+// end, nodes come from an extension block instead. Nodes are linked by absolute pointers (hash
+// chains and the free list at +0x127AC0), so they can live anywhere. A reset of the arena
+// (0xBAEE50) moves the stock bump pointer back to the start; the next stock acquire then rewinds
+// the extension as well.
+void __stdcall ResourceArenaExtensionFull()
+{
+    Log("ResourceArena: extension full (%d nodes); raise [Limits] ResourceArenaExtraNodes", g_resource_arena_extra_nodes);
+    FatalAppExitA(0, "DSF Enhanced: resource arena full. Raise [Limits] ResourceArenaExtraNodes in dsf_enhanced.ini.");
+}
+
+__declspec(naked) void ProxyResourceHashBump()
+{
+    __asm {
+        mov eax, dword ptr [ecx + 0x127AC4]
+        mov ebx, ecx
+        add ebx, dword ptr [g_arena_stock_end_offset]
+        cmp eax, ebx
+        jae extension
+        mov ebx, dword ptr [g_arena_extension_begin]
+        cmp dword ptr [g_arena_extension_next], ebx
+        je stock
+        mov dword ptr [g_arena_extension_next], ebx
+
+    stock:
+        lea ebx, [eax + 0x18]
+        mov dword ptr [ecx + 0x127AC4], ebx
+        jmp dword ptr [g_arena_bump_continue]
+
+    extension:
+        mov eax, dword ptr [g_arena_extension_next]
+        lea ebx, [eax + 0x18]
+        cmp ebx, dword ptr [g_arena_extension_end]
+        ja full
+        mov dword ptr [g_arena_extension_next], ebx
+        jmp dword ptr [g_arena_bump_continue]
+
+    full:
+        call ResourceArenaExtensionFull
+    }
+}
+
+void ApplyResourceArenaPatch(const ModuleRange& range)
+{
+    if (g_resource_arena_extra_nodes <= 0) {
+        return;
+    }
+    constexpr size_t patch_size = 17;
+    constexpr std::uint8_t expected[patch_size] = {
+        0x8B, 0x81, 0xC4, 0x7A, 0x12, 0x00,  // mov eax, [ecx+0x127AC4]
+        0x8D, 0x58, 0x18,                    // lea ebx, [eax+0x18]
+        0x89, 0x99, 0xC4, 0x7A, 0x12, 0x00,  // mov [ecx+0x127AC4], ebx
+        0xEB, 0x09                           // jmp 0xBAEDD0
+    };
+    if (!IsRvaInRange(range, kResourceHashBumpRva, patch_size)) {
+        Log("ResourceArena: patch site outside the loaded image");
+        return;
+    }
+    auto* target = range.base + kResourceHashBumpRva;
+    if (std::memcmp(target, expected, patch_size) != 0) {
+        Log("ResourceArena: unexpected bytes at RVA 0x%08lX; not patched", static_cast<unsigned long>(kResourceHashBumpRva));
+        return;
+    }
+    const size_t bytes = static_cast<size_t>(g_resource_arena_extra_nodes) * 0x18;
+    auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (block == nullptr) {
+        Log("ResourceArena: could not allocate %lu bytes for the extension", static_cast<unsigned long>(bytes));
+        return;
+    }
+    g_arena_extension_begin = block;
+    g_arena_extension_next = block;
+    g_arena_extension_end = block + bytes;
+    g_arena_bump_continue = range.base + kResourceHashBumpContinueRva;
+    g_arena_stock_end_offset = 0x20000 + static_cast<DWORD>(g_resource_arena_stock_nodes) * 0x18;
+
+    std::uint8_t patch[patch_size];
+    std::memset(patch, 0x90, sizeof(patch));
+    patch[0] = 0xE9;
+    const auto relative = static_cast<std::int32_t>(
+        reinterpret_cast<std::uint8_t*>(&ProxyResourceHashBump) - (target + 5)
+    );
+    std::memcpy(&patch[1], &relative, sizeof(relative));
+    if (!WriteMemory(target, patch, sizeof(patch))) {
+        Log("ResourceArena: failed to patch RVA 0x%08lX", static_cast<unsigned long>(kResourceHashBumpRva));
+        return;
+    }
+    Log(
+        "ResourceArena: %d stock nodes, then %d extension nodes at 0x%p (%lu KB)",
+        g_resource_arena_stock_nodes,
+        g_resource_arena_extra_nodes,
+        block,
+        static_cast<unsigned long>(bytes / 1024)
+    );
+}
+
+void LogResourceArenaUse()
+{
+    if (g_arena_extension_begin == nullptr) {
+        return;
+    }
+    const auto used = static_cast<DWORD>((g_arena_extension_next - g_arena_extension_begin) / 0x18);
+    if (used > g_arena_extension_logged_nodes) {
+        g_arena_extension_logged_nodes = used;
+        Log("ResourceArena: stock nodes full; extension high water %lu of %d", static_cast<unsigned long>(used), g_resource_arena_extra_nodes);
+    }
+}
+
 // When the legal screen ends, state 4 calls the loading screen's begin function 0x4A20C0, which
 // ends by clearing the resource manager's list of unresolved resource references (count at
 // 0x188A6B8: mov dword [0x188A6B8],0 at 0x4A2153). After the stock 5 s wait the startup packages
@@ -3010,6 +3135,7 @@ void ApplyPatches()
 
     PatchDirect3DCreate9Import(exe);
     PatchBinkImports(exe);
+    ApplyResourceArenaPatch(exe);
     ApplyStartupPatches(exe);
     ApplyUbisoftServerLostPromptPatch(exe);
     ApplyGarageMakerSwitchPatch(exe);
@@ -3042,6 +3168,9 @@ DWORD WINAPI InitThread(LPVOID)
         ApplyLodThresholds(exe, "Loop");
         ApplyDrlFlareCurves(exe);
         LogTrafficDiagnostics(exe);
+        if (tick % 4 == 0) {
+            LogResourceArenaUse();
+        }
         if (tick % 4 == 0) {
             ApplyAspectConstantPatch(exe, "Loop");
             ApplyGlobalFovScalarPatch(exe, "Loop");

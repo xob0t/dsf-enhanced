@@ -12,6 +12,7 @@ An ASI plugin for Driver: San Francisco on PC. Target exe version 1.04
 - Shrinks the distant brake and position lamp flares to small dots.
 - In the garage's vehicles screen, Up/Down switch to the previous or next maker while a maker's cars are open, so every maker's cars can be browsed without going back to the maker list.
 - Skips the legal-screen wait and dismisses the prompt about Ubisoft's servers, which no longer exist.
+- Lifts the engine's limit of 45,000 resources loaded at once, past which it crashes. Bigger world or car archives need more; `[Limits] ResourceArenaExtraNodes` sets how many more (135,000 by default, about 3 MB).
 
 ## Install
 
