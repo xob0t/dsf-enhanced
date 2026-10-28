@@ -13,6 +13,7 @@ def game(tmp_path, monkeypatch):
     passes its check."""
     monkeypatch.setattr(install, "_game_running", lambda: False)
     monkeypatch.setattr(install, "check", lambda _path: [])
+    monkeypatch.setattr(install, "plugin_problem", lambda _game: None)
     cfg = Config(
         {"game": {"dir": str(tmp_path / "game"), "archive": "Install/w.dngc"}, "run": {"work_dir": "out"}}, tmp_path
     )
@@ -50,3 +51,22 @@ def test_install_refuses_a_failing_build(game, monkeypatch):
     with pytest.raises(SystemExit, match="fails its check"):
         install.install(game)
     assert game.game_archive.read_bytes() == b"original"
+
+
+def test_plugin_check(tmp_path):
+    assert "isn't installed" in install.plugin_problem(tmp_path)
+    (tmp_path / install.PLUGIN).write_bytes(b"old plugin")
+    assert "too old" in install.plugin_problem(tmp_path)
+    (tmp_path / install.PLUGIN).write_bytes(b"...SubmodelTableExtraNodes...")
+    assert install.plugin_problem(tmp_path) is None
+    (tmp_path / "dsf_enhanced.ini").write_text("[Limits]\nSubmodelTableExtraNodes=0 ; off\n")
+    assert "SubmodelTableExtraNodes" in install.plugin_problem(tmp_path)
+    (tmp_path / "dsf_enhanced.ini").write_text("[Limits]\nPendingResourceReferences=131072\n")
+    assert install.plugin_problem(tmp_path) is None
+
+
+def test_install_remembers_the_game_folder(game):
+    from dsfworld import config
+
+    install.install(game)
+    assert config.remembered_game() == str(game.game_dir)

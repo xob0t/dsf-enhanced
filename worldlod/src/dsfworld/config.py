@@ -12,6 +12,28 @@ from pathlib import Path
 DEFAULTS = Path(__file__).with_name("default.toml")
 USER_FILE = "worldlod.toml"
 BACKUP_DIR = "worldlod-backup"  # in the game folder, written by `worldlod install`
+GAME_EXE = "Driver.exe"
+# Work files and the game folder worldlod last installed into ([run] work_dir empty).
+DATA_DIR = Path(os.environ.get("LOCALAPPDATA") or Path.home() / ".local" / "share") / "worldlod"
+STATE_FILE = DATA_DIR / "state.json"
+# --no-<name> flags: the [bake] class each leaves out, and what that is
+OPTIONAL = {
+    "trees": ("foliage", "trees and bushes"),
+    "buildings": ("buildings", "building detail (the building shells stay)"),
+    "road-text": ("props", "painted road text"),
+}
+
+
+def remembered_game() -> str:
+    try:
+        return json.loads(STATE_FILE.read_text()).get("game", "")
+    except (OSError, ValueError):
+        return ""
+
+
+def remember_game(game: Path) -> None:
+    STATE_FILE.parent.mkdir(parents=True, exist_ok=True)
+    STATE_FILE.write_text(json.dumps({"game": str(game)}, indent=2))
 
 
 FREE_TABLES = {"classes", "min_model_size"}  # keyed by class names: a user table replaces the default
@@ -37,9 +59,15 @@ class Config:
 
     @property
     def game_dir(self) -> Path:
-        d = self.data["game"]["dir"] or os.environ.get("DSF_GAME_DIR", "")
+        """[game] dir (or --game), else DSF_GAME_DIR, else the current folder if it holds the game, else
+        the folder worldlod last installed into."""
+        here = Path.cwd() if (Path.cwd() / GAME_EXE).exists() else ""
+        d = self.data["game"]["dir"] or os.environ.get("DSF_GAME_DIR", "") or here or remembered_game()
         if not d:
-            raise SystemExit("set [game] dir in worldlod.toml or the DSF_GAME_DIR environment variable")
+            raise SystemExit(
+                f"Where is the game? Run worldlod in the game folder (the one with {GAME_EXE}), or pass "
+                '--game "C:\\path\\to\\Driver San Francisco".'
+            )
         return Path(d)
 
     @property
@@ -59,7 +87,7 @@ class Config:
 
     @property
     def packed_archive(self) -> Path:
-        """Where `worldlod pack` writes."""
+        """Where `worldlod build` writes."""
         return self.work_dir / "pack" / Path(self.data["game"]["archive"]).name
 
     def reading(self, source: Path) -> Config:
@@ -68,7 +96,8 @@ class Config:
 
     @property
     def work_dir(self) -> Path:
-        return (self.folder / self.data["run"]["work_dir"]).resolve()
+        d = self.data["run"]["work_dir"]
+        return (self.folder / d).resolve() if d else DATA_DIR
 
     def section(self, name: str) -> dict:
         return self.data[name]

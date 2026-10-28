@@ -16,7 +16,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dsfworld import bake, config, simplify
+from dsfworld import bake, config, simplify, ui
 from dsfworld.config import Config
 from dsfworld.formats.modl import POSITION, UV0, Lod
 from dsfworld.gegr import CellBake
@@ -156,51 +156,80 @@ def _save(path: Path, cached: dict) -> None:
     tmp.replace(path)
 
 
+@dataclass
+class _Run:
+    """One bake run's fixed inputs."""
+
+    world: World
+    settings: Settings
+    stock: dict[tuple[int, int], tuple[int, np.ndarray]]
+    out: Path
+    digest: str
+    force: bool
+
+
+def _bake_one(run: _Run, name: str) -> tuple[CellBake, dict] | None:
+    """One region's CellBake and its cache entry (baked now or loaded), or None if its cell has no stock part."""
+    world = run.world
+    cell = world.archive.cell(world.archive.resource(name))
+    centre = (round(cell.min_x + cell.size / 2), round(cell.min_z + cell.size / 2))
+    if centre not in run.stock:
+        return None
+    part_uid, matrix = run.stock[centre]
+    lod = world.library.parts[part_uid].finest_lod()
+    replaced = _replaced(world, lod, run.settings.replace)
+    path = run.out / f"{name}.pkl"
+    cached = None if run.force else _load(path, run.digest)
+    if cached is None:
+        flags = dict(zip(lod.submodels, lod.flags, strict=True))
+        terrain = [(s, flags[s]) for s in lod.submodels if s in replaced]
+        result, covered = bake_cell(world, name, matrix, stock_terrain=terrain, settings=run.settings)
+        cached = {
+            "digest": run.digest,
+            "part": part_uid,
+            "groups": result.groups,
+            "skipped": result.skipped,
+            "covered": covered,
+        }
+        _save(path, cached)
+    kept = [s for s in lod.submodels if s not in replaced or not cached["covered"]]
+    return CellBake(part_uid, cached["groups"], kept), cached
+
+
 def run(cfg: Config, world: World, *, force: bool = False) -> list[CellBake]:
     if not cfg.section("bake")["classes"]:
         return []
-    chosen = settings(cfg, world)
     out = output_dir(cfg)
     out.mkdir(parents=True, exist_ok=True)
     source = world.archive.path  # by name and size: install moves the reading from the game file to its backup
-    digest = f"{VERSION}:{cfg.digest(*SECTIONS)}:{source.name}:{source.stat().st_size}"
-    stock = targets(world, chosen.replace)
+    chosen = settings(cfg, world)
+    job = _Run(
+        world,
+        chosen,
+        targets(world, chosen.replace),
+        out,
+        f"{VERSION}:{cfg.digest(*SECTIONS)}:{source.name}:{source.stat().st_size}",
+        force,
+    )
     names = world.region_names(cfg.section("regions")["select"])
     cells, rows, no_target = [], [], []
-    skipped_total: Counter = Counter()
-    for n, name in enumerate(names, 1):
-        cell = world.archive.cell(world.archive.resource(name))
-        centre = (round(cell.min_x + cell.size / 2), round(cell.min_z + cell.size / 2))
-        if centre not in stock:
-            no_target.append(name)
-            continue
-        part_uid, matrix = stock[centre]
-        lod = world.library.parts[part_uid].finest_lod()
-        flags = dict(zip(lod.submodels, lod.flags, strict=True))
-        replaced = _replaced(world, lod, chosen.replace)
-        path = out / f"{name}.pkl"
-        cached = None if force else _load(path, digest)
-        state = "cached"
-        if cached is None:
-            terrain = [(s, flags[s]) for s in lod.submodels if s in replaced]
-            result, covered = bake_cell(world, name, matrix, stock_terrain=terrain, settings=chosen)
-            cached = {
-                "digest": digest,
-                "part": part_uid,
-                "groups": result.groups,
-                "skipped": result.skipped,
-                "covered": covered,
-            }
-            _save(path, cached)
-            state = "built"
-        groups = cached["groups"]
-        tris = sum(len(g.triangles) for g in groups)
-        skipped_total.update(cached["skipped"])
-        kept = [s for s in lod.submodels if s not in replaced or not cached["covered"]]
-        cells.append(CellBake(part_uid, groups, kept))
-        rows.append([name, len(groups), sum(len(g.vertices) for g in groups), tris, sum(cached["skipped"].values())])
-        print(f"[{n}/{len(names)}] {name} {state}: {tris:,} triangles in {len(groups)} groups")
-    _report(out, rows, no_target, skipped_total)
+    skipped: Counter = Counter()
+    with ui.progress() as bar:
+        task = bar.add_task("Baking regions", total=len(names))
+        for name in names:
+            bar.update(task, description=f"Baking {name}")
+            done = _bake_one(job, name)
+            bar.advance(task)
+            if done is None:
+                no_target.append(name)
+                continue
+            cell, cached = done
+            cells.append(cell)
+            skipped.update(cached["skipped"])
+            tris = sum(len(g.triangles) for g in cell.groups)
+            verts = sum(len(g.vertices) for g in cell.groups)
+            rows.append([name, len(cell.groups), verts, tris, sum(cached["skipped"].values())])
+    _report(out, rows, no_target, skipped)
     return cells
 
 
@@ -208,11 +237,11 @@ def _report(out: Path, rows: list[list], no_target: list[str], skipped: Counter)
     with (out / "summary.tsv").open("w", encoding="utf-8") as f:
         f.write("region\tgroups\tvertices\ttriangles\tskipped_placements\n")
         f.writelines("\t".join(map(str, r)) + "\n" for r in rows)
-    print(f"{len(rows)} cells baked, {sum(r[3] for r in rows):,} triangles; summary in {out / 'summary.tsv'}")
+    ui.say(f"Baked {len(rows)} cells, {sum(r[3] for r in rows):,} triangles (per region: {out / 'summary.tsv'})")
     if no_target:
-        print(
-            f"{len(no_target)} regions have no stock part to replace: {', '.join(no_target[:LISTED])}"
-            f"{' ...' if len(no_target) > LISTED else ''}"
+        ui.say(
+            f"{len(no_target)} regions have no stock part to replace (sea, map edge): "
+            f"{', '.join(no_target[:LISTED])}{' ...' if len(no_target) > LISTED else ''}"
         )
     if skipped:
-        print("skipped submodel placements: " + ", ".join(f"{k} {v}" for k, v in skipped.most_common()))
+        ui.say("Skipped submodel placements: " + ", ".join(f"{k} {v}" for k, v in skipped.most_common()))

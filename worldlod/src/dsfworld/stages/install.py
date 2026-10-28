@@ -5,20 +5,63 @@ original once to <game>/worldlod-backup/ with its SHA-256, then swaps the new
 file in. The game's file can be a hard link (san_francisco.dngc is), so the new
 file is written next to it and renamed over it; the other link keeps the
 original bytes. uninstall restores the backup the same way.
+
+The built archive is bigger than three fixed-size engine pools allow; DSF
+Enhanced's [Limits] fixes lift them. install refuses without them, since the
+game would crash while loading.
 """
 
 from __future__ import annotations
 
+import configparser
 import json
 import shutil
 import subprocess
 import sys
 from pathlib import Path
 
-from dsfworld.config import BACKUP_DIR, Config
+from dsfworld import ui
+from dsfworld.config import BACKUP_DIR, Config, remember_game
 from dsfworld.stages.pack import check, sha256
 
 MANIFEST = "manifest.json"
+PLUGIN = "dsf_enhanced.asi"
+PLUGIN_URL = "https://github.com/xob0t/dsf_enhanced/releases"
+# [Limits] keys of DSF Enhanced the build needs, and the value at or below which each is off
+LIMITS = {"ResourceArenaExtraNodes": 0, "PendingResourceReferences": 16384, "SubmodelTableExtraNodes": 0}
+
+
+def plugin_problem(game: Path) -> str | None:
+    """Why the game in this folder can't load the build (DSF Enhanced missing, too old, limits off), or None."""
+    asi = game / PLUGIN
+    if not asi.exists():
+        return f"DSF Enhanced isn't installed ({PLUGIN} not in {game})"
+    if b"SubmodelTableExtraNodes" not in asi.read_bytes():
+        return "the installed DSF Enhanced is too old: it lacks the [Limits] fixes"
+    ini = configparser.ConfigParser(inline_comment_prefixes=(";",), strict=False)
+    path = game / "dsf_enhanced.ini"
+    if path.exists():
+        ini.read_string(path.read_text(encoding="utf-8", errors="replace"))
+    limits = ini["Limits"] if ini.has_section("Limits") else {}
+    for key, off in LIMITS.items():
+        value = limits.get(key)
+        if value is not None and value.strip().lstrip("-").isdigit() and int(value) <= off:
+            return f"dsf_enhanced.ini turns off [Limits] {key}"
+    return None
+
+
+def ready(cfg: Config) -> None:
+    """Stop before any work if install couldn't finish or the game couldn't load the build."""
+    if not cfg.game_archive.exists():
+        raise SystemExit(f"No {cfg.game_archive.name} in {cfg.game_archive.parent}: is {cfg.game_dir} the game folder?")
+    if _game_running():
+        raise SystemExit("Driver.exe is running: close the game first")
+    problem = plugin_problem(cfg.game_dir)
+    if problem:
+        raise SystemExit(
+            f"{problem}. The new map needs DSF Enhanced's engine limit fixes, or the game crashes while "
+            f"loading. Install DSF Enhanced from {PLUGIN_URL} first."
+        )
 
 
 def _game_running() -> bool:
@@ -46,9 +89,8 @@ def install(cfg: Config) -> None:
     target, backup, manifest_path = _paths(cfg)
     packed = cfg.packed_archive
     if not packed.exists():
-        raise SystemExit(f"no packed archive at {packed}: run `worldlod pack` first")
-    if _game_running():
-        raise SystemExit("Driver.exe is running: close the game first")
+        raise SystemExit(f"no built archive at {packed}: run `worldlod build` first")
+    ready(cfg)
     problems = check(packed)
     if problems:
         raise SystemExit(f"{packed} fails its check ({problems[0]}); not installing")
@@ -58,21 +100,22 @@ def install(cfg: Config) -> None:
         if current == manifest.get("installed"):
             raise SystemExit(f"{target} is a worldlod build but the backup is missing; restore the original first")
         backup.parent.mkdir(exist_ok=True)
-        print(f"backing up {target} -> {backup}")
-        tmp = backup.with_name(backup.name + ".worldlod-tmp")
-        shutil.copyfile(target, tmp)
-        tmp.replace(backup)
+        with ui.status(f"Backing up the original to {backup}"):
+            tmp = backup.with_name(backup.name + ".worldlod-tmp")
+            shutil.copyfile(target, tmp)
+            tmp.replace(backup)
         manifest["original"] = current
         manifest_path.write_text(json.dumps(manifest, indent=2))
     elif sha256(backup) != manifest.get("original"):
         raise SystemExit(f"{backup} doesn't match its recorded hash; not touching anything")
     elif current not in (manifest.get("original"), manifest.get("installed")):
         raise SystemExit(f"{target} changed since the last install (another mod?); uninstall or move the backup first")
-    print(f"installing {packed} -> {target}")
-    _swap_in(packed, target)
-    manifest["installed"] = sha256(target)
+    with ui.status(f"Installing into {target}"):
+        _swap_in(packed, target)
+        manifest["installed"] = sha256(target)
     manifest_path.write_text(json.dumps(manifest, indent=2))
-    print("installed; `worldlod uninstall` puts the original back")
+    remember_game(cfg.game_dir)
+    ui.say(f"Installed into {cfg.game_dir}. `worldlod uninstall` puts the original back.")
 
 
 def uninstall(cfg: Config) -> None:
@@ -86,7 +129,8 @@ def uninstall(cfg: Config) -> None:
         raise SystemExit(f"{backup} doesn't match its recorded hash; not restoring")
     if target.exists() and sha256(target) not in (manifest.get("installed"), manifest.get("original")):
         raise SystemExit(f"{target} isn't the build worldlod installed (another mod?); not overwriting it")
-    _swap_in(backup, target)
+    with ui.status(f"Restoring the original {target.name}"):
+        _swap_in(backup, target)
     manifest["installed"] = None
     manifest_path.write_text(json.dumps(manifest, indent=2))
-    print(f"restored the original {target}; the backup stays in {backup.parent}")
+    ui.say(f"Restored the original {target}; the backup stays in {backup.parent}")

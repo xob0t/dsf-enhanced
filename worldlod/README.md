@@ -1,80 +1,106 @@
 # worldlod
 
-Builds a better base LOD for Driver: San Francisco's upper Shift levels.
+A high-detail map for Driver: San Francisco's upper Shift levels.
 
-At user Shift levels 3 and 4 the game draws one global low-detail model of the
-city: building shells with atlas textures on top of a coarse vertex-coloured
-terrain. The detailed regions hold the real ground (roads, kerbs, paving,
-freeway decks), props and building detail, but the engine only loads the few
-around the camera. This pipeline reads those regions from the player's own
-`san_francisco.dngc` and bakes them into a new base LOD. It ships no game data.
+When you Shift up, the game draws one low-detail model of the whole city: flat,
+vertex-coloured ground under plain building shells. worldlod rebuilds that model
+from the game's own detailed areas, with real roads, kerbs, paving, trees and bushes,
+building detail (storefronts, rooftop units, fire escapes, containers) and
+painted road text. It reads your copy of the game and writes the new map into
+it, with a backup. No game data is shipped.
 
-With the default settings it replaces each cell's stock low-poly terrain with
-the detailed regions' ground (simplified; the stock terrain fills what it
-doesn't cover), trees and bushes, building detail (storefronts, rooftop units,
-fire escapes, containers) and painted road text: 7.6M triangles in 408 cells,
-239 MB of vertex and index data. Tested in game (Shift, driving).
+## Install
 
-The bigger base LOD needs DSF Enhanced's `[Limits]` fixes (on by default): the
-stock engine crashes loading it. Findings are in
-[research/world-lod.md](research/world-lod.md).
+1. Install [DSF Enhanced](https://github.com/xob0t/dsf_enhanced/releases)
+   (version with `[Limits]` in its ini). The new map is bigger than the stock
+   engine allows; without DSF Enhanced the game crashes while loading it.
+2. Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then
+   worldlod:
 
-## Setup
+   ```powershell
+   uv tool install "git+https://github.com/xob0t/dsf_enhanced#subdirectory=worldlod"
+   ```
 
-Python 3.13 and [uv](https://docs.astral.sh/uv/). From this folder:
+3. Close the game and run, in the game folder (the one with `Driver.exe`):
 
-```powershell
-uv sync --extra simplify
-uv run worldlod info
-```
+   ```powershell
+   worldlod install
+   ```
 
-The `simplify` extra (meshoptimizer) compiles on install and needs the Visual
-Studio C++ build tools. Without it, set `[simplify] error = 0`.
+   or from anywhere with `worldlod install --game "C:\path\to\Driver San Francisco"`.
+   The first build takes a minute or two. worldlod remembers the game folder.
 
-The game folder comes from `[game] dir` in the settings or the `DSF_GAME_DIR`
-environment variable.
+To undo: `worldlod uninstall`. To update: `uv tool upgrade dsf-worldlod`, then
+`worldlod install` again.
+
+## Options
+
+Leave things out of the map:
+
+| Flag | Leaves out |
+| --- | --- |
+| `--no-trees` | trees and bushes |
+| `--no-buildings` | building detail (the building shells stay) |
+| `--no-road-text` | painted road text |
+
+For example `worldlod install --no-buildings`. The roads and paving are always
+in. `worldlod build` builds without installing, `--force` rebuilds everything,
+and `worldlod config` prints the settings in effect.
+
+A build runs at idle priority, so the PC stays usable meanwhile. Its files
+(about 1 GB) are in `%LOCALAPPDATA%\worldlod`.
 
 ## Settings
 
-Defaults are in [src/dsfworld/default.toml](src/dsfworld/default.toml). Put the
-keys you want to change in a `worldlod.toml` in the folder you run from, or
-pass `--config <file>`. `uv run worldlod config` prints the merged settings.
+Everything else is in [src/dsfworld/default.toml](src/dsfworld/default.toml),
+with a comment per setting. To change one, put it in a `worldlod.toml` in the
+folder you run worldlod from, or pass `--config <file>`:
 
 ```toml
-[regions]
-select = ["R_360", "R_093"]
-
 [bake]
-classes = ["ground", "foliage"]
-min_model_size = { foliage = 4.0 }
+min_model_size = { buildings = 4.0 }  # drop building detail smaller than 4 m
+
+[simplify]
+error = 1.0  # simplify the ground more (metres)
 ```
 
-The pipeline lowers its own process priority (`[run] priority`, default
-`idle`), so the PC stays usable while it runs.
+Tables keyed by class name (`[classes]`, `min_model_size`) replace the default
+table as a whole.
 
-## Stages
+## Commands
 
-| Command | Output (below `[run] work_dir`) |
+| Command | Does |
 | --- | --- |
-| `worldlod info` | archive summary and the stock base LOD by material class |
-| `worldlod bake` | `bake/<region>.pkl`: the region's `[bake] classes`, moved into the frame of its cell's stock terrain part; `bake/summary.tsv` |
-| `worldlod pack [--verify]` | `pack/san_francisco.dngc` with the baked cells in GEGR; `--verify` re-reads it and checks GEGR's references (with `[bake] classes = []`: that it equals the game's file) |
-| `worldlod render [--cell R_360 \| --area ...] [--view top\|oblique]` | `render/<name>_<view>_{stock,baked,compare}.png`: the stock and the packed base LOD, textured, over the same area (default: the whole city) |
-| `worldlod install` | backs up the game's `san_francisco.dngc` once to `<game>/worldlod-backup/` (with its SHA-256) and puts the packed one in its place |
+| `worldlod install` | builds the map if it is missing or out of date, backs up the game's `san_francisco.dngc` once to `<game>/worldlod-backup/` (with its SHA-256) and puts the build in its place |
 | `worldlod uninstall` | puts the backed-up original back |
+| `worldlod build` | bakes the detailed regions into the base LOD, writes the new `san_francisco.dngc` and checks it (GEGR references, MDID, group sizes, streamer budgets) |
+| `worldlod config` | prints the settings in effect |
+| `worldlod info` | summarises the game's world archive |
+| `worldlod bake` | a build's first step only: `bake/<region>.pkl` and `bake/summary.tsv` |
+| `worldlod render [--cell R_360 \| --area ...] [--view top\|oblique]` | `render/<name>_<view>_{stock,baked,compare}.png`: the stock and the built map, textured, over the same area |
 
-`bake` reuses a region's earlier output while the settings it depends on are unchanged.
-`--archive <file>` reads another world archive, e.g. `uv run worldlod --archive
-out/pack/san_francisco.dngc info` summarises the packed one.
+A build is skipped while the code, the settings and the game's archive are
+unchanged; `bake` likewise reuses each region's earlier output. `--archive
+<file>` makes `info`, `bake` and `render` read another world archive.
 
-`install` refuses while the game runs, when the packed archive fails its check,
-or when the game's file changed since the last install. It swaps files by
-rename, so a hard link to the original (the stock file has one) keeps the
-original bytes.
+`install` refuses while the game runs, without DSF Enhanced's `[Limits]` fixes,
+when the build fails its check, or when the game's file changed since the last
+install (another mod). It swaps files by rename, so a hard link to the original
+keeps the original bytes.
+
+## How it works
+
+Findings on the formats and the engine are in
+[research/world-lod.md](research/world-lod.md). Mesh simplification uses
+[meshoptimizer](https://github.com/zeux/meshoptimizer) (MIT), whose simplifier
+ships prebuilt as `src/dsfworld/_native/meshopt.dll` (Windows x64), so no C++
+compiler is needed; `native/build.ps1` rebuilds it from `native/meshoptimizer`.
 
 ## Development
 
 ```powershell
+uv sync
+uv run worldlod --help
 uv run pytest
 uv run ruff check --fix
 uv run ruff format

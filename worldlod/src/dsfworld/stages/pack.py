@@ -1,8 +1,10 @@
-"""pack: write the world archive to <work_dir>/pack/, with the baked cells in GEGR.
+"""build: write the world archive to <work_dir>/pack/, with the baked cells in GEGR, and check it.
 
-With [bake] classes empty the output equals the game's file. --verify then
-hashes both; with a bake it re-reads the output and checks GEGR's references
-(MODL -> submodels -> buffers and materials, index ranges, MDID, group sizes).
+The check re-reads the output: GEGR's references (MODL -> submodels -> buffers
+and materials, index ranges), MDID, group sizes and the streamer budgets. With
+[bake] classes empty the output must equal the game's file. A stamp next to the
+archive (the code, settings and source it was built from) skips an unchanged
+build.
 """
 
 from __future__ import annotations
@@ -13,7 +15,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dsfworld import gegr
+from dsfworld import gegr, ui
 from dsfworld.config import Config
 from dsfworld.formats import modl, uid
 from dsfworld.formats.archive import Archive, SubModel, gesi, kid, walk
@@ -100,39 +102,58 @@ def check(path: Path) -> list[str]:
     return problems
 
 
-def run(cfg: Config, world: World, *, verify: bool = False) -> Path:
+def code_digest() -> str:
+    """Hash of the package's code and defaults, so that a new worldlod version rebuilds."""
+    h = hashlib.sha256()
+    root = Path(__file__).resolve().parent.parent
+    for f in sorted(root.rglob("*")):
+        if f.suffix in (".py", ".toml"):
+            h.update(f.relative_to(root).as_posix().encode() + b"\0" + f.read_bytes())
+    return h.hexdigest()[:16]
+
+
+def build_key(cfg: Config, world: World) -> str:
+    """What the packed archive depends on: the code, the settings and the source archive."""
+    source = world.archive.path
+    return f"{code_digest()}:{cfg.digest(*bake.SECTIONS)}:{source.name}:{source.stat().st_size}"
+
+
+def run(cfg: Config, world: World, *, force: bool = False) -> Path:
+    """Bake, write the world archive with the baked cells in GEGR, and check it. Nothing to do when the
+    archive was built with the same code, settings and source (unless force)."""
+    out = cfg.packed_archive
+    stamp = out.with_name(out.name + ".key")
+    key = build_key(cfg, world)
+    if not force and out.exists() and stamp.exists() and stamp.read_text() == key:
+        ui.say(f"Up to date: {out}")
+        return out
     a = world.archive
-    cells = bake.run(cfg, world)
+    cells = bake.run(cfg, world, force=force)
     if cells:
-        g = a.global_region()
-        stock_mdxn = kid(g, "MDXN").size
-        stats = gegr.apply(a, g, cells, uid.Allocator(uid.existing(a)))
-        print(
+        with ui.status("Writing the baked cells into GEGR"):
+            g = a.global_region()
+            stock_mdxn = kid(g, "MDXN").size
+            stats = gegr.apply(a, g, cells, uid.Allocator(uid.existing(a)))
+            mdxn, nonr = gegr.update_budgets(a, a.entries, stock_mdxn)
+        ui.say(
             f"GEGR: {stats.cells} parts replaced, {stats.submodels:,} submodels, {stats.triangles:,} triangles, "
             f"{stats.materials} cloned materials, "
-            f"{(stats.vertex_bytes + stats.index_bytes) / 1e6:.1f} MB of buffers in {stats.drsp} new groups"
+            f"{(stats.vertex_bytes + stats.index_bytes) / 1e6:.1f} MB of buffers in {stats.drsp} new groups; "
+            f"streamer budgets {mdxn / 1e6:.1f} MB and {nonr / 1e3:.0f} KB"
         )
-        mdxn, nonr = gegr.update_budgets(a, a.entries, stock_mdxn)
-        print(f"GESI: GEGR budgets {mdxn / 1e6:.1f} MB renderer data, {nonr / 1e3:.0f} KB non-renderer data")
-    out = cfg.packed_archive
     out.parent.mkdir(parents=True, exist_ok=True)
+    stamp.unlink(missing_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")
     version = a.root.version | (0x80000000 if a.root.compressed else 0)
-    with tmp.open("w+b") as f:
+    with ui.status(f"Writing {out.name}"), tmp.open("w+b") as f:
         size = write_chunk(f, a.f, a.entries, version, pad_end=a.root.pad_end)
     tmp.replace(out)
-    print(f"wrote {out} ({size:,} bytes)")
-    if verify:
-        if not cells:
-            same = sha256(out) == sha256(a.path)
-            print(f"identical to {a.path}" if same else f"DIFFERS from {a.path}")
-            if not same:
-                raise SystemExit(1)
-        else:
-            problems = check(out)
-            for p in problems[:20]:
-                print("  " + p)
-            print("GEGR references consistent" if not problems else f"{len(problems)} problems")
-            if problems:
-                raise SystemExit(1)
+    with ui.status("Checking it"):
+        problems = check(out) if cells else ([] if sha256(out) == sha256(a.path) else ["differs from the source"])
+    for p in problems[:20]:
+        ui.say("  " + p)
+    if problems:
+        raise SystemExit(f"{out} fails its check ({len(problems)} problems)")
+    stamp.write_text(key)
+    ui.say(f"Built {out} ({size / 1e6:,.0f} MB), checked")
     return out

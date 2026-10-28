@@ -37,7 +37,13 @@ def _simplify_with_attributes():
 
 
 def simplify_with_attributes(
-    indices: np.ndarray, positions: np.ndarray, attributes: np.ndarray, weights: np.ndarray, *, error: float, options: int
+    indices: np.ndarray,
+    positions: np.ndarray,
+    attributes: np.ndarray,
+    weights: np.ndarray,
+    *,
+    error: float,
+    options: int,
 ) -> np.ndarray:
     """Indices of the simplified mesh, as few as error allows (target 1 triangle).
 

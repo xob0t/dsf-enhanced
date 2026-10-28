@@ -4,14 +4,17 @@
 # whole, not merged.
 
 [game]
-# Game folder (the one with Driver.exe). Empty: the DSF_GAME_DIR environment variable.
+# Game folder (the one with Driver.exe). Empty: --game, else the DSF_GAME_DIR
+# environment variable, else the current folder if it holds the game, else the
+# folder worldlod last installed into.
 dir = ""
 # World archive, relative to the game folder.
 archive = "Install/san_francisco.dngc"
 
 [run]
-# Output folder, relative to the config file's folder.
-work_dir = "out"
+# Work folder (bake cache and the built archive), relative to the config file's
+# folder. Empty: %LOCALAPPDATA%\worldlod.
+work_dir = ""
 # Process priority: "idle", "below_normal" or "normal". Idle keeps the PC usable.
 priority = "idle"
 
@@ -88,7 +91,7 @@ fill_cover = ["ground"]
 classes = ["ground"]
 # Largest geometric error, in metres, allowed when simplifying each baked cell.
 # Upper Shift views the city from hundreds of metres up. 0 turns simplification
-# off; above 0 it needs `uv sync --extra simplify`. 0.5 keeps about 62% of the
+# off. 0.5 keeps about 62% of the
 # ground triangles, 1.0 about 52%.
 error = 0.5
 # Weights in the error metric of the normals (shading) and the vertex colour

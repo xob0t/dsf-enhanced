@@ -12,7 +12,38 @@ def test_user_file_overrides_defaults(tmp_path):
     assert cfg.section("regions")["select"] == ["R_360"]
     assert cfg.section("classes") == {"ground": ["terrain/"]}  # classes are replaced, not merged
     assert cfg.section("run")["priority"] == "idle"
-    assert cfg.work_dir == (tmp_path / "out").resolve()
+    assert cfg.work_dir == config.DATA_DIR  # [run] work_dir empty
+
+
+def test_work_dir_is_relative_to_the_settings_file(tmp_path):
+    user = tmp_path / "worldlod.toml"
+    user.write_text('[run]\nwork_dir = "out"\n')
+    assert config.load(user).work_dir == (tmp_path / "out").resolve()
+
+
+def test_game_folder_from_the_current_folder_then_the_remembered_one(tmp_path, monkeypatch):
+    with pytest.raises(SystemExit, match="Where is the game"):
+        _ = config.load(None).game_dir
+    config.remember_game(tmp_path / "remembered")
+    assert config.load(None).game_dir == tmp_path / "remembered"
+    game = tmp_path / "game"
+    game.mkdir()
+    (game / config.GAME_EXE).write_bytes(b"")
+    monkeypatch.chdir(game)
+    assert config.load(None).game_dir == game
+
+
+def test_no_flags_leave_classes_out_of_the_bake():
+    from dsfworld import cli
+
+    cfg = cli.settings(cli.parser().parse_args(["build", "--no-trees", "--no-road-text"]))
+    assert cfg.section("bake")["classes"] == ["ground", "buildings"]
+    assert cli.settings(cli.parser().parse_args(["build"])).section("bake")["classes"] == [
+        "ground",
+        "foliage",
+        "buildings",
+        "props",
+    ]
 
 
 def test_unknown_key_is_an_error(tmp_path):

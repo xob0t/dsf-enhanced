@@ -12,8 +12,8 @@ full-city loader (`archive/shift-map-2026-10-03`) is needed.
 Evidence tags: `static` (read from data or Driver.exe 1.04), `runtime`
 (measured in game), `hypothesis`. Addresses are VAs (image base 0x400000).
 
-Code: the `worldlod` pipeline in this folder (`../README.md`). `uv run worldlod
-render --cell R_360` draws the stock and the packed base LOD over the same cell.
+Code: the `worldlod` pipeline in this folder (`../README.md`). `worldlod render
+--cell R_360` draws the stock and the built base LOD over the same cell.
 
 ## Archive layout (static)
 

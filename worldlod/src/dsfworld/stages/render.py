@@ -40,7 +40,7 @@ def run(cfg: Config, world: World, *, area=None, size=None, view=None, name=None
     name = name or ("city" if area == "city" else "area")
     packed = cfg.packed_archive
     if not packed.exists():
-        raise SystemExit(f"no packed archive at {packed}: run `worldlod pack` first")
+        raise SystemExit(f"no packed archive at {packed}: run `worldlod build` first")
     out = cfg.work_dir / "render"
     out.mkdir(parents=True, exist_ok=True)
 
