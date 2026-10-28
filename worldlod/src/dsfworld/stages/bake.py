@@ -1,22 +1,24 @@
 """bake: copy each detailed region's chosen classes into the stock base part at its cell.
 
 Writes <work_dir>/bake/<region>.pkl (the baked groups) and bake/summary.tsv.
-A region is rebuilt when its file is missing or was made with different
-[classes] or [bake] settings. Regions whose cell has no stock part to replace
-are listed and skipped.
+A region is rebuilt when its file is missing or its cache key changed: VERSION,
+the [game], [classes], [bake] and [simplify] settings, and the source archive's
+path and size. Regions whose cell has no stock part to replace are listed and
+skipped.
 """
 
 from __future__ import annotations
 
 import pickle
 from collections import Counter
+from dataclasses import dataclass
 from pathlib import Path
 
 import numpy as np
 
 from dsfworld import bake, simplify
 from dsfworld.config import Config
-from dsfworld.formats.modl import POSITION, UV0
+from dsfworld.formats.modl import POSITION, UV0, Lod
 from dsfworld.gegr import CellBake
 from dsfworld.world import World
 
@@ -29,17 +31,19 @@ def output_dir(cfg: Config) -> Path:
     return cfg.work_dir / "bake"
 
 
+def _replaced(world: World, lod: Lod, prefix: str) -> set[int]:
+    """The submodels of lod that the bake replaces: their material path starts with prefix ([bake] replace)."""
+    subs, paths = world.library.submodels, world.materials.paths
+    return {s for s in lod.submodels if s in subs and paths.get(subs[s].material, "").startswith(prefix)}
+
+
 def targets(world: World, prefix: str) -> dict[tuple[int, int], tuple[int, np.ndarray]]:
     """Stock base parts to replace, by the (x, z) of their placement: part UID and instance matrix."""
     out = {}
     for inst in world.base_instances():
         part = world.library.parts.get(inst.model_uid)
         lod = part.finest_lod() if part else None
-        if lod and any(
-            world.materials.paths.get(world.library.submodels[s].material, "").startswith(prefix)
-            for s in lod.submodels
-            if s in world.library.submodels
-        ):
+        if lod and _replaced(world, lod, prefix):
             out[(round(inst.matrix[3, 0]), round(inst.matrix[3, 2]))] = (part.uid, inst.matrix)
     return out
 
@@ -63,59 +67,75 @@ def card_template(world: World, path: str) -> bake.CardTemplate:
     raise SystemExit(f"[bake] leaf_card_material: no GEGR submodel draws {path!r} with a position and UV")
 
 
-def options(cfg: Config, world: World) -> tuple[set[int], bake.BakeOptions]:
-    """The classes to bake and the bake options from [bake]."""
-    settings = cfg.section("bake")
-    unknown = set(settings["classes"]) - set(world.class_names)
+def class_indices(cfg: Config, world: World, section: str, key: str) -> list[int]:
+    """The classes that [section] key names (a list, or a table keyed by class) as indices into
+    world.class_names. An unknown name is an error: ignored, a typo would turn a step off."""
+    names = list(cfg.section(section)[key])
+    unknown = sorted(set(names) - set(world.class_names))
     if unknown:
-        raise SystemExit(f"[bake] classes: unknown class {', '.join(sorted(unknown))}")
-    if settings["leaf_cards"] not in ("flat", "keep", "drop"):
+        raise SystemExit(f"[{section}] {key}: unknown class {', '.join(unknown)}")
+    return [world.class_names.index(c) for c in names]
+
+
+@dataclass(frozen=True)
+class Settings:
+    """[bake] and [simplify], checked against the world's classes."""
+
+    keep: frozenset[int]  # classes baked
+    options: bake.BakeOptions
+    replace: str  # material path prefix of the stock submodels replaced
+    fill_drop: float
+    fill_cover: frozenset[int]
+    simplified: frozenset[int]  # classes simplified
+    error: float
+    normal_weight: float
+    colour_weight: float
+    lock_border: bool
+
+
+def settings(cfg: Config, world: World) -> Settings:
+    b, s = cfg.section("bake"), cfg.section("simplify")
+    if b["leaf_cards"] not in ("flat", "keep", "drop"):
         raise SystemExit('[bake] leaf_cards must be "flat", "keep" or "drop"')
-    keep = {world.class_names.index(c) for c in settings["classes"]}
-    return keep, bake.BakeOptions(
-        height_offset=settings["height_offset"],
-        exclude=tuple(settings["exclude"]),
-        min_size={
-            world.class_names.index(c): v for c, v in settings["min_model_size"].items() if c in world.class_names
-        },
-        leaf_cards=settings["leaf_cards"],
-        cards=card_template(world, settings["leaf_card_material"]) if settings["leaf_cards"] == "flat" else None,
+    min_size = class_indices(cfg, world, "bake", "min_model_size")
+    options = bake.BakeOptions(
+        height_offset=b["height_offset"],
+        exclude=tuple(b["exclude"]),
+        min_size=dict(zip(min_size, b["min_model_size"].values(), strict=True)),
+        leaf_cards=b["leaf_cards"],
+        cards=card_template(world, b["leaf_card_material"]) if b["leaf_cards"] == "flat" else None,
     )
-
-
-def _classes(world: World, names: list[str]) -> set[int]:
-    return {world.class_names.index(c) for c in names if c in world.class_names}
+    return Settings(
+        keep=frozenset(class_indices(cfg, world, "bake", "classes")),
+        options=options,
+        replace=b["replace"],
+        fill_drop=b["fill_drop"],
+        fill_cover=frozenset(class_indices(cfg, world, "bake", "fill_cover")),
+        simplified=frozenset(class_indices(cfg, world, "simplify", "classes")),
+        error=s["error"],
+        normal_weight=s["normal_weight"],
+        colour_weight=s["colour_weight"],
+        lock_border=s["lock_border"],
+    )
 
 
 def bake_cell(
-    cfg: Config,
-    world: World,
-    name: str,
-    target: np.ndarray,
-    *,
-    stock_terrain: list[tuple[int, int]],
-    keep: set[int],
-    opts: bake.BakeOptions,
+    world: World, name: str, target: np.ndarray, *, stock_terrain: list[tuple[int, int]], settings: Settings
 ) -> bake.Result:
     """One region baked into the frame of target, simplified by class, with the stock terrain it leaves
     uncovered kept as fill."""
-    settings = cfg.section("bake")
+    s = settings
     lib, g = world.region(name)
-    result = bake.bake_region(world, lib, g.instances, target, keep, options=opts)
-    s = cfg.section("simplify")
-    simplified = _classes(world, s["classes"])
-    to_simplify = [x for x in result.groups if world.class_index(x.material) in simplified]
-    rest = [x for x in result.groups if world.class_index(x.material) not in simplified]
-    to_simplify = simplify.cell(
-        to_simplify, s["error"], s["normal_weight"], s["colour_weight"], lock_border=s["lock_border"]
-    )
+    result = bake.bake_region(world, lib, g.instances, target, s.keep, options=s.options)
+    to_simplify = [x for x in result.groups if world.class_index(x.material) in s.simplified]
+    rest = [x for x in result.groups if world.class_index(x.material) not in s.simplified]
+    to_simplify = simplify.cell(to_simplify, s.error, s.normal_weight, s.colour_weight, lock_border=s.lock_border)
     result.groups = to_simplify + rest
-    cover_classes = _classes(world, settings["fill_cover"])
-    cover = [x for x in result.groups if world.class_index(x.material) in cover_classes]
+    cover = [x for x in result.groups if world.class_index(x.material) in s.fill_cover]
     if not cover:  # nothing replaces the stock terrain: keep all of it where it is
         result.groups += bake.fill_from_stock(world.library, stock_terrain, [], 0.0)
-    elif settings["fill_drop"] >= 0:
-        result.groups += bake.fill_from_stock(world.library, stock_terrain, cover, settings["fill_drop"])
+    elif s.fill_drop >= 0:
+        result.groups += bake.fill_from_stock(world.library, stock_terrain, cover, s.fill_drop)
     return result
 
 
@@ -135,15 +155,14 @@ def _save(path: Path, cached: dict) -> None:
 
 
 def run(cfg: Config, world: World, *, force: bool = False) -> list[CellBake]:
-    settings = cfg.section("bake")
-    if not settings["classes"]:
+    if not cfg.section("bake")["classes"]:
         return []
-    keep, opts = options(cfg, world)
+    chosen = settings(cfg, world)
     out = output_dir(cfg)
     out.mkdir(parents=True, exist_ok=True)
     source = world.archive.path
     digest = f"{VERSION}:{cfg.digest(*SECTIONS)}:{source}:{source.stat().st_size}"
-    stock = targets(world, settings["replace"])
+    stock = targets(world, chosen.replace)
     names = world.region_names(cfg.section("regions")["select"])
     cells, rows, no_target = [], [], []
     skipped_total: Counter = Counter()
@@ -156,16 +175,13 @@ def run(cfg: Config, world: World, *, force: bool = False) -> list[CellBake]:
         part_uid, matrix = stock[centre]
         lod = world.library.parts[part_uid].finest_lod()
         flags = dict(zip(lod.submodels, lod.flags, strict=True))
-        replaced = {
-            s for s in lod.submodels
-            if world.materials.paths.get(world.library.submodels[s].material, "").startswith(settings["replace"])
-        }  # fmt: skip
+        replaced = _replaced(world, lod, chosen.replace)
         path = out / f"{name}.pkl"
         cached = None if force else _load(path, digest)
         state = "cached"
         if cached is None:
             terrain = [(s, flags[s]) for s in lod.submodels if s in replaced]
-            result = bake_cell(cfg, world, name, matrix, stock_terrain=terrain, keep=keep, opts=opts)
+            result = bake_cell(world, name, matrix, stock_terrain=terrain, settings=chosen)
             cached = {"digest": digest, "part": part_uid, "groups": result.groups, "skipped": result.skipped}
             _save(path, cached)
             state = "built"
