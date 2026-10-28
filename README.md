@@ -72,14 +72,14 @@ This writes the plugin files, this README, the license, `DSF-Enhanced.zip` and `
 
 ## Releases
 
-GitHub Actions ([.github/workflows/build.yml](.github/workflows/build.yml)) runs worldlod's tests and lint and `build.ps1` on every pull request and push to `main`, and keeps both ZIPs as the run's artifacts. To release, push a version tag:
+Releases are built by GitHub Actions ([.github/workflows/build.yml](.github/workflows/build.yml)). To release, push a version tag:
 
 ```powershell
 git tag v1.2.0
 git push origin v1.2.0
 ```
 
-The workflow then builds that tag and publishes the GitHub release with `DSF-Enhanced-v1.2.0.zip` and `worldlod-v1.2.0.zip` and generated release notes.
+The workflow then runs worldlod's tests and lint and `build.ps1` on that tag, and publishes the GitHub release with `DSF-Enhanced-v1.2.0.zip` and `worldlod-v1.2.0.zip` and generated release notes. Started by hand from the Actions tab, it only builds and keeps both ZIPs as the run's artifacts.
 
 ## Repository layout
 

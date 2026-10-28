@@ -1,11 +1,10 @@
-# Builds DSF Enhanced and worldlod and tests both on every pull request and push to main; a pushed
-# tag like v1.2.0 also publishes the GitHub release for it with both ZIPs.
-name: build
+# A pushed tag like v1.2.0 builds DSF Enhanced and worldlod, tests both, and publishes the GitHub
+# release for it with both ZIPs. Run by hand (workflow_dispatch), it only builds and keeps the ZIPs as
+# the run's artifacts.
+name: release
 
 on:
-  pull_request:
   push:
-    branches: [main]
     tags: ["v*"]
   workflow_dispatch:
 
