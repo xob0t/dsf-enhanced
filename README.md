@@ -43,7 +43,13 @@ To uninstall, delete the three files. If the game already has a `winmm.dll`, fro
 
 When you Shift up, the game draws one low-detail model of the whole city: flat ground under plain building shells. worldlod rebuilds it from the game's own detailed areas, with real roads, kerbs, paving, trees and bushes, building detail and painted road text. It reads your `san_francisco.dngc` and writes the new map into it, with a backup. No game data is shipped.
 
-![Stock (left) and worldlod (right), one Shift level down](worldlod/research/img/shift-city-close.jpg)
+Stock (left) and worldlod (right) in the upper Shift view, same spot, crops of 3440x1440 screenshots:
+
+![Downtown: stock and worldlod](worldlod/research/img/compare-downtown.jpg)
+
+![Civic Center: stock and worldlod](worldlod/research/img/compare-civic-center.jpg)
+
+![Hills with trees: stock and worldlod](worldlod/research/img/compare-hills.jpg)
 
 ### Install
 
