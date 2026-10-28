@@ -109,7 +109,10 @@ class Config:
 
     def digest(self, *sections: str) -> str:
         """Hash of the named sections, to tell when cached stage output is stale."""
-        blob = json.dumps({s: self.data[s] for s in sections}, sort_keys=True)
+        data = {s: self.data[s] for s in sections}
+        if "game" in data:  # where the game is doesn't change the output; the source's name and size are keyed
+            data["game"] = {k: v for k, v in data["game"].items() if k != "dir"}
+        blob = json.dumps(data, sort_keys=True)
         return hashlib.sha256(blob.encode()).hexdigest()[:16]
 
 

@@ -50,7 +50,7 @@ When you Shift up, the game draws one low-detail model of the whole city: flat g
 1. Download `worldlod.zip` from the [latest release](https://github.com/xob0t/dsf-enhanced/releases/latest) and unzip it anywhere.
 2. Close the game and double-click `install.cmd`.
 
-The first time, it asks for the game folder and installs [uv](https://docs.astral.sh/uv/), which brings the Python worldlod runs on. It puts DSF Enhanced into the game if it isn't there, because the bigger map needs its `[Limits]` fixes. Then it builds the map (a minute or two) and installs it. `install.cmd --uninstall` undoes everything. Options (`--no-trees`, `--no-buildings`, `--no-road-text`) and how it works are in [worldlod/README.md](worldlod/README.md).
+The first time, it asks for the game folder and installs [uv](https://docs.astral.sh/uv/), which brings the Python worldlod runs on. It puts DSF Enhanced into the game if it isn't there, because the bigger map needs its `[Limits]` fixes. Then it builds the map (a minute or two) and installs it. `install.cmd --uninstall` puts the original map back and removes the DSF Enhanced files it added; the backup of the original map stays in the game's `worldlod-backup` folder. Options (`--no-trees`, `--no-buildings`, `--no-road-text`) and how it works are in [worldlod/README.md](worldlod/README.md).
 
 ## Build
 

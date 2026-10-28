@@ -108,7 +108,7 @@ def code_digest() -> str:
     h = hashlib.sha256()
     root = Path(__file__).resolve().parent.parent
     for f in sorted(root.rglob("*")):
-        if f.suffix in (".py", ".toml"):
+        if f.suffix in (".py", ".toml", ".dll"):
             h.update(f.relative_to(root).as_posix().encode() + b"\0" + f.read_bytes())
     return h.hexdigest()[:16]
 

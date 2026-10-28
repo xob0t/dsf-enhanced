@@ -23,7 +23,13 @@ $ErrorActionPreference = 'Stop'
 $UvVersion = '0.13.5'
 $App = $PSScriptRoot
 $Root = Split-Path -Parent $App
-$Forward = @($args)
+# A path ending in \ inside quotes ("C:\Games\Driver San Francisco\") reaches this script as
+# 'C:\Games\Driver San Francisco"', merged with any argument after it: split at the stray quote and drop
+# trailing quotes and backslashes (no worldlod argument needs them).
+$Forward = @(foreach ($a in $args) {
+    if ($a -isnot [string]) { $a; continue }
+    foreach ($part in ($a -split '" ')) { if ($part.Length -gt 3) { $part.TrimEnd('"').TrimEnd('\') } else { $part } }
+})
 
 function Find-Uv {
     $cmd = Get-Command uv -ErrorAction SilentlyContinue
@@ -71,11 +77,11 @@ if (-not ($Forward -contains '--game') -and -not $help) {
             if (-not (Test-Game $asked)) { Write-Host "No Driver.exe in '$asked'." }
         }
         if (-not (Test-Game $asked)) { throw 'No game folder given.' }
-        $game = (Resolve-Path -LiteralPath $asked).Path
+        $game = (Resolve-Path -LiteralPath $asked).Path.TrimEnd('\')
         [Environment]::SetEnvironmentVariable('DSF_GAME_DIR', $game, 'User')
         Write-Host "Saved as your DSF_GAME_DIR: $game"
     }
-    $Forward = @('--game', $game) + $Forward
+    $Forward = @('--game', $game.TrimEnd('\')) + $Forward
 }
 if ($command -eq 'install') { $Forward = @('--plugin', (Join-Path $Root 'plugin')) + $Forward }
 

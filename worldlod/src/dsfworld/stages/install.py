@@ -8,9 +8,10 @@ original bytes. uninstall restores the backup the same way. With the default
 work folder, install then deletes the build files (about 1 GB): uninstall only
 needs the backup.
 
-Before building, install puts DSF Enhanced (from --plugin, the release ZIP's
-plugin folder) into the game when it lacks the plugin's [Limits] fixes (see
-plugin.py); uninstall takes the plugin back out if install put it there.
+Before building, install checks that DSF Enhanced can be had (in the game, or
+from --plugin, the release ZIP's plugin folder); it puts it in (see plugin.py)
+only once the build has passed its check, right before the map. uninstall takes
+the plugin back out if install put it there.
 """
 
 from __future__ import annotations
@@ -35,28 +36,27 @@ def _manifest(cfg: Config) -> tuple[Path, dict]:
     return path, (json.loads(path.read_text()) if path.exists() else {})
 
 
+def _save(path: Path, manifest: dict) -> None:
+    """Write the manifest whole or not at all."""
+    path.parent.mkdir(exist_ok=True)
+    tmp = path.with_name(path.name + ".tmp")
+    tmp.write_text(json.dumps(manifest, indent=2))
+    tmp.replace(path)
+
+
 def ready(cfg: Config, plugin_dir: Path | None = None) -> None:
-    """Stop before any work if install couldn't finish; put DSF Enhanced into the game if it lacks it."""
+    """Stop before any work if install couldn't finish: no world archive, the game running, or DSF Enhanced
+    missing from the game with none to put in (plugin_dir) or turned off by the player's ini."""
     if not cfg.game_archive.exists():
         raise SystemExit(f"No {cfg.game_archive.name} in {cfg.game_archive.parent}: is {cfg.game_dir} the game folder?")
     if _game_running():
         raise SystemExit("Driver.exe is running: close the game first")
-    game = cfg.game_dir
-    if plugin.has_fixes(game):
-        off = plugin.limits_off(game)  # the player's own ini: their call
-        if off:
-            raise SystemExit(f"{off}. The new map needs it, or the game crashes while loading.")
+    if plugin.needed(cfg.game_dir):
+        plugin.check_source(plugin_dir)
         return
-    path, manifest = _manifest(cfg)
-    try:
-        plugin.install(game, path.parent, manifest, plugin_dir)
-    finally:
-        if manifest:
-            path.parent.mkdir(exist_ok=True)
-            path.write_text(json.dumps(manifest, indent=2))
-    problem = plugin.problem(game)
-    if problem:
-        raise SystemExit(f"{problem}. The new map needs DSF Enhanced's engine limit fixes.")
+    off = plugin.limits_off(cfg.game_dir)  # the player's own ini: their call
+    if off:
+        raise SystemExit(f"{off}. The new map needs it, or the game crashes while loading.")
 
 
 def _game_running() -> bool:
@@ -80,12 +80,14 @@ def _paths(cfg: Config) -> tuple[Path, Path, Path]:
     return target, path.parent / target.name, path
 
 
-def install(cfg: Config) -> None:
+def install(cfg: Config, plugin_dir: Path | None = None) -> None:
+    """Put DSF Enhanced in if the game needs it, back the original map up once, and swap the build in.
+    The manifest is written before each change, so an interrupted install can be run again or undone."""
     target, backup, manifest_path = _paths(cfg)
     packed = cfg.packed_archive
     if not packed.exists():
         raise SystemExit(f"no built archive at {packed}: run `worldlod build` first")
-    ready(cfg)
+    ready(cfg, plugin_dir)
     problems = check(packed)
     if problems:
         raise SystemExit(f"{packed} fails its check ({problems[0]}); not installing")
@@ -94,22 +96,27 @@ def install(cfg: Config) -> None:
     if not backup.exists():
         if current == manifest.get("installed"):
             raise SystemExit(f"{target} is a worldlod build but the backup is missing; restore the original first")
-        backup.parent.mkdir(exist_ok=True)
         with ui.status(f"Backing up the original to {backup}"):
+            backup.parent.mkdir(exist_ok=True)
             tmp = backup.with_name(backup.name + ".worldlod-tmp")
             shutil.copyfile(target, tmp)
+            manifest["original"] = current
+            _save(manifest_path, manifest)
             tmp.replace(backup)
-        manifest["original"] = current
-        manifest_path.write_text(json.dumps(manifest, indent=2))
         ui.done("Backed up the original map", str(backup))
     elif sha256(backup) != manifest.get("original"):
         raise SystemExit(f"{backup} doesn't match its recorded hash; not touching anything")
     elif current not in (manifest.get("original"), manifest.get("installed")):
         raise SystemExit(f"{target} changed since the last install (another mod?); uninstall or move the backup first")
+    if plugin.needed(cfg.game_dir):
+        try:
+            plugin.install(cfg.game_dir, backup.parent, manifest, plugin_dir)
+        finally:
+            _save(manifest_path, manifest)
     with ui.status(f"Installing into {target}"):
+        manifest["installed"] = sha256(packed)
+        _save(manifest_path, manifest)
         _swap_in(packed, target)
-        manifest["installed"] = sha256(target)
-    manifest_path.write_text(json.dumps(manifest, indent=2))
     remember_game(cfg.work_dir, cfg.game_dir)
     if not cfg.data["run"]["work_dir"]:  # the default work folder: a one-time run leaves nothing behind
         shutil.rmtree(cfg.work_dir / "bake", ignore_errors=True)
@@ -135,12 +142,13 @@ def uninstall(cfg: Config) -> None:
         with ui.status(f"Restoring the original {target.name}"):
             _swap_in(backup, target)
         manifest["installed"] = None
+        _save(manifest_path, manifest)
         ui.done("Restored the original map", str(target))
         ui.note(f"The backup stays in {backup.parent}")
     plugin.uninstall(cfg.game_dir, backup.parent, manifest)
     if backup.exists():
-        manifest_path.write_text(json.dumps(manifest, indent=2))
+        _save(manifest_path, manifest)
     else:  # only the plugin was installed: nothing left to keep
         manifest_path.unlink(missing_ok=True)
-        if not any(backup.parent.iterdir()):
+        if backup.parent.exists() and not any(backup.parent.iterdir()):
             backup.parent.rmdir()

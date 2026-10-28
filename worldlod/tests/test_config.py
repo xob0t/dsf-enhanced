@@ -87,3 +87,9 @@ def test_archive_override_is_a_separate_source(tmp_path, monkeypatch):
     cfg = config.load(None).reading(tmp_path / "x.dngc")
     assert cfg.archive == tmp_path / "x.dngc"  # no game folder needed to read it
     assert cfg.packed_archive.name == "san_francisco.dngc"
+
+
+def test_where_the_game_is_doesnt_change_the_cache_key():
+    a, b = config.load(None), config.load(None)
+    b.data["game"]["dir"] = "D:/Elsewhere"
+    assert a.digest("game", "bake") == b.digest("game", "bake")

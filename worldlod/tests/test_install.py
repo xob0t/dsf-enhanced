@@ -18,6 +18,7 @@ def game(tmp_path, monkeypatch):
     )
     cfg.game_archive.parent.mkdir(parents=True)
     (cfg.game_dir / plugin.ASI).write_bytes(b"DSF Enhanced with " + plugin.FIXES)
+    (cfg.game_dir / "winmm.dll").write_bytes(b"built at ultimate-asi-loader")
     cfg.game_archive.write_bytes(b"original")
     cfg.packed_archive.parent.mkdir(parents=True)
     cfg.packed_archive.write_bytes(b"build")

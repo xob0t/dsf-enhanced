@@ -131,6 +131,15 @@ def main(argv: list[str] | None = None) -> None:
     except KeyboardInterrupt:
         ui.fail("Stopped")
         raise SystemExit(130) from None
+    except PermissionError as e:
+        ui.fail(
+            f"Windows refused to write {e.filename}. If the game is under Program Files, run install.cmd as "
+            "administrator (right-click, Run as administrator)."
+        )
+        raise SystemExit(1) from None
+    except OSError as e:
+        ui.fail(f"{e.strerror or e}: {e.filename}" if e.filename else str(e))
+        raise SystemExit(1) from None
 
 
 def _main(argv: list[str] | None) -> None:
@@ -151,7 +160,7 @@ def _main(argv: list[str] | None) -> None:
     with world.archive:
         run_stage(cfg, world, args)
     if args.command == "install":
-        install.install(cfg)
+        install.install(cfg, args.plugin)
 
 
 if __name__ == "__main__":

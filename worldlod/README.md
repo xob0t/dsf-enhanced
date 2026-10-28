@@ -47,8 +47,13 @@ For example, in a terminal in worldlod's folder: `.\install.cmd --no-buildings`.
 The roads and paving are always in. `.\install.cmd --help` lists every option.
 
 A build runs at idle priority, so the PC stays usable meanwhile. Its files
-(about 1 GB, in `work` beside `install.cmd`) are deleted once it is installed;
-deleting worldlod's folder removes everything it put on your PC except uv.
+(about 1 GB, in `work` beside `install.cmd`) are deleted once it is installed.
+
+What stays on your PC: worldlod's folder; the original map, backed up in the
+game's `worldlod-backup` folder (about 600 MB, kept after uninstall too, so you
+can delete it yourself once you're done); uv with its Python and package cache
+(under `%USERPROFILE%\.local\bin` and `%LOCALAPPDATA%\uv`); and, if
+`install.cmd` asked for the game folder, your user's `DSF_GAME_DIR` setting.
 
 ## Settings
 
@@ -89,8 +94,11 @@ unchanged; `bake` likewise reuses each region's earlier output. `--archive
 `install` refuses while the game runs, when your `dsf_enhanced.ini` turns one
 of the needed `[Limits]` off, when the build fails its check, or when the game's
 file changed since the last install (another mod). DSF Enhanced comes from the
-repository's latest GitHub release; the files it replaces are kept in
-`worldlod-backup`. It swaps files by rename, so a hard link to the original
+ZIP's `plugin` folder (`--plugin`) and goes in only after the map has built and
+passed its check; it replaces an older DSF Enhanced where that one is (the game
+folder, `scripts` or `plugins`), keeps the files it replaces in
+`worldlod-backup`, and adds `winmm.dll` only when there is no ASI loader.
+Uninstall keeps that loader while other ASI mods use it. It swaps files by rename, so a hard link to the original
 keeps the original bytes.
 
 ## How it works
