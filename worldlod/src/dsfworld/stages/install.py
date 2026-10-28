@@ -4,7 +4,9 @@ install checks the packed archive (GEGR references), backs up the game's
 original once to <game>/worldlod-backup/ with its SHA-256, then swaps the new
 file in. The game's file can be a hard link (san_francisco.dngc is), so the new
 file is written next to it and renamed over it; the other link keeps the
-original bytes. uninstall restores the backup the same way.
+original bytes. uninstall restores the backup the same way. With the default
+work folder, install then deletes the build files (about 1 GB): uninstall only
+needs the backup.
 
 The built archive is bigger than three fixed-size engine pools allow; DSF
 Enhanced's [Limits] fixes lift them. install refuses without them, since the
@@ -115,6 +117,9 @@ def install(cfg: Config) -> None:
         manifest["installed"] = sha256(target)
     manifest_path.write_text(json.dumps(manifest, indent=2))
     remember_game(cfg.game_dir)
+    if not cfg.data["run"]["work_dir"]:  # the default work folder: a one-time run leaves nothing behind
+        shutil.rmtree(cfg.work_dir / "bake", ignore_errors=True)
+        shutil.rmtree(packed.parent, ignore_errors=True)
     ui.say(f"Installed into {cfg.game_dir}. `worldlod uninstall` puts the original back.")
 
 

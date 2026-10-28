@@ -70,3 +70,14 @@ def test_install_remembers_the_game_folder(game):
 
     install.install(game)
     assert config.remembered_game() == str(game.game_dir)
+
+
+def test_install_deletes_the_build_files_from_the_default_work_folder(game):
+    game.data["run"]["work_dir"] = ""  # the default: the data folder
+    game.packed_archive.parent.mkdir(parents=True)
+    game.packed_archive.write_bytes(b"build")
+    (game.work_dir / "bake").mkdir()
+    install.install(game)
+    assert game.game_archive.read_bytes() == b"build"
+    assert not game.packed_archive.parent.exists()
+    assert not (game.work_dir / "bake").exists()

@@ -14,24 +14,20 @@ it, with a backup. No game data is shipped.
 1. Install [DSF Enhanced](https://github.com/xob0t/dsf_enhanced/releases)
    (version with `[Limits]` in its ini). The new map is bigger than the stock
    engine allows; without DSF Enhanced the game crashes while loading it.
-2. Install [uv](https://docs.astral.sh/uv/getting-started/installation/), then
-   worldlod:
+2. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
+3. Close the game, open PowerShell in the game folder (the one with
+   `Driver.exe`) and run:
 
    ```powershell
-   uv tool install "git+https://github.com/xob0t/dsf_enhanced#subdirectory=worldlod"
+   uvx --from "git+https://github.com/xob0t/dsf_enhanced#subdirectory=worldlod" worldlod install
    ```
 
-3. Close the game and run, in the game folder (the one with `Driver.exe`):
+   uvx fetches worldlod and runs it once; nothing stays installed. The build
+   takes a minute or two, then worldlod puts the new map into the game (the
+   original is backed up in `worldlod-backup`) and deletes its build files.
+   From another folder, add `--game "C:\path\to\Driver San Francisco"`.
 
-   ```powershell
-   worldlod install
-   ```
-
-   or from anywhere with `worldlod install --game "C:\path\to\Driver San Francisco"`.
-   The first build takes a minute or two. worldlod remembers the game folder.
-
-To undo: `worldlod uninstall`. To update: `uv tool upgrade dsf-worldlod`, then
-`worldlod install` again.
+To undo, run the same line with `uninstall` instead of `install`.
 
 ## Options
 
@@ -43,12 +39,12 @@ Leave things out of the map:
 | `--no-buildings` | building detail (the building shells stay) |
 | `--no-road-text` | painted road text |
 
-For example `worldlod install --no-buildings`. The roads and paving are always
+Add them to the install line, for example `... worldlod install --no-buildings`. The roads and paving are always
 in. `worldlod build` builds without installing, `--force` rebuilds everything,
 and `worldlod config` prints the settings in effect.
 
 A build runs at idle priority, so the PC stays usable meanwhile. Its files
-(about 1 GB) are in `%LOCALAPPDATA%\worldlod`.
+(about 1 GB, in `%LOCALAPPDATA%\worldlod`) are deleted once it is installed.
 
 ## Settings
 

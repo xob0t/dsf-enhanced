@@ -20,6 +20,10 @@ build-backend = "uv_build"
 [tool.uv.build-backend]
 module-name = "dsfworld"
 
+[tool.uv]
+# Rebuild when the code changes, not only pyproject.toml (uvx --from <this folder> caches the build).
+cache-keys = [{ file = "pyproject.toml" }, { file = "src/**/*.py" }, { file = "src/**/*.toml" }, { file = "src/**/*.dll" }]
+
 [tool.ruff]
 line-length = 120  # the target version comes from requires-python
 
