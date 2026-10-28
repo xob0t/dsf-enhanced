@@ -147,20 +147,24 @@ def test_fill_keeps_only_uncovered_stock_triangles_lowered():
     assert pos[:, 0].min() == 20 and np.all(pos[:, 1] == -2)
 
 
-def test_float16_positions_are_moved_and_stay_float16():
-    elements = [(0, 4, 8, 0), (5, 4, 8, 8)]  # half4 position, half4 leaf-card data (foliage layout)
-    rows = [struct.pack("<4e4e", x, y, z, 1, 1, 0, 0, 0) for x, y, z in ((1, 0, 0), (0, 2, 0), (0, 0, 3))]
+def test_leaf_card_pivot_is_moved_and_card_data_kept():
+    # leaf-card trees: half4 semantic 0 is card data, semantic 5's y, z, w the pivot in object space
+    elements = [(0, 4, 8, 0), (5, 4, 8, 8)]
+    pivots = ((1, 0, 0), (0, 2, 0), (0, 0, 3))
+    rows = [struct.pack("<4e4e", 0.5, 0.25, 1.5, 2.0, 7, x, y, z) for x, y, z in pivots]
     lib = Library()
     lib.vbs[1] = VertexBuffer(3, 16, elements, b"".join(rows), b"decl")
     lib.ibs[2] = np.array([0, 1, 2], np.uint16)
     lib.submodels[3] = SubModel(3, 0xAA, 1, 0, 0, 2, 0, 3)
     lib.parts[4] = Part(4, np.zeros((4, 4)), [Lod(2, [3], [1])], 1)
     (g,) = bake.bake_region(Classes(), lib, [Instance(4, 0, yaw(90, (10, 0, 20)))], np.eye(4), {0}).groups
-    pos = g.vertices[:, 0:6].copy().view("<f2").astype(float)
-    np.testing.assert_allclose(pos[0], (10, 0, 21), atol=0.01)  # (1,0,0) turned 90 degrees is (0,0,1)
-    np.testing.assert_allclose(pos[1], (10, 2, 20), atol=0.01)
-    card = g.vertices[0, 8:16].copy().view("<f2").astype(float)
-    np.testing.assert_allclose(card, (1, 0, 0, 0))  # leaf-card corner data is copied, not rotated
+    data = g.vertices[:, 0:8].copy().view("<f2").astype(float)
+    np.testing.assert_allclose(data, [[0.5, 0.25, 1.5, 2.0]] * 3)  # card data copied
+    card = g.vertices[:, 8:16].copy().view("<f2").astype(float)
+    np.testing.assert_allclose(card[:, 0], 7)
+    np.testing.assert_allclose(card[0, 1:], (10, 0, 21), atol=0.01)  # (1,0,0) turned 90 degrees is (0,0,1)
+    np.testing.assert_allclose(card[1, 1:], (10, 2, 20), atol=0.01)
+    np.testing.assert_allclose(bake.positions(g)[2], (7, 0, 20), atol=0.01)  # (0,0,3) turned is (-3,0,0)
 
 
 def test_second_stream_is_folded_into_the_vertex():

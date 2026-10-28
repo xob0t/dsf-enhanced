@@ -3,10 +3,13 @@
 Each source submodel placed in the region is copied vertex for vertex: positions
 (int16 in 1/64 m, float16 or float32 in metres, kept in their stored type) and
 normals (ubyte4, x * 2 - 1) are moved from the source instance's frame into the
-target part's frame; every other attribute is kept as stored. Semantic 5 stored
-as float16 is not a normal: the leaf-card tree shaders (g_fTreetopSize,
-g_fQuadRotationCompensation) keep each card corner's offset there and expand the
-card on screen, so it is copied unchanged.
+target part's frame; every other attribute is kept as stored.
+
+Leaf-card trees (Trees_Functions.hlsl; half4 semantic 0 and half4 semantic 5) are
+laid out differently: the card's pivot in object space is semantic 5's y, z, w
+(the vertex shader transforms (v1.yzw, 1) by g_ObjectToWorld), and semantic 0
+holds per-card data (v0.z rotation, v0.w size) used to expand the card on screen.
+So for that layout the pivot is moved and semantic 0 is copied unchanged.
 Float16 positions lose precision away from the cell centre (0.25 m beyond 256 m),
 which only foliage uses. Copies are grouped by material, flag and vertex layout, welded, and
 split into submodels of at most 65,535 vertices (16-bit indices).
@@ -84,9 +87,19 @@ def combined_decl(first: bytes, second: bytes) -> bytes:
     return struct.pack("<I", n1 + n2) + first[4 : 4 + 16 * n1] + second[4 : 4 + 16 * n2]
 
 
+def position_slot(elements) -> tuple | None:
+    """Where a layout keeps vertex positions, as (semantic, components, type, byte offset): semantic 5's
+    y, z, w for leaf-card trees (half4 semantic 0 and half4 semantic 5), else semantic 0."""
+    sems = {e[0]: e for e in elements}
+    pos, card = sems.get(POSITION), sems.get(NORMAL)
+    if pos and card and pos[1:3] == (4, FLOAT16) and card[1:3] == (4, FLOAT16):
+        return (NORMAL, 3, FLOAT16, card[3] + 2)
+    return pos
+
+
 def positions(g) -> np.ndarray:
     """(n, 3) metres of a group's vertices."""
-    return read_positions(g.vertices, next(e for e in g.elements if e[0] == POSITION))
+    return read_positions(g.vertices, position_slot(g.elements))
 
 
 @dataclass
@@ -195,7 +208,7 @@ def bake_region(
             if len(sems) != len(elements):
                 skipped["semantic in both streams"] += 1
                 continue
-            pos = sems.get(POSITION)
+            pos = position_slot(elements)
             if pos is None or pos[2] not in POSITION_TYPES or pos[1] < 3:
                 skipped["unsupported position type"] += 1
                 continue
@@ -278,12 +291,11 @@ def fill_from_stock(lib: modl.Library, stock: list[tuple[int, int]], baked: list
     for su, flag in stock:
         sub = lib.submodels[su]
         vb = lib.vbs[sub.vb]
-        sems = {e[0]: e for e in vb.elements}
         idx = lib.ibs[sub.ib][sub.first_index : sub.first_index + sub.index_count].astype(np.int64) + sub.base_vertex
         used, tri = np.unique(idx, return_inverse=True)
         tri = tri.reshape(-1, 3)
         rows = vb.rows()[used].copy()
-        p = read_positions(rows, sems[POSITION])
+        p = read_positions(rows, position_slot(vb.elements))
         pts, owner = _samples(p[tri], 1 / FILL_GRID**2, rng)
         cells = np.floor(pts[:, [0, 2]] / FILL_GRID).astype(np.int64)
         hit = np.fromiter((tuple(c) in covered for c in cells.tolist()), bool, len(cells))
@@ -292,7 +304,7 @@ def fill_from_stock(lib: modl.Library, stock: list[tuple[int, int]], baked: list
         if not len(tri):
             continue
         p[:, 1] -= drop
-        write_positions(rows, sems[POSITION], p)
+        write_positions(rows, position_slot(vb.elements), p)
         keep, remap = np.unique(tri, return_inverse=True)
         out.append(Group(sub.material, flag, vb.stride, tuple(vb.elements), vb.decl, rows[keep], remap.reshape(-1, 3)))
     return out

@@ -29,7 +29,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
-from dsfworld.bake import Group, read_positions
+from dsfworld.bake import Group, position_slot, read_positions
 from dsfworld.formats import modl
 from dsfworld.formats.archive import Archive, kid, walk
 from dsfworld.formats.chnk import ENTRY_LIMIT, Entry, entry_size
@@ -124,7 +124,7 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
             vb = layouts.setdefault(
                 (g.stride, g.elements), {"uid": uids.new(), "rows": [], "count": 0, "users": [], "decl": g.decl}
             )
-            pos_el = next(e for e in g.elements if e[0] == 0)
+            pos_el = position_slot(g.elements)
             for verts, tris in g.chunks():
                 sub = uids.new()
                 base = vb["count"]
