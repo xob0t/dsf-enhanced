@@ -16,12 +16,7 @@ An ASI plugin for Driver: San Francisco on PC. Target exe version 1.04
 
 ## High-detail upper Shift (worldlod)
 
-[worldlod](worldlod/README.md) is a Python pipeline that rebuilds the city model the game draws at the upper Shift levels from the game's own detailed regions: real roads, paving, trees and building detail instead of the coarse low-poly city. It reads your `san_francisco.dngc` and writes a new one (no game data is shipped), and needs this plugin's `[Limits]` fixes to load; it installs this plugin's latest release itself if the game lacks it. With [uv](https://docs.astral.sh/uv/) installed, run in the game folder (nothing stays installed):
-
-```powershell
-$tag = (irm https://api.github.com/repos/xob0t/dsf-enhanced/releases/latest).tag_name
-uvx --from "git+https://github.com/xob0t/dsf-enhanced@$tag#subdirectory=worldlod" worldlod install
-```
+[worldlod](worldlod/README.md) is a Python pipeline that rebuilds the city model the game draws at the upper Shift levels from the game's own detailed regions: real roads, paving, trees and building detail instead of the coarse low-poly city. It reads your `san_francisco.dngc` and writes a new one (no game data is shipped), and needs this plugin's `[Limits]` fixes to load. To install it, download `worldlod.zip` from the latest release, unzip it and double-click `install.cmd`: it puts this plugin into the game too if it isn't there.
 
 ## Install
 

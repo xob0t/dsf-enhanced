@@ -52,4 +52,7 @@ $packageFiles = @("winmm.dll", "dsf_enhanced.asi", "dsf_enhanced.ini", "README.m
   ForEach-Object { Join-Path $dist $_ }
 Compress-Archive -LiteralPath $packageFiles -DestinationPath (Join-Path $dist "DSF-Enhanced.zip")
 
+# worldlod: install.cmd, the pipeline and this build of the plugin (worldlod\release\package.ps1)
+& (Join-Path $root "worldlod\release\package.ps1") -Dist $dist
+
 Write-Host "Built release package in $dist"

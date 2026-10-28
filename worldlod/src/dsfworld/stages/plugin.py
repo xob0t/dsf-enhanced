@@ -2,27 +2,22 @@
 fixed-size engine pools allow, and the stock game crashes while loading it.
 
 When the game lacks the plugin (or has one without the fixes), install puts the
-latest DSF Enhanced release into the game folder: dsf_enhanced.asi, its ini
-unless the player already has one, and the ASI loader (winmm.dll) unless an
-Ultimate ASI Loader is already there. Files it replaces go to the backup folder;
-the manifest records what it placed, and uninstall takes exactly that back.
+DSF Enhanced that comes with worldlod (the release ZIP's plugin folder, given as
+--plugin) into the game folder: dsf_enhanced.asi, its ini unless the player
+already has one, and the ASI loader (winmm.dll) unless an Ultimate ASI Loader is
+already there. Files it replaces go to the backup folder; the manifest records
+what it placed, and uninstall takes exactly that back.
 """
 
 from __future__ import annotations
 
 import configparser
 import hashlib
-import io
-import json
 import shutil
-import urllib.request
-import zipfile
 from pathlib import Path
 
 from dsfworld import ui
 
-REPO = "xob0t/dsf-enhanced"
-LATEST = f"https://api.github.com/repos/{REPO}/releases/latest"
 ASI, INI, LOADER = "dsf_enhanced.asi", "dsf_enhanced.ini", "winmm.dll"
 FIXES = b"SubmodelTableExtraNodes"  # a setting only plugins with all three [Limits] fixes know
 # [Limits] keys the build needs, and the value at or below which each is off
@@ -64,50 +59,29 @@ def has_loader(game: Path) -> bool:
     return any(ASI_LOADER in f.read_bytes().lower() for f in game.glob("*.dll"))
 
 
-def _get(url: str, accept: str = "*/*") -> bytes:
-    request = urllib.request.Request(url, headers={"User-Agent": "worldlod", "Accept": accept})
-    try:
-        with urllib.request.urlopen(request, timeout=60) as response:
-            return response.read()
-    except OSError as e:  # URLError and HTTPError are OSErrors
+def install(game: Path, backup_dir: Path, manifest: dict, source: Path | None) -> None:
+    """Put the DSF Enhanced in source (a folder) into game; record it in manifest (the caller saves it)."""
+    if source is None or not (source / ASI).exists():
         raise SystemExit(
-            f"Couldn't download DSF Enhanced from GitHub ({e}); install it by hand from "
-            f"https://github.com/{REPO}/releases"
-        ) from None
-
-
-def latest_release() -> tuple[str, dict[str, bytes]]:
-    """The latest DSF Enhanced release's tag and its plugin files (by name) from its ZIP."""
-    release = json.loads(_get(LATEST, "application/vnd.github+json"))
-    asset = next((a for a in release.get("assets", []) if a["name"].lower().endswith(".zip")), None)
-    if asset is None:
-        raise SystemExit(f"The latest DSF Enhanced release ({release.get('tag_name')}) has no ZIP to install from")
-    with zipfile.ZipFile(io.BytesIO(_get(asset["browser_download_url"]))) as z:
-        files = {Path(n).name: z.read(n) for n in z.namelist() if Path(n).name in (ASI, INI, LOADER)}
-    return release["tag_name"], files
-
-
-def install(game: Path, backup_dir: Path, manifest: dict) -> None:
-    """Put the latest DSF Enhanced release into game; record it in manifest (the caller saves it)."""
-    with ui.status("Downloading DSF Enhanced (the latest release)"):
-        tag, files = latest_release()
-    if FIXES not in files.get(ASI, b""):
-        raise SystemExit(
-            f"The latest DSF Enhanced release ({tag}) doesn't have the [Limits] fixes the new map needs yet"
+            f"{problem(game)}. The new map needs DSF Enhanced's [Limits] fixes, or the game crashes while loading: "
+            "run worldlod through install.cmd from its release ZIP (it brings DSF Enhanced), or install DSF "
+            "Enhanced yourself first"
         )
+    files = {name: (source / name).read_bytes() for name in (ASI, INI, LOADER) if (source / name).exists()}
+    if FIXES not in files[ASI]:
+        raise SystemExit(f"The DSF Enhanced in {source} doesn't have the [Limits] fixes the new map needs")
     record = manifest.setdefault("plugin", {"placed": {}, "replaced": []})
-    record["release"] = tag
-    for name in (ASI, INI, LOADER):
+    for name, data in files.items():
         target = game / name
-        if name not in files or (name == INI and target.exists()) or (name == LOADER and has_loader(game)):
+        if (name == INI and target.exists()) or (name == LOADER and has_loader(game)):
             continue  # the player's own settings, or the loader they have
         if target.exists() and not (backup_dir / name).exists():
             backup_dir.mkdir(exist_ok=True)
             shutil.copyfile(target, backup_dir / name)
             record["replaced"].append(name)
-        target.write_bytes(files[name])
-        record["placed"][name] = hashlib.sha256(files[name]).hexdigest()
-    ui.say(f"Installed DSF Enhanced {tag} ({', '.join(record['placed'])})")
+        target.write_bytes(data)
+        record["placed"][name] = hashlib.sha256(data).hexdigest()
+    ui.say(f"Installed DSF Enhanced ({', '.join(record['placed'])})")
 
 
 def uninstall(game: Path, backup_dir: Path, manifest: dict) -> None:
@@ -122,4 +96,4 @@ def uninstall(game: Path, backup_dir: Path, manifest: dict) -> None:
     for name in record["replaced"]:
         if (backup_dir / name).exists() and not (game / name).exists():
             shutil.move(backup_dir / name, game / name)
-    ui.say(f"Removed DSF Enhanced {record.get('release', '')} (restored: {', '.join(record['replaced']) or 'nothing'})")
+    ui.say(f"Removed DSF Enhanced (restored: {', '.join(record['replaced']) or 'nothing'})")

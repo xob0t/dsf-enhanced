@@ -8,14 +8,15 @@ original bytes. uninstall restores the backup the same way. With the default
 work folder, install then deletes the build files (about 1 GB): uninstall only
 needs the backup.
 
-Before building, install puts DSF Enhanced into the game when it lacks the
-plugin's [Limits] fixes (see plugin.py); uninstall takes the plugin back out if
-install put it there.
+Before building, install puts DSF Enhanced (from --plugin, the release ZIP's
+plugin folder) into the game when it lacks the plugin's [Limits] fixes (see
+plugin.py); uninstall takes the plugin back out if install put it there.
 """
 
 from __future__ import annotations
 
 import json
+import os
 import shutil
 import subprocess
 import sys
@@ -34,7 +35,7 @@ def _manifest(cfg: Config) -> tuple[Path, dict]:
     return path, (json.loads(path.read_text()) if path.exists() else {})
 
 
-def ready(cfg: Config) -> None:
+def ready(cfg: Config, plugin_dir: Path | None = None) -> None:
     """Stop before any work if install couldn't finish; put DSF Enhanced into the game if it lacks it."""
     if not cfg.game_archive.exists():
         raise SystemExit(f"No {cfg.game_archive.name} in {cfg.game_archive.parent}: is {cfg.game_dir} the game folder?")
@@ -48,7 +49,7 @@ def ready(cfg: Config) -> None:
         return
     path, manifest = _manifest(cfg)
     try:
-        plugin.install(game, path.parent, manifest)
+        plugin.install(game, path.parent, manifest, plugin_dir)
     finally:
         if manifest:
             path.parent.mkdir(exist_ok=True)
@@ -112,23 +113,31 @@ def install(cfg: Config) -> None:
     if not cfg.data["run"]["work_dir"]:  # the default work folder: a one-time run leaves nothing behind
         shutil.rmtree(cfg.work_dir / "bake", ignore_errors=True)
         shutil.rmtree(packed.parent, ignore_errors=True)
-    ui.say(f"Installed into {cfg.game_dir}. `worldlod uninstall` puts the original back.")
+    undo = "install.cmd --uninstall" if os.environ.get("WORLDLOD_LAUNCHER") else "worldlod uninstall"
+    ui.say(f"Installed into {cfg.game_dir}. `{undo}` puts the original back.")
 
 
 def uninstall(cfg: Config) -> None:
+    """Put the original map back and take out the DSF Enhanced install added, whichever there is."""
     target, backup, manifest_path = _paths(cfg)
-    if not backup.exists():
-        raise SystemExit(f"no backup at {backup}: nothing to restore")
+    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
+    if not backup.exists() and "plugin" not in manifest:
+        raise SystemExit(f"Nothing to undo: worldlod hasn't installed anything into {cfg.game_dir}")
     if _game_running():
         raise SystemExit("Driver.exe is running: close the game first")
-    manifest = json.loads(manifest_path.read_text()) if manifest_path.exists() else {}
-    if manifest.get("original") and sha256(backup) != manifest["original"]:
-        raise SystemExit(f"{backup} doesn't match its recorded hash; not restoring")
-    if target.exists() and sha256(target) not in (manifest.get("installed"), manifest.get("original")):
-        raise SystemExit(f"{target} isn't the build worldlod installed (another mod?); not overwriting it")
-    with ui.status(f"Restoring the original {target.name}"):
-        _swap_in(backup, target)
-    manifest["installed"] = None
+    if backup.exists():
+        if manifest.get("original") and sha256(backup) != manifest["original"]:
+            raise SystemExit(f"{backup} doesn't match its recorded hash; not restoring")
+        if target.exists() and sha256(target) not in (manifest.get("installed"), manifest.get("original")):
+            raise SystemExit(f"{target} isn't the build worldlod installed (another mod?); not overwriting it")
+        with ui.status(f"Restoring the original {target.name}"):
+            _swap_in(backup, target)
+        manifest["installed"] = None
+        ui.say(f"Restored the original {target}; the backup stays in {backup.parent}")
     plugin.uninstall(cfg.game_dir, backup.parent, manifest)
-    manifest_path.write_text(json.dumps(manifest, indent=2))
-    ui.say(f"Restored the original {target}; the backup stays in {backup.parent}")
+    if backup.exists():
+        manifest_path.write_text(json.dumps(manifest, indent=2))
+    else:  # only the plugin was installed: nothing left to keep
+        manifest_path.unlink(missing_ok=True)
+        if not any(backup.parent.iterdir()):
+            backup.parent.rmdir()

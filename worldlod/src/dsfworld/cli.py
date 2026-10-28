@@ -4,6 +4,7 @@ detailed regions. Start with `worldlod install`."""
 from __future__ import annotations
 
 import argparse
+import struct
 import tomllib
 from pathlib import Path
 from typing import TYPE_CHECKING
@@ -52,11 +53,12 @@ def parser() -> argparse.ArgumentParser:
 
     ap = argparse.ArgumentParser(prog="worldlod", description=__doc__)
     sub = ap.add_subparsers(dest="command", required=True, metavar="command")
-    sub.add_parser(
+    p = sub.add_parser(
         "install",
         parents=[common, built],
         help="put DSF Enhanced into the game if it lacks it, build the new map (if needed) and install it",
     )
+    p.add_argument("--plugin", type=Path, help="folder with the DSF Enhanced to install if the game lacks it")
     sub.add_parser(
         "uninstall",
         parents=[common],
@@ -92,7 +94,10 @@ def open_world(cfg: config.Config) -> World:
     from dsfworld.world import World
 
     with ui.status(f"Reading {cfg.archive}"):
-        return World.open(cfg)
+        try:
+            return World.open(cfg)
+        except (OSError, ValueError, KeyError, struct.error) as e:
+            raise SystemExit(f"Can't read {cfg.archive} as Driver: San Francisco's world archive ({e})") from None
 
 
 def run_stage(cfg: config.Config, world: World, args: argparse.Namespace) -> None:
@@ -128,7 +133,7 @@ def main(argv: list[str] | None = None) -> None:
         install.uninstall(cfg)
         return
     if args.command == "install":
-        install.ready(cfg)  # before minutes of building
+        install.ready(cfg, args.plugin)  # before any building
     world = open_world(cfg)
     with world.archive:
         run_stage(cfg, world, args)

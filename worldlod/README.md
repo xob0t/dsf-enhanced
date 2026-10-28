@@ -11,45 +11,40 @@ it, with a backup. No game data is shipped.
 
 ## Install
 
-1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/):
+1. Download `worldlod.zip` from the
+   [latest release](https://github.com/xob0t/dsf-enhanced/releases/latest) and
+   unzip it anywhere.
+2. Close the game and double-click `install.cmd`.
 
-   ```powershell
-   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
-   ```
+The first time, it asks for the game folder (the one with `Driver.exe`) unless
+you unzipped worldlod inside it, and installs
+[uv](https://docs.astral.sh/uv/) if you don't have it (uv brings the Python
+worldlod runs on). Then it:
 
-2. Close the game, open a new PowerShell in the game folder (the one with
-   `Driver.exe`) and run:
+1. puts [DSF Enhanced](https://github.com/xob0t/dsf-enhanced) into the game if
+   it isn't there yet (from the zip's `plugin` folder; your
+   `dsf_enhanced.ini` and ASI loader stay if you have them). The new map is
+   bigger than the stock engine allows; DSF Enhanced's `[Limits]` fixes lift
+   that, without them the game crashes while loading;
+2. builds the map from your game's files (a minute or two);
+3. backs up the game's original map to `worldlod-backup` and puts the new one
+   in its place, then deletes its build files.
 
-   ```powershell
-   $tag = (irm https://api.github.com/repos/xob0t/dsf-enhanced/releases/latest).tag_name
-   uvx --from "git+https://github.com/xob0t/dsf-enhanced@$tag#subdirectory=worldlod" worldlod install
-   ```
-
-   This runs worldlod from the latest release, once; nothing stays installed.
-   The new map is bigger than the stock engine allows, so if the game doesn't
-   have [DSF Enhanced](https://github.com/xob0t/dsf-enhanced) with its
-   `[Limits]` fixes yet, worldlod puts the latest release in (keeping your
-   `dsf_enhanced.ini` and ASI loader if you have them). Then it builds the map
-   (a minute or two), puts it into the game (the original is backed up in
-   `worldlod-backup`) and deletes its build files. From another folder, add
-   `--game "C:\path\to\Driver San Francisco"`.
-
-To undo, run the same two lines with `uninstall` instead of `install`: the
-original map comes back, and DSF Enhanced goes again if worldlod put it there.
+To undo: `install.cmd --uninstall` puts the original map back, and takes DSF
+Enhanced out again if worldlod put it there.
 
 ## Options
 
 Leave things out of the map:
 
-| Flag | Leaves out |
+| Option | Leaves out |
 | --- | --- |
 | `--no-trees` | trees and bushes |
 | `--no-buildings` | building detail (the building shells stay) |
 | `--no-road-text` | painted road text |
 
-Add them to the install line, for example `... worldlod install --no-buildings`. The roads and paving are always
-in. `worldlod build` builds without installing, `--force` rebuilds everything,
-and `worldlod config` prints the settings in effect.
+For example, in a terminal in worldlod's folder: `.\install.cmd --no-buildings`.
+The roads and paving are always in. `.\install.cmd --help` lists every option.
 
 A build runs at idle priority, so the PC stays usable meanwhile. Its files
 (about 1 GB, in `%LOCALAPPDATA%\worldlod`) are deleted once it is installed.
@@ -57,8 +52,8 @@ A build runs at idle priority, so the PC stays usable meanwhile. Its files
 ## Settings
 
 Everything else is in [src/dsfworld/default.toml](src/dsfworld/default.toml),
-with a comment per setting. To change one, put it in a `worldlod.toml` in the
-folder you run worldlod from, or pass `--config <file>`:
+with a comment per setting. To change one, put it in a file and pass it with
+`--config <file>`:
 
 ```toml
 [bake]
@@ -72,6 +67,9 @@ Tables keyed by class name (`[classes]`, `min_model_size`) replace the default
 table as a whole.
 
 ## Commands
+
+`install.cmd` runs `worldlod install` (or `uninstall`). From a checkout of this
+repository, `uv run worldlod <command>` runs any of them:
 
 | Command | Does |
 | --- | --- |
@@ -111,3 +109,8 @@ uv run pytest
 uv run ruff check --fix
 uv run ruff format
 ```
+
+The repository's `build.ps1` also makes the release's `dist\worldlod.zip`
+(`release\package.ps1`): `install.cmd`, the launcher (`release\launcher.ps1`),
+this package with its `uv.lock` in `app\`, and the DSF Enhanced just built in
+`plugin\`.
