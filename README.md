@@ -19,7 +19,7 @@ An ASI plugin for Driver: San Francisco on PC. Target exe version 1.04
 [worldlod](worldlod/README.md) is a Python pipeline that rebuilds the city model the game draws at the upper Shift levels from the game's own detailed regions: real roads, paving, trees and building detail instead of the coarse low-poly city. It reads your `san_francisco.dngc` and writes a new one (no game data is shipped), and needs this plugin's `[Limits]` fixes to load. With DSF Enhanced and [uv](https://docs.astral.sh/uv/) installed, run in the game folder (nothing stays installed):
 
 ```powershell
-uvx --from "git+https://github.com/xob0t/dsf_enhanced#subdirectory=worldlod" worldlod install
+uvx --from "git+https://github.com/xob0t/dsf-enhanced#subdirectory=worldlod" worldlod install
 ```
 
 ## Install

@@ -11,7 +11,7 @@ it, with a backup. No game data is shipped.
 
 ## Install
 
-1. Install [DSF Enhanced](https://github.com/xob0t/dsf_enhanced/releases)
+1. Install [DSF Enhanced](https://github.com/xob0t/dsf-enhanced/releases)
    (version with `[Limits]` in its ini). The new map is bigger than the stock
    engine allows; without DSF Enhanced the game crashes while loading it.
 2. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
@@ -19,7 +19,7 @@ it, with a backup. No game data is shipped.
    `Driver.exe`) and run:
 
    ```powershell
-   uvx --from "git+https://github.com/xob0t/dsf_enhanced#subdirectory=worldlod" worldlod install
+   uvx --from "git+https://github.com/xob0t/dsf-enhanced#subdirectory=worldlod" worldlod install
    ```
 
    uvx fetches worldlod and runs it once; nothing stays installed. The build

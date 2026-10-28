@@ -28,7 +28,7 @@ from dsfworld.stages.pack import check, sha256
 
 MANIFEST = "manifest.json"
 PLUGIN = "dsf_enhanced.asi"
-PLUGIN_URL = "https://github.com/xob0t/dsf_enhanced/releases"
+PLUGIN_URL = "https://github.com/xob0t/dsf-enhanced/releases"
 # [Limits] keys of DSF Enhanced the build needs, and the value at or below which each is off
 LIMITS = {"ResourceArenaExtraNodes": 0, "PendingResourceReferences": 16384, "SubmodelTableExtraNodes": 0}
 
