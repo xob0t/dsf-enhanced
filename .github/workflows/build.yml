@@ -1,0 +1,69 @@
+# Builds DSF Enhanced and worldlod and tests both on every pull request and push to main; a pushed
+# tag like v1.2.0 also publishes the GitHub release for it with both ZIPs.
+name: build
+
+on:
+  pull_request:
+  push:
+    branches: [main]
+    tags: ["v*"]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  build:
+    runs-on: windows-2022  # Visual Studio 2022 with the x86 C++ tools, as build.ps1 needs
+    defaults:
+      run:
+        shell: pwsh
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: astral-sh/setup-uv@v6
+        with:
+          version: "0.13.5"
+
+      - name: worldlod tests and lint
+        working-directory: worldlod
+        run: |
+          uv run --frozen ruff check
+          uv run --frozen ruff format --check
+          uv run --frozen pytest
+
+      - name: Build the plugin and both ZIPs
+        run: ./build.ps1
+
+      - name: Name the ZIPs after the version
+        id: version
+        run: |
+          $version = if ($env:GITHUB_REF_TYPE -eq 'tag') { $env:GITHUB_REF_NAME } else { "dev-$($env:GITHUB_SHA.Substring(0, 7))" }
+          Rename-Item dist/DSF-Enhanced.zip "DSF-Enhanced-$version.zip"
+          Rename-Item dist/worldlod.zip "worldlod-$version.zip"
+          "version=$version" >> $env:GITHUB_OUTPUT
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: release-${{ steps.version.outputs.version }}
+          path: |
+            dist/DSF-Enhanced-*.zip
+            dist/worldlod-*.zip
+
+  release:
+    if: github.ref_type == 'tag'
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - uses: actions/download-artifact@v4
+        with:
+          name: release-${{ github.ref_name }}
+          path: dist
+      - name: Publish the release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: >-
+          gh release create "${{ github.ref_name }}" dist/*.zip
+          --repo "${{ github.repository }}" --title "${{ github.ref_name }}" --generate-notes --verify-tag

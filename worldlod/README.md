@@ -11,7 +11,7 @@ it, with a backup. No game data is shipped.
 
 ## Install
 
-1. Download `worldlod.zip` from the
+1. Download `worldlod-<version>.zip` from the
    [latest release](https://github.com/xob0t/dsf-enhanced/releases/latest) and
    unzip it anywhere.
 2. Close the game and double-click `install.cmd`.
@@ -122,4 +122,6 @@ uv run ruff format
 The repository's `build.ps1` also makes the release's `dist\worldlod.zip`
 (`release\package.ps1`): `install.cmd`, the launcher (`release\launcher.ps1`),
 this package with its `uv.lock` in `app\`, and the DSF Enhanced just built in
-`plugin\`.
+`plugin\`. GitHub Actions builds and tests it with the rest of the
+repository and attaches it to each release as `worldlod-<version>.zip` (see the
+repository README's Releases section).

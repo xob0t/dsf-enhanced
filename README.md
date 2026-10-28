@@ -3,10 +3,10 @@
 Improvements for Driver: San Francisco on PC (exe version 1.04), in two parts.
 Each release has a ZIP for each:
 
-- **DSF Enhanced** (`DSF-Enhanced.zip`): an ASI plugin that fixes ultrawide
+- **DSF Enhanced** (`DSF-Enhanced-<version>.zip`): an ASI plugin that fixes ultrawide
   and cinematics, adds borderless mode and better filtering, raises detail and
   traffic, and lifts engine limits.
-- **worldlod** (`worldlod.zip`): a high-detail map for the upper Shift levels,
+- **worldlod** (`worldlod-<version>.zip`): a high-detail map for the upper Shift levels,
   built from your own copy of the game. It brings DSF Enhanced along.
 
 ## DSF Enhanced
@@ -23,7 +23,7 @@ Each release has a ZIP for each:
 
 ### Install
 
-Copy three files from `DSF-Enhanced.zip` into the game folder, next to `Driver.exe`:
+Copy three files from `DSF-Enhanced-<version>.zip` into the game folder, next to `Driver.exe`:
 
 - `winmm.dll` (Ultimate ASI Loader)
 - `dsf_enhanced.asi`
@@ -47,7 +47,7 @@ When you Shift up, the game draws one low-detail model of the whole city: flat g
 
 ### Install
 
-1. Download `worldlod.zip` from the [latest release](https://github.com/xob0t/dsf-enhanced/releases/latest) and unzip it anywhere.
+1. Download `worldlod-<version>.zip` from the [latest release](https://github.com/xob0t/dsf-enhanced/releases/latest) and unzip it anywhere.
 2. Close the game and double-click `install.cmd`.
 
 The first time, it asks for the game folder and installs [uv](https://docs.astral.sh/uv/), which brings the Python worldlod runs on. It puts DSF Enhanced into the game if it isn't there, because the bigger map needs its `[Limits]` fixes. Then it builds the map (a minute or two) and installs it. `install.cmd --uninstall` puts the original map back and removes the DSF Enhanced files it added; the backup of the original map stays in the game's `worldlod-backup` folder. Options (`--no-trees`, `--no-buildings`, `--no-road-text`) and how it works are in [worldlod/README.md](worldlod/README.md).
@@ -69,6 +69,17 @@ This writes the plugin files, this README, the license, `DSF-Enhanced.zip` and `
 ```
 
 `install.ps1` runs the build first if `dist/` is missing any files. worldlod's own development setup (uv, tests, ruff) is in [worldlod/README.md](worldlod/README.md).
+
+## Releases
+
+GitHub Actions ([.github/workflows/build.yml](.github/workflows/build.yml)) runs worldlod's tests and lint and `build.ps1` on every pull request and push to `main`, and keeps both ZIPs as the run's artifacts. To release, push a version tag:
+
+```powershell
+git tag v1.2.0
+git push origin v1.2.0
+```
+
+The workflow then builds that tag and publishes the GitHub release with `DSF-Enhanced-v1.2.0.zip` and `worldlod-v1.2.0.zip` and generated release notes.
 
 ## Repository layout
 
