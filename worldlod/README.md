@@ -12,7 +12,7 @@ around the camera. This pipeline reads those regions from the player's own
 With the default settings it replaces each cell's stock low-poly terrain with
 the detailed regions' ground (simplified; the stock terrain fills what it
 doesn't cover), trees and bushes, building detail (storefronts, rooftop units,
-fire escapes, containers) and painted road text: 7.6M triangles in 408 cells,
+fire escapes, containers) and painted road text: 7.6M triangles in 420 cells,
 239 MB of vertex and index data. Tested in game (Shift, driving).
 
 The bigger base LOD needs DSF Enhanced's `[Limits]` fixes (on by default): the

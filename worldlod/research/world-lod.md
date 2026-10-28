@@ -239,9 +239,10 @@ container yards, whose detail uses the same low-poly terrain material; they keep
 the stock part. The 112 cells without a terrain part hold 2,784 ground
 triangles in all (sea edge and the map border).
 
-Result of the default settings: 284 parts replaced, 7,480 submodels, 1,572,683
-triangles, 42.4 MB of buffers in 23 new DRSP groups; the archive grows from
-532 MB to 576 MB. `pack --verify` re-reads it and finds every reference intact,
+Result of the first bake (ground only, not simplified, no fill; 2026-10-28,
+since superseded): 284 parts replaced, 7,480 submodels, 1,572,683 triangles,
+42.4 MB of buffers in 23 new DRSP groups; the archive grew from 532 MB to
+576 MB. `pack --verify` re-reads it and finds every reference intact,
 and a preview of the packed archive drew the new ground under the stock building
 shells.
 
@@ -257,8 +258,9 @@ shells.
   win, which is safer if the base turns out to draw in gameplay too.
 - What the per-cell binding (lightmap) does for a distant cell with the
   detailed ground materials.
-- Memory: GEGR is resident in gameplay too; the bake adds 42 MB of managed
-  buffers to a 32-bit process.
+- Memory: GEGR is resident in gameplay too; that first bake added 42 MB of
+  managed buffers to a 32-bit process (the current default adds 239 MB; see
+  the submodel table note below for the peak).
 
 ## When the base is drawn (runtime, user observation)
 
@@ -296,9 +298,14 @@ same inside and outside the loaded area.
   `meshoptimizer` 0.2.30a0 doesn't declare ctypes argtypes for
   `meshopt_simplifyWithAttributes`; `dsfworld/simplify.py` declares them.
 
-Default result: 403 parts replaced, 7,995 submodels, 1,049,811 triangles
-(931k baked ground and 118k stock fill; 1.57M before simplification), 30.6 MB of
-buffers in 20 DRSP groups.
+Result with these fixes (ground only; 2026-10-28, since superseded): 403 parts
+replaced, 7,995 submodels, 1,049,811 triangles (931k baked ground and 118k stock
+fill; 1.57M before simplification), 30.6 MB of buffers in 20 DRSP groups.
+
+Current default (ground, trees, building detail and road text; a cell that
+bakes no ground keeps all its stock terrain in place, so every one of the 420
+terrain parts is replaced): 420 parts, 14,426 submodels, 7,638,372 triangles,
+32 cloned materials, 239 MB of buffers in 116 new DRSP groups.
 
 ## Trees and building detail (2026-10-28)
 
