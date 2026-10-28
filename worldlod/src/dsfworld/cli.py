@@ -115,7 +115,7 @@ def run_stage(cfg: config.Config, world: World, args: argparse.Namespace) -> Non
         "info": lambda: info.run(world),
         "bake": lambda: bake.run(cfg, world, force=args.force),
         "build": lambda: pack.run(cfg, world, force=args.force),
-        "install": lambda: pack.run(cfg, world, force=args.force),
+        "install": lambda: pack.run(cfg, world, force=args.force, show_file=False),
     }
     stages[args.command]()
 

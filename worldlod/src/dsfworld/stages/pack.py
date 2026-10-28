@@ -119,7 +119,7 @@ def build_key(cfg: Config, world: World) -> str:
     return f"{code_digest()}:{cfg.digest(*bake.SECTIONS)}:{source.name}:{source.stat().st_size}"
 
 
-def run(cfg: Config, world: World, *, force: bool = False) -> Path:
+def run(cfg: Config, world: World, *, force: bool = False, show_file: bool = True) -> Path:
     """Bake, write the world archive with the baked cells in GEGR, and check it. Nothing to do when the
     archive was built with the same code, settings and source (unless force)."""
     out = cfg.packed_archive
@@ -163,5 +163,6 @@ def run(cfg: Config, world: World, *, force: bool = False) -> Path:
     ui.done("Checked: every reference resolves and fits the streamer")
     stamp.write_text(key)
     minutes, seconds = divmod(round(time.monotonic() - started), 60)
-    ui.summary("New upper-Shift map", [*rows, ("File", str(out))], footer=f"built in {minutes}:{seconds:02d}")
+    file = [("File", str(out))] if show_file else []  # install copies it into the game and deletes it
+    ui.summary("New upper-Shift map", [*rows, *file], footer=f"built in {minutes}:{seconds:02d}")
     return out
