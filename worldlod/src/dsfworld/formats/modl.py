@@ -21,9 +21,21 @@ import numpy as np
 
 from dsfworld.formats.archive import Archive, SubModel, kid, walk
 
-POSITION_SCALE = 1 / 64
+# VDCL element semantics
+POSITION = 0
+NORMAL = 5  # also the pivot of leaf-card trees (see dsfworld.bake)
+UV0 = 8
+UV1 = 9
+COLOUR = 19
+# VDCL element types
+INT16 = 1
+UBYTE4 = 6
+FLOAT16 = 8
+FLOAT32 = 9
+
+POSITION_SCALE = 1 / 64  # metres per unit of an int16 position
 # VDCL element type -> numpy dtype of one component
-DTYPES = {1: "<i2", 2: "u1", 6: "u1", 8: "<f2", 9: "<f4"}
+DTYPES = {INT16: "<i2", 2: "u1", UBYTE4: "u1", FLOAT16: "<f2", FLOAT32: "<f4"}
 
 
 @dataclass
@@ -133,16 +145,14 @@ def build_modl(parts: list[Part]) -> bytes:
     return bytes(out + uids + flags)
 
 
-def load(a: Archive, res, lib: Library | None = None, *, geometry: bool = True) -> Library:
-    """Add one resource's parts and submodels (and, with geometry, its buffers) to lib."""
+def load(a: Archive, res, lib: Library | None = None) -> Library:
+    """Add one resource's parts, submodels and buffers to lib."""
     lib = lib if lib is not None else Library()
     modl = a.nonr(res, "MODL")
     for p in parse_modl(modl) if modl else []:
         lib.parts[p.uid] = p
     for s in a.submodels(res):
         lib.submodels[s.uid] = s
-    if not geometry:
-        return lib
     for v in walk(res, "VXCK"):
         uid, n, stride = struct.unpack_from("<QII", a.read(kid(v, "VXHD")))
         decl = a.read(kid(v, "VDCL"))
@@ -158,12 +168,18 @@ def load(a: Archive, res, lib: Library | None = None, *, geometry: bool = True) 
     return lib
 
 
-def submodel_uv(lib: Library, sub: SubModel) -> np.ndarray:
-    """First UV set (semantic 8) of a submodel's vertices, in submodel_geometry's vertex order; zeros if none."""
-    vb = lib.vbs[sub.vb]
+def submodel_indices(lib: Library, sub: SubModel) -> tuple[np.ndarray, np.ndarray]:
+    """The vertices a submodel draws (sorted indices into its vertex buffer) and its triangles (M x 3) as
+    indices into those."""
     idx = lib.ibs[sub.ib][sub.first_index : sub.first_index + sub.index_count].astype(np.int64) + sub.base_vertex
-    used = np.unique(idx)
-    uv = vb.attribute(8)
+    used, tri = np.unique(idx, return_inverse=True)
+    return used, tri.reshape(-1, 3)
+
+
+def submodel_uv(lib: Library, sub: SubModel) -> np.ndarray:
+    """First UV set of a submodel's vertices, in submodel_geometry's vertex order; zeros if none."""
+    used, _ = submodel_indices(lib, sub)
+    uv = lib.vbs[sub.vb].attribute(UV0)
     if uv is None:
         return np.zeros((len(used), 2))
     return uv[used, :2].astype(np.float64)
@@ -171,11 +187,9 @@ def submodel_uv(lib: Library, sub: SubModel) -> np.ndarray:
 
 def submodel_geometry(lib: Library, sub: SubModel) -> tuple[np.ndarray, np.ndarray]:
     """Local-space positions (N x 3, metres) and triangles (M x 3) of one submodel."""
-    vb = lib.vbs[sub.vb]
-    idx = lib.ibs[sub.ib][sub.first_index : sub.first_index + sub.index_count].astype(np.int64) + sub.base_vertex
-    pos = vb.attribute(0)
-    used, tri = np.unique(idx, return_inverse=True)
+    used, tri = submodel_indices(lib, sub)
+    pos = lib.vbs[sub.vb].attribute(POSITION)
     p = pos[used, :3].astype(np.float64)
     if pos.dtype.kind == "i":
         p *= POSITION_SCALE
-    return p, tri.reshape(-1, 3)
+    return p, tri

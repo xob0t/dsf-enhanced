@@ -16,9 +16,8 @@ from __future__ import annotations
 
 import numpy as np
 
-from dsfworld.bake import NORMAL, UBYTE4, Group, position_slot, read_positions
-
-COLOUR = 19
+from dsfworld.bake import Group, positions, read_normals
+from dsfworld.formats.modl import COLOUR, NORMAL, UBYTE4
 
 
 def _meshoptimizer():
@@ -59,16 +58,15 @@ def cell(
     if error <= 0 or not groups:
         return groups
     mo = _meshoptimizer()
-    positions, attributes, indices, bases = [], [], [], []
+    points, attributes, indices, bases = [], [], [], []
     base = 0
     for g in groups:
         sems = {e[0]: e for e in g.elements}
-        positions.append(read_positions(g.vertices, position_slot(g.elements)).astype(np.float32))
+        points.append(positions(g).astype(np.float32))
         a = np.zeros((len(g.vertices), 7), np.float32)
         a[:, 3:] = 1
         if NORMAL in sems and sems[NORMAL][2] == UBYTE4:
-            o = sems[NORMAL][3]
-            a[:, :3] = g.vertices[:, o : o + 3].astype(np.float32) / 255 * 2 - 1
+            a[:, :3] = read_normals(g.vertices, sems[NORMAL], np.float32)  # float64 rounds a few apart
         if COLOUR in sems and sems[COLOUR][2] == UBYTE4:
             o = sems[COLOUR][3]
             a[:, 3:] = g.vertices[:, o : o + 4].astype(np.float32) / 255
@@ -83,7 +81,7 @@ def cell(
     n = mo.simplify_with_attributes(
         out,
         index,
-        np.ascontiguousarray(np.vstack(positions)),
+        np.ascontiguousarray(np.vstack(points)),
         np.ascontiguousarray(np.vstack(attributes)),
         np.array([normal_weight] * 3 + [colour_weight] * 4, np.float32),
         target_index_count=3,

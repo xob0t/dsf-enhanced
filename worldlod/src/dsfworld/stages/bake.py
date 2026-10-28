@@ -16,6 +16,7 @@ import numpy as np
 
 from dsfworld import bake, simplify
 from dsfworld.config import Config
+from dsfworld.formats.modl import POSITION, UV0
 from dsfworld.gegr import CellBake
 from dsfworld.world import World
 
@@ -57,7 +58,7 @@ def card_template(world: World, path: str) -> bake.CardTemplate:
                     continue
                 vb = lib.vbs[sub.vb]
                 sems = {e[0]: e for e in vb.elements}
-                if bake.POSITION in sems and 8 in sems and bake.position_slot(vb.elements) == sems[bake.POSITION]:
+                if POSITION in sems and UV0 in sems and bake.position_slot(vb.elements) == sems[POSITION]:
                     return bake.CardTemplate(uid, flag, vb.stride, tuple(vb.elements), vb.decl)
     raise SystemExit(f"[bake] leaf_card_material: no GEGR submodel draws {path!r} with a position and UV")
 

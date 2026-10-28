@@ -33,18 +33,14 @@ import numpy as np
 
 from dsfworld.formats import gebi, modl
 from dsfworld.formats.archive import SubModel
+from dsfworld.formats.modl import COLOUR, FLOAT16, FLOAT32, INT16, NORMAL, POSITION, POSITION_SCALE, UBYTE4, UV0, UV1
 from dsfworld.world import World
 
 MAX_VERTICES = 0xFFFF
-POSITION = 0
-NORMAL = 5
-# Semantics copied as stored: UV sets (8, 9) and vertex colour (19).
-COPIED = {8, 9, 19}
-INT16 = 1
-UBYTE4 = 6
-FLOAT16 = 8
+# Semantics copied as stored: UV sets and vertex colour.
+COPIED = {UV0, UV1, COLOUR}
 # VDCL type -> (numpy dtype, metres per stored unit) of positions
-POSITION_TYPES = {INT16: ("<i2", 1 / 64), FLOAT16: ("<f2", 1.0), 9: ("<f4", 1.0)}
+POSITION_TYPES = {INT16: ("<i2", POSITION_SCALE), FLOAT16: ("<f2", 1.0), FLOAT32: ("<f4", 1.0)}
 
 
 def _span(element) -> tuple[int, str, int]:
@@ -74,11 +70,12 @@ def write_positions(rows: np.ndarray, element, p: np.ndarray) -> bool:
     return True
 
 
-def read_normals(rows: np.ndarray, element) -> np.ndarray:
+def read_normals(rows: np.ndarray, element, dtype=np.float64) -> np.ndarray:
+    """(n, 3) normals from vertex rows (n, stride), computed in dtype."""
     off = element[3]
     if element[2] == UBYTE4:
-        return rows[:, off : off + 3].astype(np.float64) / 255 * 2 - 1
-    return rows[:, off : off + 6].copy().view("<f2").astype(np.float64)
+        return rows[:, off : off + 3].astype(dtype) / 255 * 2 - 1
+    return rows[:, off : off + 6].copy().view("<f2").astype(dtype)
 
 
 def write_normals(rows: np.ndarray, element, n: np.ndarray) -> None:
@@ -216,9 +213,9 @@ class Vertices:
     decl: bytes
 
 
-def expand_cards(v: Vertices, place: Placement, cards: CardTemplate) -> np.ndarray | None:
-    """Turn leaf-card vertices into flat quad corners in the template layout, in place. None if they
-    don't fit the template's position type, else the corner positions in the target frame."""
+def expand_cards(v: Vertices, place: Placement, cards: CardTemplate) -> bool:
+    """Turn leaf-card vertices into flat quad corners in the template layout, in place; False if they
+    don't fit the template's position type."""
     data_off = next(e[3] for e in v.elements if e[0] == POSITION)
     data = v.rows[:, data_off : data_off + 8].copy().view("<f2").astype(np.float64)  # u, v, angle, size
     pivot = place.points(read_positions(v.rows, position_slot(v.elements)))
@@ -229,10 +226,10 @@ def expand_cards(v: Vertices, place: Placement, cards: CardTemplate) -> np.ndarr
     t_sems = {e[0]: e for e in cards.elements}
     p_el = t_sems[POSITION]
     if not write_positions(out, p_el, q):
-        return None
+        return False
     if p_el[2] == INT16 and p_el[1] == 4:
         out[:, p_el[3] + 6 : p_el[3] + 8] = np.frombuffer(struct.pack("<h", 64), np.uint8)  # w = 1.0
-    uv = t_sems[8]
+    uv = t_sems[UV0]
     out[:, uv[3] : uv[3] + 4] = data[:, :2].astype("<f2").view(np.uint8).reshape(len(out), 4)
     if NORMAL in t_sems:
         write_normals(out, t_sems[NORMAL], np.repeat(place.up[None], len(out), 0))
@@ -240,7 +237,7 @@ def expand_cards(v: Vertices, place: Placement, cards: CardTemplate) -> np.ndarr
             out[:, t_sems[NORMAL][3] + 3] = 255
     v.rows, v.elements, v.layout, v.decl = out, cards.elements, (cards.stride, cards.elements), cards.decl
     v.triangles = face_up(v.triangles, q, place.up)
-    return q
+    return True
 
 
 def face_up(tri: np.ndarray, q: np.ndarray, up: np.ndarray) -> np.ndarray:
@@ -256,10 +253,6 @@ def face_up(tri: np.ndarray, q: np.ndarray, up: np.ndarray) -> np.ndarray:
 class Result:
     groups: list[Group]
     skipped: Counter = field(default_factory=Counter)  # reason -> submodel placements
-
-    @property
-    def triangles(self) -> int:
-        return sum(len(g.triangles) for g in self.groups)
 
 
 def unsupported(elements: tuple) -> str | None:
@@ -295,8 +288,7 @@ def gather(lib: modl.Library, sub: SubModel, skipped: Counter) -> Vertices | Non
     if problem := unsupported(elements):
         skipped[problem] += 1
         return None
-    idx = lib.ibs[sub.ib][sub.first_index : sub.first_index + sub.index_count].astype(np.int64) + sub.base_vertex
-    used, tri = np.unique(idx, return_inverse=True)
+    used, tri = modl.submodel_indices(lib, sub)
     rows = vb.rows()[used].copy()
     if vb2 is not None:
         second = used - sub.base_vertex + sub.vb2_base
@@ -304,7 +296,7 @@ def gather(lib: modl.Library, sub: SubModel, skipped: Counter) -> Vertices | Non
             skipped["second stream range"] += 1
             return None
         rows = np.hstack([rows, vb2.rows()[second]])
-    return Vertices(rows, tri.reshape(-1, 3), elements, layout, decl)
+    return Vertices(rows, tri, elements, layout, decl)
 
 
 def move(v: Vertices, place: Placement) -> bool:
@@ -368,7 +360,7 @@ def bake_region(
             if position_slot(v.elements)[0] != NORMAL or options.leaf_cards == "keep":
                 fits = move(v, place)
             elif options.leaf_cards == "flat" and options.cards is not None:
-                fits = expand_cards(v, place, options.cards) is not None
+                fits = expand_cards(v, place, options.cards)
                 key_flag, retarget = options.cards.flag, options.cards.material
             else:
                 continue
@@ -417,9 +409,7 @@ def fill_from_stock(lib: modl.Library, stock: list[tuple[int, int]], baked: list
     for su, flag in stock:
         sub = lib.submodels[su]
         vb = lib.vbs[sub.vb]
-        idx = lib.ibs[sub.ib][sub.first_index : sub.first_index + sub.index_count].astype(np.int64) + sub.base_vertex
-        used, tri = np.unique(idx, return_inverse=True)
-        tri = tri.reshape(-1, 3)
+        used, tri = modl.submodel_indices(lib, sub)
         rows = vb.rows()[used].copy()
         p = read_positions(rows, position_slot(vb.elements))
         pts, owner = _samples(p[tri], 1 / FILL_GRID**2, rng)

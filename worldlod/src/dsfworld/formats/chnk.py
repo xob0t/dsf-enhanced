@@ -1,7 +1,7 @@
 """Read and write Driver: San Francisco CHNK containers (.sp, .dngc, .fchunk).
 
-Vendored from driversf-forza (src/dsfforza/formats/chnk.py, MIT), without its CLI,
-plus the unpadded container end that san_francisco.dngc uses (pad_end).
+Vendored from driversf-forza (src/dsfforza/formats/chnk.py, MIT), without its CLI and
+tree-walking helpers, plus the unpadded container end that san_francisco.dngc uses (pad_end).
 
 Layout, little-endian:
 
@@ -34,7 +34,6 @@ dngvehicles.sp):
 from __future__ import annotations
 
 import struct
-from collections.abc import Iterator
 from dataclasses import dataclass, field
 from typing import BinaryIO
 
@@ -62,10 +61,6 @@ class Entry:
     chunk_version: int = 3  # raw header version of a nested CHNK, LZW bit included
     payload: bytes | None = None  # replaces the source bytes of a leaf when writing
     pad_end: bool = True  # nested CHNK: total_size padded to the largest alignment
-
-    @property
-    def is_chunk(self) -> bool:
-        return self.children is not None
 
 
 @dataclass
@@ -233,50 +228,3 @@ def write_chunk(
         position = offset + size + len(entry.name_raw)
     _fill(out, position, total)
     return total
-
-
-def walk(entries: list[Entry], path: tuple[int, ...] = ()) -> Iterator[tuple[tuple[int, ...], Entry]]:
-    for index, entry in enumerate(entries):
-        here = (*path, index)
-        yield here, entry
-        if entry.children:
-            yield from walk(entry.children, here)
-
-
-def walk_collapsed(entries: list[Entry], path: tuple[int, ...] = ()) -> Iterator[tuple[tuple[int, ...], Entry, int]]:
-    """Like walk, but a run of siblings sharing tag and name yields only its first
-    member (with its subtree) plus the run length."""
-    index = 0
-    while index < len(entries):
-        entry = entries[index]
-        run = 1
-        while (
-            index + run < len(entries)
-            and entries[index + run].tag == entry.tag
-            and entries[index + run].name == entry.name
-        ):
-            run += 1
-        here = (*path, index)
-        yield here, entry, run
-        if entry.children:
-            yield from walk_collapsed(entry.children, here)
-        index += run
-
-
-def resolve(entries: list[Entry], path: str) -> Entry:
-    """Resolve a dotted index path such as ``12.0.3``."""
-    entry = None
-    for part in path.split("."):
-        if entries is None:
-            raise KeyError(f"{path}: not a container")
-        entry = entries[int(part)]
-        entries = entry.children
-    if entry is None:
-        raise KeyError(path)
-    return entry
-
-
-def describe(entry: Entry) -> str:
-    name = f" '{entry.name}'" if entry.name else ""
-    kind = f"[{len(entry.children)}]" if entry.is_chunk else ""
-    return f"{entry.tag}{kind} off={entry.offset:#x} size={entry.size:#x} v{entry.version} a{entry.align_log2}{name}"
