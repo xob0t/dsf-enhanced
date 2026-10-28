@@ -150,6 +150,9 @@ hidden under resident detail is not traced yet.
 
 ## Per-region textures (static)
 
+(Decoded below, "Lightmaps": the DXT1 is the terrain lightmap, the DXT5 the
+buildings'.)
+
 Each GEIR carries up to two textures:
 
 - 528x528 DXT1 with mips (532 regions): a top-down map of the cell, red on
@@ -336,3 +339,93 @@ next to what it bakes.
   continues the pool in an extension block. With it, the VM run loaded, drove
   and Shifted; the table peaked at 15,523. Peak process memory: 1,873 MB
   virtual (ground only 1,432 MB); Driver.exe is large-address-aware.
+
+## Lightmaps (static; Driver.exe 1.04)
+
+The soft shadows, ambient occlusion and contact shadows of the detailed cells
+are per-cell lightmaps that the engine binds by name.
+
+- **Where they live.** Each region's two TEXC (above): the 528 x 528 DXT1 with
+  10 mips (186,224 bytes) is `"<cell>_TRR_lightmap"` (terrain, 531 regions),
+  the 512 x 512 DXT5 is `"<cell>_BLD_lightmap"` (buildings, 316). The cell
+  index is row * 29 + col (GEBI +0x08), which is the number in the region's
+  name. TEXC hold no name: GEGR's `NONR/UIDL` (`UidlProvider`, the only UIDL)
+  is `{u32 count, count x {u32 name hash, u64 UID}}`, 968 entries, 848 of them
+  the regions' lightmaps. The name hash is a CRC (0xBA6DE0, init ~0, no final
+  xor) with a non-standard table at 0xE97C20; 952 of the 968 hashes match
+  `"%d_TRR_lightmap"`/`"%d_BLD_lightmap"`, 8 of those name textures that are
+  in no region.
+- **Lookup.** FUN_006BDB50 fills 0x123FE88 (TRR) and 0x1240BB0 (BLD) with the
+  841 name hashes of each kind. FUN_004945F0 (thiscall on `[engine + 0x198]`,
+  the UIDL registry; hash buckets at provider +0xE110, 0x96B of them) returns
+  the UID or ~0. FUN_00BA9FD0 binds a texture parameter by UID and queues it
+  for resolving; an unloaded UID resolves to null (FUN_006BDCA0 ->
+  FUN_00BAE770 -> 0xBAEE00, the resource manager 0x1732BF0's UID hash).
+- **Binding.** FUN_006BD740(cell) builds a two-entry command list (from the
+  per-frame allocator FUN_00BA96B0): `g_vLightMapOffsetScale` (0x7011EF1B,
+  table 0xF404AC) and the lightmap texture (0x9C8DB674, 0xF404B4), gated on
+  0x123FE00. The offset-scale is FUN_00564420 of (X0, Z0, 1/600, 1/600):
+  (s, s, -s X0, -s Z0) with X0 = (col - 14) * 512 + 300, Z0 = (14 - row) * 512
+  - 300 (constants 0xDD6454/0xDD6450/0xDD644C, set by FUN_00D69470). The
+  shaders (Uber2_0 VertexShader.hlsl line 7) take `world.xz * scale + offset`:
+  one top-down map of the 600 m around the cell centre, wrapping in u. It
+  matches the cells' building footprints offline (R_360, R_208: the green
+  channel's correlation with roofs is -0.18 and -0.13 with the engine's
+  mapping, about 0 when flipped or transposed, best within 4 m).
+- **What it does.** The pixel shader (far technique of `terrain/terr_alley_tile`)
+  scales the ambient light by the red channel and the sun by
+  saturate(2 * green): red is ambient occlusion, green the sun's shadow. Under
+  buildings and trees both are low.
+- **Who gets it.** FUN_006BA750 (from ShiftSector_EmitDrawMetadata 0x6BB1A0)
+  returns the binding per placed model. It returns nothing for the far
+  technique 0xF59DDF6D, first thing. Otherwise, part trailer (+0x5C) bit 4
+  goes through ShiftMaterialBinding_CacheLookup (0x6BDA10, cache per cell and
+  frame at 0x12418D8) to FUN_006BD740, but only if the cell is resident
+  (world +0x347E8 list); bit 8 (FUN_006BDA80 -> 0x6BDE50 -> 0x6BCB20) binds
+  the instance's own UID (render state +0x21C00, which ShiftSector_BuildRenderState
+  fills with the TRR lightmap UID of the instance's cell) without an
+  offset-scale; bit 0x20 the default (0x6BCB80). The instance's cell
+  (+0x1E7B0) comes from its position (0x6B77E0): col = int(x / 512 + 14.5),
+  row = int(14.5 - z / 512).
+- **So the base LOD is never lit.** Base terrain instances (GEBI flags 1)
+  always draw with the far technique, and non-resident cells have no texture
+  to bind. Every baked material but the leaf cards samples the lightmap in
+  its far technique, so they draw the default lightmap: fully lit.
+
+What worldlod and DSF Enhanced do (`[lightmaps] enabled`, `[Quality]
+DistantLightmaps`):
+
+- worldlod copies the terrain lightmap of every cell that holds a placed base
+  part with trailer bit 4 into GEGR, byte for byte under a new UID, and points
+  the cell's UIDL name at the copy (`dsfworld/lightmaps.py`). GEGR is always
+  resident, so the name finds a loaded texture for every cell; detail draws in
+  gameplay bind the same pixels as before (the regions' own copies go unused).
+  With the default bake that is 420 cells (408 baked plus stock trailer-5
+  terrain), 78 MB: the archive grows from 775 MB to 853 MB and GEGR's MDXN
+  budget from 332 MB to 410 MB. `pack` checks that UIDL names only GEGR
+  copies for the lit cells; the engine's own name hash finds a GEGR copy with
+  the region's pixels for all 420 (the other 8 lit cells' names point at
+  textures the archive lacks).
+- DSF Enhanced replaces FUN_006BA750's far-technique return (0x6BA75E, `xor
+  eax,eax; pop ebx; pop ecx; ret`) with a jump: for a part with trailer bit 4
+  whose cell's TRR name resolves to a loaded texture (0xBAEE00), it returns
+  FUN_006BD740's list, otherwise 0 as before. With the stock archive that
+  lights the far draws of the resident cells only.
+- **The list must come from the locked allocator.** FUN_006BD740 (and
+  ShiftMaterialBinding_CacheLookup over it) take their memory from
+  FUN_00BA96B0, a bump of `[0x19B0CC4] + 0x10` without a lock. The base
+  LOD's far draws are prepared on several job threads (EmitDrawMetadata's own
+  lists come from FUN_006BA610 -> FUN_006BA550, `lock cmpxchg`), and both a
+  cached and a direct FUN_006BD740 crashed the game 3 s into Story mode
+  (`runtime`, VM: render jobs at 0xBC6ECF/0xBC6EF3 and 0xBC32AA read lists
+  holding a parameter hash and a type code). DSF Enhanced builds the same
+  two entries in a FUN_006BA610(2, 0) list: the float4 (type 3, handle at
+  0xF404AC) and the texture through FUN_00BA9FD0 (handle at 0xF404B4).
+  EmitDrawMetadata copies it into persistent memory itself when it caches a
+  draw. With that it loads, Shifts and drives (`runtime`, VM 1,
+  vm1-20261028-143351).
+- Smaller copies (a mip dropped: 264 x 264, 46.6 KB, 20 MB for 420 cells)
+  would also lower the lightmaps of the detail in gameplay, since both look up
+  the same name. Keeping gameplay intact at that size needs the far draws to
+  find the copies under names of their own (more UIDL entries and a lookup of
+  its own in DSF Enhanced).

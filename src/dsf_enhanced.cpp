@@ -86,6 +86,30 @@ constexpr DWORD kSubmodelOwnerRva = 0x015BBA74;
 constexpr DWORD kSubmodelNodeAllocCallRva = 0x007BBE9B;  // call 0x8CCAA0 in the table's insert
 constexpr DWORD kPoolAllocRva = 0x004CCAA0;
 constexpr DWORD kSubmodelTableOffset = 0x30;
+// Per-cell terrain lightmaps. FUN_006BA750 (0x6BA750) returns the lighting binding of a placed model:
+// with part trailer bit 4 it calls ShiftMaterialBinding_CacheLookup (0x6BDA10), which (while the
+// cell's region is resident) builds FUN_006BD740's command list: g_vLightMapOffsetScale from the
+// cell's grid position and the texture named "<cell>_TRR_lightmap" (name hashes at 0x123FE88, UIDL
+// registry lookup 0x4945F0). For the far technique 0xF59DDF6D it returns 0 at once, and the base LOD
+// (upper Shift) always draws with it, so the base draws the default lightmap everywhere.
+constexpr DWORD kFarLightmapReturnRva = 0x002BA75E;      // xor eax,eax; pop ebx; pop ecx; ret
+// FUN_006BD740 builds that list in memory from FUN_00BA96B0, a bump allocator without a lock: fine for
+// the few resident cells, but the base LOD's far draws are prepared on several job threads at once,
+// and lists built there overlapped (the game faulted reading them, in-game 2026-10-28). So the patch
+// builds the same list with FUN_006BA610, the locked allocator EmitDrawMetadata's own lists use.
+constexpr DWORD kCommandListNewRva = 0x002BA610;         // cdecl (entries, persistent) -> list
+constexpr DWORD kCommandListSetTextureRva = 0x007A9FD0;  // thiscall (list, const u32* param, const u64* uid)
+constexpr DWORD kLightmapOffsetScaleParamRva = 0x00B404AC; // u32 parameter handle, g_vLightMapOffsetScale
+constexpr DWORD kLightmapTextureParamRva = 0x00B404B4;   // u32 parameter handle, the lightmap texture
+constexpr DWORD kLightmapOriginRva = 0x00E3FE78;         // float x, z, scale x, scale z (FUN_00D69470)
+constexpr DWORD kCellSizeRva = 0x00A18464;               // float 512
+constexpr DWORD kUidlLookupRva = 0x000945F0;             // thiscall (registry, const u32* name hash) -> u64 UID or ~0
+constexpr DWORD kTerrainLightmapNamesRva = 0x00E3FE88;   // u32[841]
+constexpr DWORD kTerrainLightmapsOnRva = 0x00E3FE00;     // u8, set by FUN_006BCA40
+constexpr DWORD kResourceFindRva = 0x007AEE00;           // thiscall (manager, uid low, uid high) -> slot or null
+constexpr DWORD kEngineRegistryOffset = 0x198;           // engine -> UIDL registry
+constexpr DWORD kLitPartBit = 4;                         // MODL part trailer (+0x5C)
+constexpr DWORD kLightmapCells = 841;                    // 29 x 29
 constexpr DWORD kPendingPtrsRva = 0x0145A6B8;
 constexpr DWORD kPendingPairsRva = 0x0146A6B8;
 constexpr int kPendingStockCapacity = 16384;
@@ -243,6 +267,8 @@ void* g_arena_bump_continue = nullptr;
 DWORD g_arena_extension_logged_nodes = 0;
 int g_pending_reference_capacity = 131072;
 int g_submodel_table_extra_nodes = 60000;
+bool g_distant_lightmaps = true;
+std::uint8_t* g_lightmap_exe = nullptr;
 std::uint8_t* g_submodel_extension_begin = nullptr;
 std::uint8_t* g_submodel_extension_end = nullptr;
 void* g_submodel_pool_alloc = nullptr;
@@ -438,6 +464,7 @@ void LoadConfig()
         ClampInt(GetPrivateProfileIntA("Limits", "PendingResourceReferences", 131072, ini_path), 0, 4194304);
     g_submodel_table_extra_nodes =
         ClampInt(GetPrivateProfileIntA("Limits", "SubmodelTableExtraNodes", 60000, ini_path), 0, 2000000);
+    g_distant_lightmaps = GetPrivateProfileIntA("Quality", "DistantLightmaps", 1, ini_path) != 0;
     LoadFlareConfig(ini_path);
 }
 
@@ -2501,6 +2528,102 @@ void ApplySubmodelTablePatch(const ModuleRange& range)
     );
 }
 
+// Far draws of a lit part (trailer bit 4) get the cell's lightmap binding too, when the texture the
+// cell's name finds is loaded: with a worldlod archive that carries the lightmaps in GEGR, for every
+// cell; with the stock archive, for the resident cells only. Otherwise no binding, as before.
+using UidlLookupFn = unsigned long long(__thiscall*)(void* registry, const DWORD* name_hash);
+using ResourceFindFn = void*(__thiscall*)(void* manager, DWORD uid_low, DWORD uid_high);
+using CommandListNewFn = std::uint8_t*(__cdecl*)(DWORD entries, DWORD persistent);
+using CommandListSetTextureFn = void(__thiscall*)(void* list, const DWORD* param, const unsigned long long* uid);
+
+DWORD __cdecl FarLightmapBinding(DWORD cell, const std::uint8_t* part)
+{
+    cell &= 0xFFFF;
+    if (part == nullptr || (*reinterpret_cast<const DWORD*>(part + 0x5C) & kLitPartBit) == 0 ||
+        cell >= kLightmapCells || g_lightmap_exe[kTerrainLightmapsOnRva] == 0) {
+        return 0;
+    }
+    auto* engine = *reinterpret_cast<std::uint8_t**>(g_lightmap_exe + kEngineSingletonRva);
+    void* registry = engine != nullptr ? *reinterpret_cast<void**>(engine + kEngineRegistryOffset) : nullptr;
+    if (registry == nullptr) {
+        return 0;
+    }
+    const auto* names = reinterpret_cast<const DWORD*>(g_lightmap_exe + kTerrainLightmapNamesRva);
+    const unsigned long long uid = reinterpret_cast<UidlLookupFn>(g_lightmap_exe + kUidlLookupRva)(registry, &names[cell]);
+    if (uid == ~0ull) {
+        return 0;
+    }
+    const auto find = reinterpret_cast<ResourceFindFn>(g_lightmap_exe + kResourceFindRva);
+    if (find(g_lightmap_exe + kResourceManagerRva, static_cast<DWORD>(uid), static_cast<DWORD>(uid >> 32)) == nullptr) {
+        return 0;
+    }
+    // FUN_006BD740's list: g_vLightMapOffsetScale = (sx, sz, -sx * x0, -sz * z0) for the cell's corner
+    // (x0, z0) (FUN_00564420), then the texture.
+    const auto* origin = reinterpret_cast<const float*>(g_lightmap_exe + kLightmapOriginRva);
+    const float cell_size = *reinterpret_cast<const float*>(g_lightmap_exe + kCellSizeRva);
+    const float x0 = static_cast<float>(static_cast<int>(cell % 29) - 14) * cell_size + origin[0];
+    const float z0 = static_cast<float>(14 - static_cast<int>(cell / 29)) * cell_size + origin[1];
+    auto* list = reinterpret_cast<CommandListNewFn>(g_lightmap_exe + kCommandListNewRva)(2, 0);
+    if (list == nullptr) {
+        return 0;
+    }
+    auto& used = *reinterpret_cast<DWORD*>(list + 4);
+    auto* value = *reinterpret_cast<float**>(list + 8) + used * 4;
+    auto* entry = *reinterpret_cast<DWORD**>(list + 0xC) + used * 2;
+    value[0] = origin[2];
+    value[1] = origin[3];
+    value[2] = -origin[2] * x0;
+    value[3] = -origin[3] * z0;
+    entry[0] = 3;  // a float4
+    entry[1] = *reinterpret_cast<const DWORD*>(g_lightmap_exe + kLightmapOffsetScaleParamRva);
+    ++used;
+    reinterpret_cast<CommandListSetTextureFn>(g_lightmap_exe + kCommandListSetTextureRva)(
+        list, reinterpret_cast<const DWORD*>(g_lightmap_exe + kLightmapTextureParamRva), &uid
+    );
+    return reinterpret_cast<DWORD>(list);
+}
+
+// Replaces FUN_006BA750's far-technique return. The stack holds the saved ebx and ecx, the return
+// address, then the arguments: cell, &technique, part, frame.
+__declspec(naked) void FarLightmapReturn()
+{
+    __asm {
+        push dword ptr [esp + 0x14]  // part
+        push dword ptr [esp + 0x10]  // cell
+        call FarLightmapBinding
+        add esp, 8
+        pop ebx
+        pop ecx
+        ret
+    }
+}
+
+void ApplyDistantLightmapPatch(const ModuleRange& range)
+{
+    if (!g_distant_lightmaps) {
+        return;
+    }
+    if (!IsRvaInRange(range, kFarLightmapReturnRva, 5) || !IsRvaInRange(range, kTerrainLightmapNamesRva, kLightmapCells * 4)) {
+        Log("DistantLightmaps: patch site outside the loaded image");
+        return;
+    }
+    auto* site = range.base + kFarLightmapReturnRva;
+    const std::uint8_t expected[5] = {0x33, 0xC0, 0x5B, 0x59, 0xC3};
+    if (std::memcmp(site, expected, sizeof(expected)) != 0) {
+        Log("DistantLightmaps: unexpected bytes at RVA 0x%08lX; not patched", static_cast<unsigned long>(kFarLightmapReturnRva));
+        return;
+    }
+    g_lightmap_exe = range.base;
+    std::uint8_t patch[5] = {0xE9};
+    const auto relative = static_cast<std::int32_t>(reinterpret_cast<std::uint8_t*>(&FarLightmapReturn) - (site + 5));
+    std::memcpy(&patch[1], &relative, sizeof(relative));
+    if (!WriteMemory(site, patch, sizeof(patch))) {
+        Log("DistantLightmaps: failed to patch RVA 0x%08lX", static_cast<unsigned long>(kFarLightmapReturnRva));
+        return;
+    }
+    Log("DistantLightmaps: far draws of lit parts bind their cell's lightmap when it is loaded");
+}
+
 // The table's live node count (pool +8), logged when it passes its highest so far by 1,000.
 void LogSubmodelTableUse(const ModuleRange& range)
 {
@@ -3431,6 +3554,7 @@ void ApplyPatches()
     ApplyPendingReferencePatch(exe);
     ApplyResourceArenaPatch(exe);
     ApplySubmodelTablePatch(exe);
+    ApplyDistantLightmapPatch(exe);
     ApplyStartupPatches(exe);
     ApplyUbisoftServerLostPromptPatch(exe);
     ApplyGarageMakerSwitchPatch(exe);

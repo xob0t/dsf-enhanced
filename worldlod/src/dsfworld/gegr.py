@@ -15,8 +15,12 @@ material (MACO): a new UID, and every g_texDiffuseMap and g_hAlphaTestRefValue
 the clone has set to the group's own material's. The clones come first in the
 new DRSP groups; MDID gains them after the last stock material.
 
+With lightmaps, the terrain lightmaps of the cells whose base parts bind one
+are copied in as TEXC (dsfworld.lightmaps); they come first in the new groups,
+and MDID gains them after the last stock texture.
+
 Entry headers (tags, versions, alignment, names) are copied from stock GEGR
-entries of the same kind.
+entries of the same kind (the lightmaps' from their regions).
 
 The streamer allocates its buffers from GEGL/GESI (static, san_francisco.dngc
 1.04): +0x24 GEGR's MDXN budget (its size rounded to 4 KB, 0x5337000, plus
@@ -34,8 +38,9 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from dsfworld import lightmaps
 from dsfworld.bake import Group, position_slot, read_positions
-from dsfworld.formats import modl
+from dsfworld.formats import gebi, modl
 from dsfworld.formats.archive import Archive, gesi, kid, walk
 from dsfworld.formats.chnk import ENTRY_LIMIT, Entry, entry_size
 from dsfworld.formats.uid import Allocator
@@ -60,6 +65,8 @@ class Stats:
     vertex_bytes: int = 0
     index_bytes: int = 0
     drsp: int = 0
+    lightmaps: int = 0  # terrain lightmaps copied into GEGR
+    lightmap_bytes: int = 0
 
 
 def _like(template: Entry, payload: bytes | None = None, children: list[Entry] | None = None) -> Entry:
@@ -123,7 +130,7 @@ def clone_material(a: Archive, template: Entry, source: Entry, uid: int) -> Entr
     return rebuild(template)
 
 
-KINDS = ("MACO", "SBMC", "VXCK", "IXCK")  # new resources, in the order they go into DRSP groups
+KINDS = ("TEXC", "MACO", "SBMC", "VXCK", "IXCK")  # new resources, in the order they go into DRSP groups
 
 
 @dataclass
@@ -258,8 +265,20 @@ def insert_uids(ids: list[int], stock: dict[str, set[int]], new: dict[str, list[
     return out
 
 
-def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> Stats:
-    """Modify the parsed GEGR entry tree in place."""
+def _copy_lightmaps(a: Archive, nonr: Entry, parts: list[modl.Part], uids: Allocator) -> list[tuple[int, Entry]]:
+    """Copies of the terrain lightmaps of the cells whose placed base parts bind one (dsfworld.lightmaps),
+    with GEGR's UIDL pointed at them."""
+    uidl = kid(nonr, "UIDL")
+    blob = _read(a, uidl)
+    sources = lightmaps.terrain_lightmaps(a, a.regions(), {u for _, u in lightmaps.parse_uidl(blob)})
+    placed = gebi.parse(_read(a, kid(nonr, "GEBI"))).instances
+    cells = lightmaps.lit_cells({p.uid: p.trailer for p in parts}, placed)
+    textures, uidl.payload = lightmaps.copy(a, blob, sources, cells, uids.new)
+    return textures
+
+
+def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator, *, with_lightmaps: bool = False) -> Stats:
+    """Modify the parsed GEGR entry tree in place. with_lightmaps: copy the lit cells' terrain lightmaps in."""
     writer = _Writer(a, gegr, uids)
     nonr = kid(gegr, "NONR")
     parts = modl.parse_modl(a.read(kid(nonr, "MODL")))
@@ -269,7 +288,11 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
             writer.cell(cell, by_uid[cell.part_uid])
     stats, new = writer.stats, writer.new
     stats.materials = len(new["MACO"])
-    if not new["SBMC"]:
+    if with_lightmaps:
+        new["TEXC"] = _copy_lightmaps(a, nonr, parts, uids)
+        stats.lightmaps = len(new["TEXC"])
+        stats.lightmap_bytes = sum(entry_size(e) for _, e in new["TEXC"])
+    if not any(new.values()):
         return stats
 
     # new DRSP groups before the last stock one (which holds MDID)

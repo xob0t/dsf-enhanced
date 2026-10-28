@@ -1,7 +1,8 @@
 """build: write the world archive to <work_dir>/pack/, with the baked cells in GEGR, and check it.
 
 The check re-reads the output: GEGR's references (MODL -> submodels -> buffers
-and materials, index ranges), MDID, group sizes and the streamer budgets. With
+and materials, index ranges), MDID, group sizes, the streamer budgets and the
+carried lightmaps (UIDL -> GEGR textures). With
 [bake] classes empty the output must equal the game's file. A stamp next to the
 archive (the code, settings and source it was built from) skips an unchanged
 build.
@@ -16,7 +17,7 @@ from pathlib import Path
 
 import numpy as np
 
-from dsfworld import gegr, ui
+from dsfworld import gegr, lightmaps, ui
 from dsfworld.config import Config
 from dsfworld.formats import modl, uid
 from dsfworld.formats.archive import Archive, SubModel, gesi, kid, walk
@@ -95,11 +96,13 @@ def check(path: Path) -> list[str]:
         ids = struct.unpack_from(f"<{len(md) // 8}Q", md)
         if len(set(ids)) != len(ids):
             problems.append("MDID has duplicates")
-        missing = (set(subs) | set(vbs) | set(ibs) | mats) - set(ids)
+        textures = {a.uid(t) for t in walk(g, "TEXC")}
+        missing = (set(subs) | set(vbs) | set(ibs) | mats | textures) - set(ids)
         if missing:
             problems.append(f"MDID lacks {len(missing)} resource UIDs")
         problems += [f"DRSP with {len(d.children)} children" for d in walk(g, "DRSP") if len(d.children) > ENTRY_LIMIT]
         problems += _budget_problems(a, g)
+        problems += lightmaps.check(a, g)
     return problems
 
 
@@ -116,7 +119,7 @@ def code_digest() -> str:
 def build_key(cfg: Config, world: World) -> str:
     """What the packed archive depends on: the code, the settings and the source archive."""
     source = world.archive.path
-    return f"{code_digest()}:{cfg.digest(*bake.SECTIONS)}:{source.name}:{source.stat().st_size}"
+    return f"{code_digest()}:{cfg.digest(*bake.SECTIONS, 'lightmaps')}:{source.name}:{source.stat().st_size}"
 
 
 def run(cfg: Config, world: World, *, force: bool = False, show_file: bool = True) -> Path:
@@ -136,7 +139,8 @@ def run(cfg: Config, world: World, *, force: bool = False, show_file: bool = Tru
         with ui.status("Writing the baked cells into the base LOD"):
             g = a.global_region()
             stock_mdxn = kid(g, "MDXN").size
-            stats = gegr.apply(a, g, cells, uid.Allocator(uid.existing(a)))
+            carry = cfg.section("lightmaps")["enabled"]
+            stats = gegr.apply(a, g, cells, uid.Allocator(uid.existing(a)), with_lightmaps=carry)
             mdxn, _ = gegr.update_budgets(a, a.entries, stock_mdxn)
         rows = [
             ("Cells rebuilt", f"{stats.cells}"),
@@ -146,6 +150,8 @@ def run(cfg: Config, world: World, *, force: bool = False, show_file: bool = Tru
             ("Geometry", f"{(stats.vertex_bytes + stats.index_bytes) / 1e6:.0f} MB in {stats.drsp} new groups"),
             ("Streamer budget", f"{mdxn / 1e6:.0f} MB for the base LOD"),
         ]
+        if carry:
+            rows.insert(-1, ("Lightmaps", f"{stats.lightmaps} cells, {stats.lightmap_bytes / 1e6:.0f} MB"))
     out.parent.mkdir(parents=True, exist_ok=True)
     stamp.unlink(missing_ok=True)
     tmp = out.with_suffix(out.suffix + ".tmp")

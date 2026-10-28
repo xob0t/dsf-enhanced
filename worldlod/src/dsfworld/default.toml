@@ -113,3 +113,10 @@ size = 2048
 view = "top"
 # Largest texture side, in texels, decoded for drawing.
 texture_size = 256
+
+[lightmaps]
+# Copy each baked cell's terrain lightmap (the soft shadows and ambient occlusion
+# that the detailed regions draw with) into the base LOD, so that it is drawn
+# lit like the detail. About 186 KB per cell, always loaded. Needs DSF Enhanced
+# with [Quality] DistantLightmaps; without it the base LOD stays fully lit.
+enabled = true

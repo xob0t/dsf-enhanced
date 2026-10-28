@@ -17,7 +17,8 @@ PREFIX = 0x574C44  # "WLD"
 
 
 def existing(a: Archive) -> set[int]:
-    """Every UID the archive defines or lists: resources, MODL parts, MDID and GEBI tables."""
+    """Every UID the archive defines or lists: resources, MODL parts, MDID, GEBI tables and UIDL (the
+    texture names, some of them for textures this archive doesn't hold)."""
     seen: set[int] = set()
     for res in a.entries:
         for tag in UID_HEADERS:
@@ -33,6 +34,9 @@ def existing(a: Archive) -> set[int]:
         if gebi:
             count, offset = struct.unpack_from("<H", gebi, 0x1E)[0], struct.unpack_from("<I", gebi, 0x20)[0]
             seen.update(struct.unpack_from(f"<{count}Q", gebi, offset))
+        uidl = a.nonr(res, "UIDL") if res.children else None
+        if uidl:
+            seen.update(struct.unpack_from("<Q", uidl, 8 + 12 * i)[0] for i in range(struct.unpack_from("<I", uidl)[0]))
     return seen
 
 
