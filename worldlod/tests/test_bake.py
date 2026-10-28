@@ -3,7 +3,7 @@ import struct
 import numpy as np
 import pytest
 
-from dsfworld import bake
+from dsfworld import bake, meshopt
 from dsfworld.formats.archive import SubModel
 from dsfworld.formats.gebi import Instance
 from dsfworld.formats.modl import Library, Lod, Part, VertexBuffer
@@ -122,7 +122,8 @@ def grid_group(material, x0, x1, n=12):
 
 
 def test_cell_simplification_keeps_material_boundaries_closed():
-    pytest.importorskip("meshoptimizer")
+    if not meshopt.DLL.exists():
+        pytest.skip("no meshopt.dll")
     from dsfworld import simplify
 
     left, right = grid_group(1, 0, 5), grid_group(2, 5, 10)

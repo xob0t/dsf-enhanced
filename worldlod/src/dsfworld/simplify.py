@@ -1,4 +1,4 @@
-"""Simplify baked groups with meshoptimizer (optional: `uv sync --extra simplify`).
+"""Simplify baked groups with meshoptimizer (the DLL in _native, see meshopt.py).
 
 meshoptimizer's simplifier keeps a subset of the original vertices, so every
 kept vertex carries its stored attributes unchanged. The error is absolute, in
@@ -16,33 +16,9 @@ from __future__ import annotations
 
 import numpy as np
 
+from dsfworld import meshopt
 from dsfworld.bake import Group, positions, read_normals
 from dsfworld.formats.modl import COLOUR, NORMAL, UBYTE4
-
-
-def _meshoptimizer():
-    try:
-        import meshoptimizer
-        from meshoptimizer._loader import lib
-    except ImportError:
-        raise SystemExit(
-            "[simplify] error > 0 needs meshoptimizer: run `uv sync --extra simplify` "
-            "(it compiles, so it needs the Visual Studio C++ build tools), or set [simplify] error = 0"
-        ) from None
-    f = lib.meshopt_simplifyWithAttributes
-    if f.argtypes is None:  # meshoptimizer 0.2.30a0 declares meshopt_simplify but not this one
-        import ctypes
-
-        c_uint_p, c_float_p, size = ctypes.POINTER(ctypes.c_uint), ctypes.POINTER(ctypes.c_float), ctypes.c_size_t
-        f.argtypes = [
-            c_uint_p, c_uint_p, size,  # destination, indices, index_count
-            c_float_p, size, size,  # positions, vertex_count, positions stride
-            c_float_p, size, c_float_p, size,  # attributes, attributes stride, weights, attribute_count
-            ctypes.POINTER(ctypes.c_ubyte), size,  # vertex_lock, target_index_count
-            ctypes.c_float, ctypes.c_uint, c_float_p,  # target_error, options, result_error
-        ]  # fmt: skip
-        f.restype = size
-    return meshoptimizer
 
 
 def cell(
@@ -57,7 +33,6 @@ def cell(
     """
     if error <= 0 or not groups:
         return groups
-    mo = _meshoptimizer()
     points, attributes, indices, bases = [], [], [], []
     base = 0
     for g in groups:
@@ -76,19 +51,15 @@ def cell(
         base += len(g.vertices)
     owner = np.repeat(np.arange(len(groups)), [len(g.vertices) for g in groups])
     index = np.ascontiguousarray(np.concatenate(indices).astype(np.uint32))
-    out = np.zeros_like(index)
-    options = mo.SIMPLIFY_ERROR_ABSOLUTE | (mo.SIMPLIFY_LOCK_BORDER if lock_border else 0)
-    n = mo.simplify_with_attributes(
-        out,
+    kept = meshopt.simplify_with_attributes(
         index,
-        np.ascontiguousarray(np.vstack(points)),
-        np.ascontiguousarray(np.vstack(attributes)),
+        np.vstack(points),
+        np.vstack(attributes),
         np.array([normal_weight] * 3 + [colour_weight] * 4, np.float32),
-        target_index_count=3,
-        target_error=error,
-        options=options,
+        error=error,
+        options=meshopt.ERROR_ABSOLUTE | (meshopt.LOCK_BORDER if lock_border else 0),
     )
-    tris = out[:n].reshape(-1, 3).astype(np.int64)
+    tris = kept.reshape(-1, 3).astype(np.int64)
     which = owner[tris[:, 0]]
     result = []
     for k, g in enumerate(groups):

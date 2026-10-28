@@ -5,11 +5,7 @@ description = "Builds a high-detail base LOD for Driver: San Francisco's upper S
 readme = "README.md"
 license = "MIT"
 requires-python = ">=3.13"
-dependencies = ["numpy>=2.1"]
-
-[project.optional-dependencies]
-# Mesh simplification. Builds from source on Windows: needs the Visual Studio C++ build tools.
-simplify = ["meshoptimizer==0.2.30a0"]
+dependencies = ["numpy>=2.1", "rich>=13"]
 
 [project.scripts]
 worldlod = "dsfworld.cli:main"
@@ -34,7 +30,7 @@ select = [
 ]
 ignore = [
     "PLR0913",  # pipeline functions take their settings as arguments
-    "PLC0415",  # lazy imports keep optional dependencies (meshoptimizer) optional
+    "PLC0415",  # the CLI imports a stage only when it runs it
 ]
 
 [tool.ruff.lint.per-file-ignores]
