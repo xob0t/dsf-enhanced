@@ -424,6 +424,19 @@ DistantLightmaps`):
   EmitDrawMetadata copies it into persistent memory itself when it caches a
   draw. With that it loads, Shifts and drives (`runtime`, VM 1,
   vm1-20261028-143351).
+- **In game** (`runtime`, VM 1, vm1-20261028-144951, with counters): from
+  Story mode's Shift overview on, 70% of the far calls bind a lightmap, 30%
+  are parts without trailer bit 4 (building shells), 33 calls found the
+  cell's texture unloaded (cells whose name points at no texture). For 13 s
+  around the zoom the game had its TRR lightmaps switched off (0x123FE00 = 0,
+  FUN_006BCA40), which the patch respects. The calls come at about a thousand
+  a second, not per draw and frame: EmitDrawMetadata's draws are kept and
+  reused, so a test that switched the patch off and on every second changed
+  nothing on screen. On screen the lit overview has contact shadows at the
+  building bases, in courtyards and under trees
+  (`img/lightmaps-mission.jpg`, `img/lightmaps-downtown.jpg`: zoom-02 of
+  vm1-20261028-143800 without and vm1-20261028-143351 with, registered with a
+  homography; the camera and the sky's haze differ a little between runs).
 - Smaller copies (a mip dropped: 264 x 264, 46.6 KB, 20 MB for 420 cells)
   would also lower the lightmaps of the detail in gameplay, since both look up
   the same name. Keeping gameplay intact at that size needs the far draws to

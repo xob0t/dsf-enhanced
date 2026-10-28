@@ -268,6 +268,8 @@ DWORD g_arena_extension_logged_nodes = 0;
 int g_pending_reference_capacity = 131072;
 int g_submodel_table_extra_nodes = 60000;
 bool g_distant_lightmaps = true;
+volatile LONG g_far_lightmap_binds = 0;
+LONG g_far_lightmap_logged = 0;
 std::uint8_t* g_lightmap_exe = nullptr;
 std::uint8_t* g_submodel_extension_begin = nullptr;
 std::uint8_t* g_submodel_extension_end = nullptr;
@@ -2557,6 +2559,7 @@ DWORD __cdecl FarLightmapBinding(DWORD cell, const std::uint8_t* part)
     if (find(g_lightmap_exe + kResourceManagerRva, static_cast<DWORD>(uid), static_cast<DWORD>(uid >> 32)) == nullptr) {
         return 0;
     }
+    InterlockedIncrement(&g_far_lightmap_binds);
     // FUN_006BD740's list: g_vLightMapOffsetScale = (sx, sz, -sx * x0, -sz * z0) for the cell's corner
     // (x0, z0) (FUN_00564420), then the texture.
     const auto* origin = reinterpret_cast<const float*>(g_lightmap_exe + kLightmapOriginRva);
@@ -2622,6 +2625,17 @@ void ApplyDistantLightmapPatch(const ModuleRange& range)
         return;
     }
     Log("DistantLightmaps: far draws of lit parts bind their cell's lightmap when it is loaded");
+}
+
+// How many far draws got a lightmap: logged at the first and then every 50,000. EmitDrawMetadata
+// keeps the draws it builds, so this grows by about a thousand a second in the Shift overview.
+void LogDistantLightmapUse()
+{
+    const LONG binds = g_far_lightmap_binds;
+    if ((binds > 0 && g_far_lightmap_logged == 0) || binds - g_far_lightmap_logged >= 50000) {
+        g_far_lightmap_logged = binds;
+        Log("DistantLightmaps: %ld far draws lit so far", binds);
+    }
 }
 
 // The table's live node count (pool +8), logged when it passes its highest so far by 1,000.
@@ -3591,6 +3605,7 @@ DWORD WINAPI InitThread(LPVOID)
         if (tick % 4 == 0) {
             LogResourceArenaUse();
             LogSubmodelTableUse(exe);
+            LogDistantLightmapUse();
         }
         if (tick % 4 == 0) {
             ApplyAspectConstantPatch(exe, "Loop");

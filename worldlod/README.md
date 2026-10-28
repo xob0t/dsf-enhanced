@@ -6,7 +6,8 @@ When you Shift up, the game draws one low-detail model of the whole city: flat,
 vertex-coloured ground under plain building shells. worldlod rebuilds that model
 from the game's own detailed areas, with real roads, kerbs, paving, trees and bushes,
 building detail (storefronts, rooftop units, fire escapes, containers) and
-painted road text. It reads your copy of the game and writes the new map into
+painted road text, lit with the detailed areas' own baked shadows (with DSF
+Enhanced's `[Quality] DistantLightmaps`). It reads your copy of the game and writes the new map into
 it, with a backup. No game data is shipped.
 
 ## Install
