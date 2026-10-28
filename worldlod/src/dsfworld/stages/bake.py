@@ -84,7 +84,18 @@ def run(cfg: Config, world: World, force: bool = False) -> list[CellBake]:
         if cached is None:
             lib, g = world.region(name)
             result = bake.bake_region(
-                world, lib, g.instances, matrix, keep, settings["height_offset"], tuple(settings["exclude"])
+                world,
+                lib,
+                g.instances,
+                matrix,
+                keep,
+                settings["height_offset"],
+                tuple(settings["exclude"]),
+                {
+                    world.class_names.index(c): v
+                    for c, v in settings["min_model_size"].items()
+                    if c in world.class_names
+                },
             )
             s = cfg.section("simplify")
             simplified = {world.class_names.index(c) for c in s["classes"] if c in world.class_names}

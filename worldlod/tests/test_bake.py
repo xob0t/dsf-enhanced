@@ -161,3 +161,19 @@ def test_float16_positions_are_moved_and_stay_float16():
     np.testing.assert_allclose(pos[1], (10, 2, 20), atol=0.01)
     normal = g.vertices[0, 8:14].copy().view("<f2").astype(float)
     np.testing.assert_allclose(normal, (0, 0, 1), atol=0.01)
+
+
+def test_second_stream_is_folded_into_the_vertex():
+    lib = library(
+        [vertex(0, 0, 0, 0, 0, (0, 1, 0)), vertex(1, 0, 0, 0, 0, (0, 1, 0)), vertex(0, 0, 1, 0, 0, (0, 1, 0))],
+        [0, 1, 2],
+    )
+    colours = bytes([9, 9, 9, 9]) * 5 + bytes([10, 0, 0, 255, 0, 20, 0, 255, 0, 0, 30, 255])
+    decl2 = struct.pack("<I4I", 1, 19, 4, 6, 0xC0)
+    lib.vbs[7] = VertexBuffer(8, 4, [(19, 4, 6, 0)], colours, decl2)
+    lib.vbs[1].decl = struct.pack("<I12I", 3, 0, 4, 1, 0xA0, 8, 2, 8, 0xA1, 5, 4, 6, 0xA2)
+    lib.submodels[3] = SubModel(3, 0xAA, 1, 7, 0, 2, 0, 3, vb2_base=5)
+    (g,) = bake.bake_region(Classes(), lib, [Instance(4, 0, np.eye(4))], np.eye(4), {0}).groups
+    assert g.stride == 20 and g.elements[-1] == (19, 4, 6, 16)
+    assert g.vertices[:, 16:20].tolist() == [[10, 0, 0, 255], [0, 20, 0, 255], [0, 0, 30, 255]]
+    assert struct.unpack_from("<I", g.decl)[0] == 4 and g.decl.endswith(struct.pack("<4I", 19, 4, 6, 0xC0))

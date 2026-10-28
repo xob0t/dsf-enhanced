@@ -11,6 +11,7 @@ split into submodels of at most 65,535 vertices (16-bit indices).
 
 from __future__ import annotations
 
+import struct
 from collections import Counter
 from dataclasses import dataclass, field
 
@@ -71,6 +72,13 @@ def write_normals(rows: np.ndarray, element, n: np.ndarray) -> None:
         rows[:, off : off + 3] = np.clip(np.round((n + 1) / 2 * 255), 0, 255).astype(np.uint8)
     else:
         rows[:, off : off + 6] = n.astype("<f2").view(np.uint8).reshape(len(rows), 6)
+
+
+def combined_decl(first: bytes, second: bytes) -> bytes:
+    """VDCL of a vertex made of one buffer's vertex followed by another's: {u32 count, count x 16-byte
+    elements}, offsets implied by order."""
+    n1, n2 = struct.unpack_from("<I", first)[0], struct.unpack_from("<I", second)[0]
+    return struct.pack("<I", n1 + n2) + first[4 : 4 + 16 * n1] + second[4 : 4 + 16 * n2]
 
 
 def positions(g) -> np.ndarray:
@@ -134,10 +142,13 @@ def bake_region(
     keep: set[int],
     height_offset: float = 0.0,
     exclude: tuple[str, ...] = (),
+    min_size: dict[int, float] | None = None,
 ):
     """Copy the submodels of the given classes placed by instances into the frame of target (a 4x4 matrix),
     moved up by height_offset metres (world Y; negative moves down). Materials whose path starts with
-    one of exclude are left out."""
+    one of exclude are left out, and so are a class's placed models smaller than min_size[class]
+    metres (longest box edge after instance scale). A second vertex stream (the per-region colour of
+    many props) is folded into the copied vertices."""
     a_t, t_t = _frame(target)
     inv_t = np.linalg.inv(a_t)
     pieces: dict[tuple, list] = {}
@@ -150,6 +161,7 @@ def bake_region(
         lod = part.finest_lod()
         if lod is None:
             continue
+        placed_size = part.size * float(inst.scale.max())
         a_s, t_s = _frame(inst.matrix)
         linear = a_s @ inv_t  # source local -> target local (row vectors)
         offset = (t_s - t_t + (0.0, height_offset, 0.0)) @ inv_t
@@ -161,14 +173,25 @@ def bake_region(
                 continue
             if exclude and world.materials.paths.get(sub.material, "").startswith(exclude):
                 continue
+            if min_size and placed_size < min_size.get(world.class_index(sub.material), 0.0):
+                continue
             vb = lib.vbs.get(sub.vb)
             if vb is None:
                 skipped["missing vertex buffer"] += 1
                 continue
+            vb2 = None
             if sub.vb2:
-                skipped["second vertex stream"] += 1
+                vb2 = lib.vbs.get(sub.vb2)
+                if vb2 is None:
+                    skipped["missing second vertex stream"] += 1
+                    continue
+            elements = tuple(vb.elements)
+            if vb2 is not None:
+                elements += tuple((e[0], e[1], e[2], e[3] + vb.stride) for e in vb2.elements)
+            sems = {e[0]: e for e in elements}
+            if len(sems) != len(elements):
+                skipped["semantic in both streams"] += 1
                 continue
-            sems = {e[0]: e for e in vb.elements}
             pos = sems.get(POSITION)
             if pos is None or pos[2] not in POSITION_TYPES or pos[1] < 3:
                 skipped["unsupported position type"] += 1
@@ -183,6 +206,12 @@ def bake_region(
             idx += sub.base_vertex
             used, tri = np.unique(idx, return_inverse=True)
             rows = vb.rows()[used].copy()
+            if vb2 is not None:
+                second = used - sub.base_vertex + sub.vb2_base
+                if second.max(initial=0) >= vb2.count:
+                    skipped["second stream range"] += 1
+                    continue
+                rows = np.hstack([rows, vb2.rows()[second]])
             if not write_positions(rows, pos, read_positions(rows, pos) @ linear + offset):
                 skipped["outside the target frame"] += 1
                 continue
@@ -193,8 +222,13 @@ def bake_region(
             tri = tri.reshape(-1, 3)
             if flip:
                 tri = tri[:, ::-1]
-            key = (sub.material, flag, vb.layout)
-            decls[vb.layout] = vb.decl
+            if vb2 is None:
+                layout, decl = vb.layout, vb.decl
+            else:
+                layout = (vb.stride + vb2.stride, elements)
+                decl = combined_decl(vb.decl, vb2.decl)
+            key = (sub.material, flag, layout)
+            decls[layout] = decl
             pieces.setdefault(key, []).append((rows, tri))
     groups = []
     for (material, flag, layout), parts in pieces.items():

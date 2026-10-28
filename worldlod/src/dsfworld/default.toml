@@ -41,10 +41,21 @@ min_model_size = 0.0
 # Classes from the detailed regions that go into the base LOD, replacing the
 # stock submodels below. An empty list turns the bake off; pack then writes the
 # stock archive.
-classes = ["ground", "foliage"]
+classes = ["ground", "foliage", "buildings"]
 # Materials left out of the bake: their path starts with one of these. Grass
-# cards (1.45M triangles) can't be seen from Shift height.
-exclude = ["trees/foliage_grass", "trees/misc_grasses"]
+# cards (1.45M triangles) can't be seen from Shift height; the Bay and
+# Carquinez bridges' girders are 4.3M triangles of lines.
+exclude = [
+    "trees/foliage_grass",
+    "trees/misc_grasses",
+    "buildings/specular/bridge_baybridge",
+    "buildings/specular/bridge_carquinez",
+]
+# Per class: leave out placed models whose longest box edge (after instance
+# scale) is below this many metres. "buildings" in the detailed regions are the
+# overlays on the base's building shells and the street furniture: storefronts,
+# rooftop units, fire escapes, containers, pallets, rocks.
+min_model_size = { buildings = 2.0 }
 # The stock submodels to replace: those whose material path starts with this
 # prefix (the vertex-coloured low-poly terrain). The part holding them, one at
 # the centre of 420 of the 532 detailed cells, receives the baked cell; its

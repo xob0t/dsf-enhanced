@@ -11,7 +11,7 @@ from dsfworld.priority import set_priority
 
 
 def dump_toml(data: dict) -> str:
-    """The merged settings as TOML (tables of scalars and lists only)."""
+    """The merged settings as TOML (tables of scalars, lists and inline tables)."""
 
     def value(v):
         if isinstance(v, str):
@@ -20,6 +20,8 @@ def dump_toml(data: dict) -> str:
             return "true" if v else "false"
         if isinstance(v, list):
             return "[" + ", ".join(value(x) for x in v) + "]"
+        if isinstance(v, dict):
+            return "{ " + ", ".join(f"{k} = {value(x)}" for k, x in v.items()) + " }"
         return repr(v)
 
     lines = []

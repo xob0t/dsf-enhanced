@@ -37,6 +37,7 @@ class SubModel:
     ib: int
     first_index: int
     index_count: int
+    vb2_base: int = 0  # SBBH +0x24: vertex i of the draw reads vb2[vb2_base + i]
 
 
 @dataclass
@@ -97,7 +98,7 @@ class Archive:
         out = []
         for s in walk(res, "SBMC"):
             b = self.read(kid(s, "SBBH"))
-            uid, mat, vb, vb2, basev = struct.unpack_from("<QQQQI", b)
+            uid, mat, vb, vb2, basev, vb2_base = struct.unpack_from("<QQQQII", b)
             ib, first, cnt = struct.unpack_from("<QII", b, 48)
-            out.append(SubModel(uid, mat, vb, vb2, basev, ib, first, cnt))
+            out.append(SubModel(uid, mat, vb, vb2, basev, ib, first, cnt, vb2_base))
         return out
