@@ -2,8 +2,11 @@
 
 Each source submodel placed in the region is copied vertex for vertex: positions
 (int16 in 1/64 m, float16 or float32 in metres, kept in their stored type) and
-normals (ubyte4 as x * 2 - 1, or float16) are moved from the source instance's
-frame into the target part's frame; every other attribute is kept as stored.
+normals (ubyte4, x * 2 - 1) are moved from the source instance's frame into the
+target part's frame; every other attribute is kept as stored. Semantic 5 stored
+as float16 is not a normal: the leaf-card tree shaders (g_fTreetopSize,
+g_fQuadRotationCompensation) keep each card corner's offset there and expand the
+card on screen, so it is copied unchanged.
 Float16 positions lose precision away from the cell centre (0.25 m beyond 256 m),
 which only foliage uses. Copies are grouped by material, flag and vertex layout, welded, and
 split into submodels of at most 65,535 vertices (16-bit indices).
@@ -200,7 +203,7 @@ def bake_region(
                 skipped["unhandled semantic"] += 1
                 continue
             if NORMAL in sems and sems[NORMAL][2] not in (UBYTE4, FLOAT16):
-                skipped["unsupported normal type"] += 1
+                skipped["unsupported semantic 5 type"] += 1
                 continue
             idx = lib.ibs[sub.ib][sub.first_index : sub.first_index + sub.index_count].astype(np.int64)
             idx += sub.base_vertex
@@ -215,7 +218,7 @@ def bake_region(
             if not write_positions(rows, pos, read_positions(rows, pos) @ linear + offset):
                 skipped["outside the target frame"] += 1
                 continue
-            if NORMAL in sems:
+            if NORMAL in sems and sems[NORMAL][2] == UBYTE4:
                 n = read_normals(rows, sems[NORMAL]) @ normal_m
                 n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-12
                 write_normals(rows, sems[NORMAL], n)

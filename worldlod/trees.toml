@@ -1,0 +1,3 @@
+# Ground and trees, no building detail (the build being tested in game).
+[bake]
+classes = ["ground", "foliage"]

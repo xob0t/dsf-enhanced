@@ -21,7 +21,7 @@ from dsfworld.world import World
 
 SECTIONS = ("game", "classes", "bake", "simplify")
 # Part of the cache key: raise when the bake or simplification output changes for the same settings.
-VERSION = 4
+VERSION = 5
 
 
 def output_dir(cfg: Config) -> Path:

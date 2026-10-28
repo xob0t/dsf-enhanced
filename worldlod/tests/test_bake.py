@@ -148,7 +148,7 @@ def test_fill_keeps_only_uncovered_stock_triangles_lowered():
 
 
 def test_float16_positions_are_moved_and_stay_float16():
-    elements = [(0, 4, 8, 0), (5, 4, 8, 8)]  # half4 position, half4 normal (foliage layout)
+    elements = [(0, 4, 8, 0), (5, 4, 8, 8)]  # half4 position, half4 leaf-card data (foliage layout)
     rows = [struct.pack("<4e4e", x, y, z, 1, 1, 0, 0, 0) for x, y, z in ((1, 0, 0), (0, 2, 0), (0, 0, 3))]
     lib = Library()
     lib.vbs[1] = VertexBuffer(3, 16, elements, b"".join(rows), b"decl")
@@ -159,8 +159,8 @@ def test_float16_positions_are_moved_and_stay_float16():
     pos = g.vertices[:, 0:6].copy().view("<f2").astype(float)
     np.testing.assert_allclose(pos[0], (10, 0, 21), atol=0.01)  # (1,0,0) turned 90 degrees is (0,0,1)
     np.testing.assert_allclose(pos[1], (10, 2, 20), atol=0.01)
-    normal = g.vertices[0, 8:14].copy().view("<f2").astype(float)
-    np.testing.assert_allclose(normal, (0, 0, 1), atol=0.01)
+    card = g.vertices[0, 8:16].copy().view("<f2").astype(float)
+    np.testing.assert_allclose(card, (1, 0, 0, 0))  # leaf-card corner data is copied, not rotated
 
 
 def test_second_stream_is_folded_into_the_vertex():
