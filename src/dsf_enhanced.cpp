@@ -76,6 +76,17 @@ constexpr DWORD kResourceHashBumpContinueRva = 0x007AEDD0;  // fills the node in
 // resolves them later. Entry 16,385 writes its UID over the count, and the next append faults
 // (0x6A594F). A world archive whose global region holds more than about 16,000 submodels hits it.
 constexpr DWORD kResourceManagerRva = 0x01332BF0;
+// The submodel table (owner pointer at 0x19BBA74, table at owner+0x30): SBMC UID -> submodel, filled
+// by the SBMC loader (0xBBB6C5 -> 0xBBBE40) and emptied as submodels are released (0xBBBCA0). Its
+// nodes come from a pool of 15,000 24-byte nodes at table+0x10..table+0x57E50, taken by
+// 0x8CCAA0 from the free list (head and count at table+0, +4) or by bumping table+0 with no end
+// check; the bucket array (15,013 heads) follows the nodes. Node 15,001 is written over the
+// buckets, and the next lookup faults (0xBBBE70).
+constexpr DWORD kSubmodelOwnerRva = 0x015BBA74;
+constexpr DWORD kSubmodelNodeAllocCallRva = 0x007BBE9B;  // call 0x8CCAA0 in the table's insert
+constexpr DWORD kPoolAllocRva = 0x004CCAA0;
+constexpr DWORD kSubmodelTableOffset = 0x30;
+constexpr DWORD kSubmodelStockEnd = 0x57E50;  // table offset where the stock nodes end
 constexpr DWORD kPendingPtrsRva = 0x0145A6B8;
 constexpr DWORD kPendingPairsRva = 0x0146A6B8;
 constexpr int kPendingStockCapacity = 16384;
@@ -232,6 +243,11 @@ std::uint8_t* g_arena_extension_end = nullptr;
 void* g_arena_bump_continue = nullptr;
 DWORD g_arena_extension_logged_nodes = 0;
 int g_pending_reference_capacity = 131072;
+int g_submodel_table_extra_nodes = 60000;
+std::uint8_t* g_submodel_extension_begin = nullptr;
+std::uint8_t* g_submodel_extension_end = nullptr;
+void* g_submodel_pool_alloc = nullptr;
+DWORD g_submodel_table_logged_peak = 0;
 bool g_pending_reference_patch_applied = false;
 DWORD g_pending_reference_logged_peak = 0;
 void* g_error_message_update_continue = nullptr;
@@ -421,6 +437,8 @@ void LoadConfig()
         ClampInt(GetPrivateProfileIntA("Limits", "ResourceArenaStockNodes", 45000, ini_path), 1, 45000);
     g_pending_reference_capacity =
         ClampInt(GetPrivateProfileIntA("Limits", "PendingResourceReferences", 131072, ini_path), 0, 4194304);
+    g_submodel_table_extra_nodes =
+        ClampInt(GetPrivateProfileIntA("Limits", "SubmodelTableExtraNodes", 60000, ini_path), 0, 2000000);
     LoadFlareConfig(ini_path);
 }
 
@@ -2404,6 +2422,103 @@ void LogResourceArenaUse()
     }
 }
 
+// Once the bump pointer of the submodel table's pool reaches the end of its 15,000 stock nodes,
+// it is moved to an extension block, and the pool bumps on through that. Freed nodes go on the
+// pool's free list, whose last entry holds the bump pointer, wherever the nodes live. The bucket
+// count stays 15,013: chains just get longer.
+void __stdcall SubmodelTableExtensionFull()
+{
+    Log("SubmodelTable: extension full (%d nodes); raise [Limits] SubmodelTableExtraNodes", g_submodel_table_extra_nodes);
+    FatalAppExitA(0, "DSF Enhanced: submodel table full. Raise [Limits] SubmodelTableExtraNodes in dsf_enhanced.ini.");
+}
+
+__declspec(naked) void ProxySubmodelNodeAlloc()
+{
+    __asm {
+        cmp dword ptr [ecx + 4], 0
+        jne original
+        push eax
+        lea eax, [ecx + 0x57E50]  // kSubmodelStockEnd
+        cmp dword ptr [ecx], eax
+        jne in_extension
+        mov eax, dword ptr [g_submodel_extension_begin]
+        mov dword ptr [ecx], eax
+        pop eax
+        jmp original
+
+    in_extension:
+        mov eax, dword ptr [g_submodel_extension_end]
+        cmp dword ptr [ecx], eax
+        pop eax
+        je full
+
+    original:
+        jmp dword ptr [g_submodel_pool_alloc]
+
+    full:
+        call SubmodelTableExtensionFull
+    }
+}
+
+void ApplySubmodelTablePatch(const ModuleRange& range)
+{
+    if (g_submodel_table_extra_nodes <= 0) {
+        return;
+    }
+    if (!IsRvaInRange(range, kSubmodelNodeAllocCallRva, 5)) {
+        Log("SubmodelTable: patch site outside the loaded image");
+        return;
+    }
+    auto* site = range.base + kSubmodelNodeAllocCallRva;
+    std::int32_t stock_relative = 0;
+    std::memcpy(&stock_relative, site + 1, sizeof(stock_relative));
+    if (site[0] != 0xE8 || site + 5 + stock_relative != range.base + kPoolAllocRva) {
+        Log("SubmodelTable: unexpected bytes at RVA 0x%08lX; not patched", static_cast<unsigned long>(kSubmodelNodeAllocCallRva));
+        return;
+    }
+    const size_t bytes = static_cast<size_t>(g_submodel_table_extra_nodes) * 0x18;
+    auto* block = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (block == nullptr) {
+        Log("SubmodelTable: could not allocate %lu bytes for the extension", static_cast<unsigned long>(bytes));
+        return;
+    }
+    g_submodel_extension_begin = block;
+    g_submodel_extension_end = block + bytes;
+    g_submodel_pool_alloc = range.base + kPoolAllocRva;
+    std::uint8_t patch[5] = {0xE8};
+    const auto relative = static_cast<std::int32_t>(
+        reinterpret_cast<std::uint8_t*>(&ProxySubmodelNodeAlloc) - (site + 5)
+    );
+    std::memcpy(&patch[1], &relative, sizeof(relative));
+    if (!WriteMemory(site, patch, sizeof(patch))) {
+        Log("SubmodelTable: failed to patch RVA 0x%08lX", static_cast<unsigned long>(kSubmodelNodeAllocCallRva));
+        return;
+    }
+    Log(
+        "SubmodelTable: 15000 stock nodes, then %d extension nodes at 0x%p (%lu KB)",
+        g_submodel_table_extra_nodes,
+        block,
+        static_cast<unsigned long>(bytes / 1024)
+    );
+}
+
+// The table's live node count (pool +8), logged when it passes its highest so far by 1,000.
+void LogSubmodelTableUse(const ModuleRange& range)
+{
+    if (!IsRvaInRange(range, kSubmodelOwnerRva, 4)) {
+        return;
+    }
+    const auto owner = *reinterpret_cast<const DWORD*>(range.base + kSubmodelOwnerRva);
+    if (owner == 0) {
+        return;
+    }
+    const auto live = *reinterpret_cast<const DWORD*>(owner + kSubmodelTableOffset + 8);
+    if (live >= g_submodel_table_logged_peak + 1000) {
+        g_submodel_table_logged_peak = live;
+        Log("SubmodelTable: %lu submodels loaded (stock limit 15000)", static_cast<unsigned long>(live));
+    }
+}
+
 // Moves the pending-reference list to bigger arrays by rewriting the disp32 of every instruction
 // that addresses it; the count stays where it is. All sites are checked first: on any mismatch
 // nothing is patched.
@@ -3269,6 +3384,7 @@ void ApplyPatches()
     PatchBinkImports(exe);
     ApplyPendingReferencePatch(exe);
     ApplyResourceArenaPatch(exe);
+    ApplySubmodelTablePatch(exe);
     ApplyStartupPatches(exe);
     ApplyUbisoftServerLostPromptPatch(exe);
     ApplyGarageMakerSwitchPatch(exe);
@@ -3304,6 +3420,7 @@ DWORD WINAPI InitThread(LPVOID)
         LogPendingReferencePeak(exe);
         if (tick % 4 == 0) {
             LogResourceArenaUse();
+            LogSubmodelTableUse(exe);
         }
         if (tick % 4 == 0) {
             ApplyAspectConstantPatch(exe, "Loop");
