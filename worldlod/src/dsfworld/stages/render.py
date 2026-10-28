@@ -3,7 +3,7 @@
 Writes <work_dir>/render/<name>_stock.png, <name>_baked.png and <name>_compare.png
 (side by side). The baked base is read from the archive pack wrote, so run pack
 first. Textured with each material's diffuse map; see dsfworld.render for what
-the preview leaves out.
+the drawing leaves out.
 """
 
 from __future__ import annotations
@@ -21,8 +21,7 @@ def city_box(world: World) -> tuple[float, float, float, float]:
 
 
 def draw(world: World, box, size: int, view: str, texture_size: int) -> tuple[np.ndarray, int]:
-    everything = set(range(len(world.class_names)))
-    mesh = world.flatten(world.library, world.base_instances(), everything, uv=True)
+    mesh = world.flatten(world.library, world.base_instances(), uv=True)
     margin = (box[2] - box[0]) * (0.5 if view == "oblique" else 0.0)  # oblique also shows what lies north
     mesh = clip_to_box(mesh, (box[0], box[1], box[2], box[3] + margin))
     return render.render(mesh, box, size=size, view=view, textures=world.textures(texture_size)), len(mesh.triangles)

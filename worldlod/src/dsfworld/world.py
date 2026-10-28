@@ -15,22 +15,21 @@ from dsfworld.formats.archive import Archive, kid, walk
 
 @dataclass
 class Mesh:
-    """World-space triangles with a material UID and class index per triangle."""
+    """World-space triangles with a material UID per triangle."""
 
     positions: np.ndarray  # (N, 3) float32
     triangles: np.ndarray  # (M, 3) int32
     materials: np.ndarray  # (M,) uint64
-    classes: np.ndarray  # (M,) uint8, index into World.class_names
     uv: np.ndarray | None = None  # (N, 2) float32, the first UV set (semantic 8), when asked for
 
     @staticmethod
     def empty() -> Mesh:
         z = np.zeros
-        return Mesh(z((0, 3), np.float32), z((0, 3), np.int32), z(0, np.uint64), z(0, np.uint8))
+        return Mesh(z((0, 3), np.float32), z((0, 3), np.int32), z(0, np.uint64))
 
     def select(self, keep: np.ndarray) -> Mesh:
         """Keep the triangles where keep is true (vertices are left as they are)."""
-        return Mesh(self.positions, self.triangles[keep], self.materials[keep], self.classes[keep], self.uv)
+        return Mesh(self.positions, self.triangles[keep], self.materials[keep], self.uv)
 
 
 @dataclass
@@ -91,26 +90,19 @@ class World:
     def base_instances(self) -> list[gebi.Instance]:
         return gebi.parse(self.archive.nonr(self.archive.global_region(), "GEBI")).instances
 
-    def flatten(
-        self, lib: modl.Library, instances, keep_classes: set[int], min_size: float = 0.0, *, uv: bool = False
-    ) -> Mesh:
-        """Place every instance's finest LOD in world space, keeping the given classes (with UVs if asked)."""
-        ps, ts, ms, cs, uvs = [], [], [], [], []
+    def flatten(self, lib: modl.Library, instances, *, uv: bool = False) -> Mesh:
+        """Place every instance's finest LOD in world space (with UVs if asked)."""
+        ps, ts, ms, uvs = [], [], [], []
         base = 0
         local: dict[int, tuple] = {}
         for inst in instances:
             part = lib.parts.get(inst.model_uid)
             if part is None:
                 continue
-            if min_size and part.size * inst.scale.max() < min_size:
-                continue
             lod = part.finest_lod()
             for su in lod.submodels if lod else []:
                 sub = lib.submodels.get(su)
                 if sub is None:
-                    continue
-                ci = self.class_index(sub.material)
-                if ci not in keep_classes:
                     continue
                 if su not in local:
                     local[su] = (*modl.submodel_geometry(lib, sub), modl.submodel_uv(lib, sub) if uv else None)
@@ -120,7 +112,6 @@ class World:
                     uvs.append(sub_uv)
                 ts.append(t + base)
                 ms.append(np.full(len(t), sub.material, np.uint64))
-                cs.append(np.full(len(t), ci, np.uint8))
                 base += len(p)
         if not ps:
             return Mesh.empty()
@@ -128,7 +119,6 @@ class World:
             np.vstack(ps).astype(np.float32),
             np.vstack(ts).astype(np.int32),
             np.concatenate(ms),
-            np.concatenate(cs),
             np.vstack(uvs).astype(np.float32) if uv else None,
         )
 

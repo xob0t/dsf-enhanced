@@ -13,7 +13,7 @@ Evidence tags: `static` (read from data or Driver.exe 1.04), `runtime`
 (measured in game), `hypothesis`. Addresses are VAs (image base 0x400000).
 
 Code: the `worldlod` pipeline in this folder (`../README.md`). `uv run worldlod
-preview --base` renders detailed regions next to the stock base for the same cell.
+render --cell R_360` draws the stock and the packed base LOD over the same cell.
 
 ## Archive layout (static)
 
@@ -128,7 +128,8 @@ building shells are the base megamesh with atlas materials
 (`alley_01_cream_groundfloor`, `ALLEY_01_Cream_Window`, `ROOFTOP_CORNER`).
 Material names come from `MACO/MATX`, which holds the source `.matxml` path.
 
-Images (R_360, colour = material, flat shading, 45-degree view from the south;
+Images (R_360, from an early preview stage since removed, colour = material,
+flat shading, 45-degree view from the south;
 `img/world-lod-R_360-base.png`, `img/world-lod-R_360-detail.png`). The base
 terrain looks speckled only because the preview point-samples its huge
 triangles sparsely. The detail cell has roads,
@@ -241,8 +242,8 @@ triangles in all (sea edge and the map border).
 Result of the default settings: 284 parts replaced, 7,480 submodels, 1,572,683
 triangles, 42.4 MB of buffers in 23 new DRSP groups; the archive grows from
 532 MB to 576 MB. `pack --verify` re-reads it and finds every reference intact,
-and `preview --base` on the packed archive draws the new ground under the stock
-building shells.
+and a preview of the packed archive drew the new ground under the stock building
+shells.
 
 ### Open for the in-game test
 

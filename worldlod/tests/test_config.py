@@ -17,7 +17,7 @@ def test_user_file_overrides_defaults(tmp_path):
 
 def test_unknown_key_is_an_error(tmp_path):
     user = tmp_path / "worldlod.toml"
-    user.write_text("[flatten]\nmin_size = 1\n")
+    user.write_text("[bake]\nmin_size = 1\n")
     with pytest.raises(KeyError):
         config.load(user)
 
@@ -25,14 +25,14 @@ def test_unknown_key_is_an_error(tmp_path):
 def test_digest_follows_settings(tmp_path):
     a = config.load(None)
     user = tmp_path / "worldlod.toml"
-    user.write_text("[flatten]\nmin_model_size = 2.0\n")
+    user.write_text("[bake]\nheight_offset = 1.0\n")
     b = config.load(user)
-    assert a.digest("flatten") != b.digest("flatten")
-    assert a.digest("preview") == b.digest("preview")
+    assert a.digest("bake") != b.digest("bake")
+    assert a.digest("render") == b.digest("render")
 
 
 def test_dump_is_valid_toml():
-    assert "[flatten]" in dump_toml(config.load(None).data)
+    assert "[bake]" in dump_toml(config.load(None).data)
 
 
 def test_material_classes():

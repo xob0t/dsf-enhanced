@@ -20,7 +20,7 @@ select = "all"
 # Material classes. A material belongs to the first class with a prefix that its
 # source path (below Levels/San_Francisco/{Materials,Textures}/[Permanent/],
 # lower case, '/' separators) starts with. Materials that match no prefix are
-# class "other". A class named "skip" is never drawn.
+# class "other". "skip" (occluders, tool materials) is in no [bake] classes.
 [classes]
 # The low-poly terrain material is ground too: 119 detailed regions draw it themselves.
 skip = ["occludermaterial", "r:/toolchain/"]
@@ -29,13 +29,6 @@ buildings = ["buildings/"]
 foliage = ["trees/", "hyperlowtree"]
 water = ["water/"]
 props = ["misc/"]
-
-[flatten]
-# Classes to keep from the detailed regions.
-classes = ["ground", "buildings", "foliage", "water", "props", "other"]
-# Drop placed models whose largest box edge (after instance scale) is below this
-# many metres. 0 keeps everything.
-min_model_size = 0.0
 
 [bake]
 # Classes from the detailed regions that go into the base LOD, replacing the
@@ -114,8 +107,3 @@ view = "top"
 # Largest texture side, in texels, decoded for drawing.
 texture_size = 256
 
-[preview]
-# Image width and height in pixels.
-size = 1024
-# "top" (orthographic, looking down) or "oblique" (45 degrees, from the south).
-view = "oblique"

@@ -45,10 +45,6 @@ def parser() -> argparse.ArgumentParser:
     sub = ap.add_subparsers(dest="command", required=True)
     sub.add_parser("config", help="print the merged settings")
     sub.add_parser("info", help="summarise the archive and the stock base LOD")
-    p = sub.add_parser("flatten", help="place each detailed region's models in world space")
-    p.add_argument("--force", action="store_true", help="rebuild regions that are up to date")
-    p = sub.add_parser("preview", help="render flattened regions to PNG")
-    p.add_argument("--base", action="store_true", help="also render the stock base LOD over each cell")
     sub.add_parser("install", help="back up the game's world archive and put the packed one in its place")
     sub.add_parser("uninstall", help="put the game's original world archive back")
     p = sub.add_parser("render", help="draw the stock and the packed base LOD over the same area")
@@ -66,7 +62,7 @@ def parser() -> argparse.ArgumentParser:
 
 def run_stage(cfg: config.Config, world: World, args: argparse.Namespace) -> None:
     """Run the stage named by args.command on the open world."""
-    from dsfworld.stages import bake, flatten, info, pack, preview, render
+    from dsfworld.stages import bake, info, pack, render
 
     if args.command == "render":
         area, name = args.area, args.name
@@ -77,8 +73,6 @@ def run_stage(cfg: config.Config, world: World, args: argparse.Namespace) -> Non
         return
     stages = {
         "info": lambda: info.run(world),
-        "flatten": lambda: flatten.run(cfg, world, force=args.force),
-        "preview": lambda: preview.run(cfg, world, base=args.base),
         "bake": lambda: bake.run(cfg, world, force=args.force),
         "pack": lambda: pack.run(cfg, world, verify=args.verify),
     }
