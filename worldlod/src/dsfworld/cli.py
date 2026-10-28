@@ -52,8 +52,16 @@ def parser() -> argparse.ArgumentParser:
 
     ap = argparse.ArgumentParser(prog="worldlod", description=__doc__)
     sub = ap.add_subparsers(dest="command", required=True, metavar="command")
-    sub.add_parser("install", parents=[common, built], help="build the new map (if needed) and put it into the game")
-    sub.add_parser("uninstall", parents=[common], help="put the game's original map back")
+    sub.add_parser(
+        "install",
+        parents=[common, built],
+        help="put DSF Enhanced into the game if it lacks it, build the new map (if needed) and install it",
+    )
+    sub.add_parser(
+        "uninstall",
+        parents=[common],
+        help="put the game's original map back (and remove DSF Enhanced if install added it)",
+    )
     sub.add_parser("build", parents=[common, built], help="build the new map without installing it")
     sub.add_parser("config", parents=[common, built], help="print the settings in effect")
     sub.add_parser("info", parents=[common, dev], help="summarise the game's world archive")

@@ -8,14 +8,13 @@ original bytes. uninstall restores the backup the same way. With the default
 work folder, install then deletes the build files (about 1 GB): uninstall only
 needs the backup.
 
-The built archive is bigger than three fixed-size engine pools allow; DSF
-Enhanced's [Limits] fixes lift them. install refuses without them, since the
-game would crash while loading.
+Before building, install puts DSF Enhanced into the game when it lacks the
+plugin's [Limits] fixes (see plugin.py); uninstall takes the plugin back out if
+install put it there.
 """
 
 from __future__ import annotations
 
-import configparser
 import json
 import shutil
 import subprocess
@@ -24,46 +23,39 @@ from pathlib import Path
 
 from dsfworld import ui
 from dsfworld.config import BACKUP_DIR, Config, remember_game
+from dsfworld.stages import plugin
 from dsfworld.stages.pack import check, sha256
 
 MANIFEST = "manifest.json"
-PLUGIN = "dsf_enhanced.asi"
-PLUGIN_URL = "https://github.com/xob0t/dsf-enhanced/releases"
-# [Limits] keys of DSF Enhanced the build needs, and the value at or below which each is off
-LIMITS = {"ResourceArenaExtraNodes": 0, "PendingResourceReferences": 16384, "SubmodelTableExtraNodes": 0}
 
 
-def plugin_problem(game: Path) -> str | None:
-    """Why the game in this folder can't load the build (DSF Enhanced missing, too old, limits off), or None."""
-    asi = game / PLUGIN
-    if not asi.exists():
-        return f"DSF Enhanced isn't installed ({PLUGIN} not in {game})"
-    if b"SubmodelTableExtraNodes" not in asi.read_bytes():
-        return "the installed DSF Enhanced is too old: it lacks the [Limits] fixes"
-    ini = configparser.ConfigParser(inline_comment_prefixes=(";",), strict=False)
-    path = game / "dsf_enhanced.ini"
-    if path.exists():
-        ini.read_string(path.read_text(encoding="utf-8", errors="replace"))
-    limits = ini["Limits"] if ini.has_section("Limits") else {}
-    for key, off in LIMITS.items():
-        value = limits.get(key)
-        if value is not None and value.strip().lstrip("-").isdigit() and int(value) <= off:
-            return f"dsf_enhanced.ini turns off [Limits] {key}"
-    return None
+def _manifest(cfg: Config) -> tuple[Path, dict]:
+    path = cfg.game_dir / BACKUP_DIR / MANIFEST
+    return path, (json.loads(path.read_text()) if path.exists() else {})
 
 
 def ready(cfg: Config) -> None:
-    """Stop before any work if install couldn't finish or the game couldn't load the build."""
+    """Stop before any work if install couldn't finish; put DSF Enhanced into the game if it lacks it."""
     if not cfg.game_archive.exists():
         raise SystemExit(f"No {cfg.game_archive.name} in {cfg.game_archive.parent}: is {cfg.game_dir} the game folder?")
     if _game_running():
         raise SystemExit("Driver.exe is running: close the game first")
-    problem = plugin_problem(cfg.game_dir)
+    game = cfg.game_dir
+    if plugin.has_fixes(game):
+        off = plugin.limits_off(game)  # the player's own ini: their call
+        if off:
+            raise SystemExit(f"{off}. The new map needs it, or the game crashes while loading.")
+        return
+    path, manifest = _manifest(cfg)
+    try:
+        plugin.install(game, path.parent, manifest)
+    finally:
+        if manifest:
+            path.parent.mkdir(exist_ok=True)
+            path.write_text(json.dumps(manifest, indent=2))
+    problem = plugin.problem(game)
     if problem:
-        raise SystemExit(
-            f"{problem}. The new map needs DSF Enhanced's engine limit fixes, or the game crashes while "
-            f"loading. Install DSF Enhanced from {PLUGIN_URL} first."
-        )
+        raise SystemExit(f"{problem}. The new map needs DSF Enhanced's engine limit fixes.")
 
 
 def _game_running() -> bool:
@@ -83,8 +75,8 @@ def _swap_in(source: Path, target: Path) -> None:
 
 def _paths(cfg: Config) -> tuple[Path, Path, Path]:
     target = cfg.game_archive
-    backup_dir = cfg.game_dir / BACKUP_DIR
-    return target, backup_dir / target.name, backup_dir / MANIFEST
+    path, _ = _manifest(cfg)
+    return target, path.parent / target.name, path
 
 
 def install(cfg: Config) -> None:
@@ -137,5 +129,6 @@ def uninstall(cfg: Config) -> None:
     with ui.status(f"Restoring the original {target.name}"):
         _swap_in(backup, target)
     manifest["installed"] = None
+    plugin.uninstall(cfg.game_dir, backup.parent, manifest)
     manifest_path.write_text(json.dumps(manifest, indent=2))
     ui.say(f"Restored the original {target}; the backup stays in {backup.parent}")

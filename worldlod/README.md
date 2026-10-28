@@ -11,23 +11,31 @@ it, with a backup. No game data is shipped.
 
 ## Install
 
-1. Install [DSF Enhanced](https://github.com/xob0t/dsf-enhanced/releases)
-   (version with `[Limits]` in its ini). The new map is bigger than the stock
-   engine allows; without DSF Enhanced the game crashes while loading it.
-2. Install [uv](https://docs.astral.sh/uv/getting-started/installation/).
-3. Close the game, open PowerShell in the game folder (the one with
+1. Install [uv](https://docs.astral.sh/uv/getting-started/installation/):
+
+   ```powershell
+   powershell -ExecutionPolicy ByPass -c "irm https://astral.sh/uv/install.ps1 | iex"
+   ```
+
+2. Close the game, open a new PowerShell in the game folder (the one with
    `Driver.exe`) and run:
 
    ```powershell
-   uvx --from "git+https://github.com/xob0t/dsf-enhanced#subdirectory=worldlod" worldlod install
+   $tag = (irm https://api.github.com/repos/xob0t/dsf-enhanced/releases/latest).tag_name
+   uvx --from "git+https://github.com/xob0t/dsf-enhanced@$tag#subdirectory=worldlod" worldlod install
    ```
 
-   uvx fetches worldlod and runs it once; nothing stays installed. The build
-   takes a minute or two, then worldlod puts the new map into the game (the
-   original is backed up in `worldlod-backup`) and deletes its build files.
-   From another folder, add `--game "C:\path\to\Driver San Francisco"`.
+   This runs worldlod from the latest release, once; nothing stays installed.
+   The new map is bigger than the stock engine allows, so if the game doesn't
+   have [DSF Enhanced](https://github.com/xob0t/dsf-enhanced) with its
+   `[Limits]` fixes yet, worldlod puts the latest release in (keeping your
+   `dsf_enhanced.ini` and ASI loader if you have them). Then it builds the map
+   (a minute or two), puts it into the game (the original is backed up in
+   `worldlod-backup`) and deletes its build files. From another folder, add
+   `--game "C:\path\to\Driver San Francisco"`.
 
-To undo, run the same line with `uninstall` instead of `install`.
+To undo, run the same two lines with `uninstall` instead of `install`: the
+original map comes back, and DSF Enhanced goes again if worldlod put it there.
 
 ## Options
 
@@ -79,9 +87,11 @@ A build is skipped while the code, the settings and the game's archive are
 unchanged; `bake` likewise reuses each region's earlier output. `--archive
 <file>` makes `info`, `bake` and `render` read another world archive.
 
-`install` refuses while the game runs, without DSF Enhanced's `[Limits]` fixes,
-when the build fails its check, or when the game's file changed since the last
-install (another mod). It swaps files by rename, so a hard link to the original
+`install` refuses while the game runs, when your `dsf_enhanced.ini` turns one
+of the needed `[Limits]` off, when the build fails its check, or when the game's
+file changed since the last install (another mod). DSF Enhanced comes from the
+repository's latest GitHub release; the files it replaces are kept in
+`worldlod-backup`. It swaps files by rename, so a hard link to the original
 keeps the original bytes.
 
 ## How it works
