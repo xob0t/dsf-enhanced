@@ -26,10 +26,10 @@ def draw(world: World, box, size: int, view: str, texture_size: int) -> tuple[np
     mesh = world.flatten(world.library, world.base_instances(), everything, uv=True)
     margin = (box[2] - box[0]) * (0.5 if view == "oblique" else 0.0)  # oblique also shows what lies north
     mesh = clip_to_box(mesh, (box[0], box[1], box[2], box[3] + margin))
-    return render.render(mesh, box, size, view, world.textures(texture_size)), len(mesh.triangles)
+    return render.render(mesh, box, size=size, view=view, textures=world.textures(texture_size)), len(mesh.triangles)
 
 
-def run(cfg: Config, world: World, area=None, size=None, view=None, name=None) -> None:
+def run(cfg: Config, world: World, *, area=None, size=None, view=None, name=None) -> None:
     settings = cfg.section("render")
     area = area or settings["area"]
     size = size or settings["size"]

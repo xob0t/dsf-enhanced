@@ -24,7 +24,9 @@ MANIFEST = "manifest.json"
 def _game_running() -> bool:
     if sys.platform != "win32":
         return False
-    out = subprocess.run(["tasklist", "/FI", "IMAGENAME eq Driver.exe"], capture_output=True, text=True).stdout
+    out = subprocess.run(
+        ["tasklist", "/FI", "IMAGENAME eq Driver.exe"], capture_output=True, text=True, check=False
+    ).stdout
     return "Driver.exe" in out
 
 

@@ -14,6 +14,10 @@ An ASI plugin for Driver: San Francisco on PC. Target exe version 1.04
 - Skips the legal-screen wait and dismisses the prompt about Ubisoft's servers, which no longer exist.
 - Lifts three engine limits that bigger world or car archives run into and crash on: 45,000 resources loaded at once (`[Limits] ResourceArenaExtraNodes`, 135,000 more by default, about 3 MB), 16,384 resource references waiting to be resolved (`[Limits] PendingResourceReferences`, 131,072 by default, 1.5 MB), and 15,000 submodels loaded at once (`[Limits] SubmodelTableExtraNodes`, 60,000 more by default, about 1.4 MB).
 
+## High-detail upper Shift (worldlod)
+
+[worldlod](worldlod/README.md) is a Python pipeline that rebuilds the city model the game draws at the upper Shift levels from the game's own detailed regions: real roads, paving, trees and building detail instead of the coarse low-poly city. It reads your `san_francisco.dngc` and writes a new one (no game data is shipped), and needs this plugin's `[Limits]` fixes to load.
+
 ## Install
 
 Copy three files from the release ZIP into the game folder, next to `Driver.exe`:

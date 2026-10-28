@@ -125,137 +125,169 @@ def clone_material(a: Archive, template: Entry, source: Entry, uid: int) -> Entr
     return rebuild(template)
 
 
-def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> Stats:
-    """Modify the parsed GEGR entry tree in place."""
-    stats = Stats()
-    mdxn = kid(gegr, "MDXN")
-    nonr = kid(gegr, "NONR")
-    drsps = [c for c in mdxn.children if c.tag == "DRSP"]
-    t_sbmc = next(walk(gegr, "SBMC"))
-    t_vxck = next(walk(gegr, "VXCK"))
-    t_ixck = next(walk(gegr, "IXCK"))
-    t_drsp = drsps[0]
-    ixhd_tail = a.read(kid(t_ixck, "IXHD"))[16:]
-    stock = {
-        "SBMC": {struct.unpack_from("<Q", a.read(kid(e, "SBBH")))[0] for e in walk(gegr, "SBMC")},
-        "VXCK": {struct.unpack_from("<Q", a.read(kid(e, "VXHD")))[0] for e in walk(gegr, "VXCK")},
-        "IXCK": {struct.unpack_from("<Q", a.read(kid(e, "IXHD")))[0] for e in walk(gegr, "IXCK")},
-    }
-    macos = {struct.unpack_from("<Q", a.read(kid(e, "MAHE")))[0]: e for e in walk(gegr, "MACO")}
-    stock["MACO"] = set(macos)
-    clones: dict[tuple[int, int], int] = {}  # (template, material) -> clone UID
-    new_maco: list[tuple[int, Entry]] = []
+KINDS = ("MACO", "SBMC", "VXCK", "IXCK")  # new resources, in the order they go into DRSP groups
+HEADERS = {"MACO": "MAHE", "SBMC": "SBBH", "VXCK": "VXHD", "IXCK": "IXHD"}  # the child that starts with the UID
 
-    def material_of(g: Group) -> int:
+
+@dataclass
+class _VertexBuffer:
+    uid: int
+    decl: bytes
+    rows: list[np.ndarray] = field(default_factory=list)
+    count: int = 0
+    users: list[int] = field(default_factory=list)  # submodel UIDs
+
+    def add(self, verts: np.ndarray, user: int) -> int:
+        """Append verts for the submodel user; returns their base vertex."""
+        base = self.count
+        self.rows.append(verts)
+        self.count += len(verts)
+        self.users.append(user)
+        return base
+
+
+class _Writer:
+    """Builds new GEGR resources from stock entries of the same kind, collected by kind."""
+
+    def __init__(self, a: Archive, gegr: Entry, uids: Allocator) -> None:
+        self.a, self.uids = a, uids
+        self.templates = {kind: next(walk(gegr, kind)) for kind in KINDS}
+        self.ixhd_tail = a.read(kid(self.templates["IXCK"], "IXHD"))[16:]
+        self.macos = {_uid(a, e, "MAHE"): e for e in walk(gegr, "MACO")}
+        self.stock = {kind: {_uid(a, e, HEADERS[kind]) for e in walk(gegr, kind)} for kind in KINDS}
+        self.new: dict[str, list[tuple[int, Entry]]] = {kind: [] for kind in KINDS}
+        self.clones: dict[tuple[int, int], int] = {}  # (template, material) -> clone UID
+        self.stats = Stats()
+
+    def material(self, g: Group) -> int:
+        """The material a group is drawn with: its own, or a clone of its retarget."""
         if not g.retarget:
             return g.material
         key = (g.retarget, g.material)
-        if key not in clones:
-            clones[key] = uids.new()
-            new_maco.append((clones[key], clone_material(a, macos[g.retarget], macos[g.material], clones[key])))
-        return clones[key]
+        if key not in self.clones:
+            uid = self.clones[key] = self.uids.new()
+            self.new["MACO"].append((uid, clone_material(self.a, self.macos[g.retarget], self.macos[g.material], uid)))
+        return self.clones[key]
 
-    mdid = next(walk(gegr, "MDID"))
-    old = list(struct.unpack_from(f"<{mdid.size // 8}Q", a.read(mdid)))
-
-    parts = modl.parse_modl(a.read(kid(nonr, "MODL")))
-    by_uid = {p.uid: p for p in parts}
-
-    new_sbmc, new_vxck, new_ixck = [], [], []
-    for cell in cells:
-        if not cell.groups:
-            continue
-        part = by_uid[cell.part_uid]
+    def cell(self, cell: CellBake, part: modl.Part) -> None:
+        """Write a cell's groups as new submodels and buffers and point the part's finest LOD at them."""
         lod = part.finest_lod()
-        layouts: dict[tuple, dict] = {}  # layout -> {uid, rows: [], users: [], decl}
-        ib_uid = uids.new()
-        indices: list[np.ndarray] = []
-        n_indices = 0
         flag_of = dict(zip(lod.submodels, lod.flags, strict=True))
         sub_uids, sub_flags = list(cell.keep), [flag_of[s] for s in cell.keep]
-        if cell.keep:
-            corners = _box_corners(part.box)
-            lo, hi = corners.min(0), corners.max(0)
-        else:
-            lo, hi = np.full(3, np.inf), np.full(3, -np.inf)
+        corners = _box_corners(part.box)
+        lo, hi = (corners.min(0), corners.max(0)) if cell.keep else (np.full(3, np.inf), np.full(3, -np.inf))
+        ib_uid = self.uids.new()
+        vbs: dict[tuple, _VertexBuffer] = {}
+        indices: list[np.ndarray] = []
+        n_indices = 0
+        t_sbmc = self.templates["SBMC"]
         for g in cell.groups:
-            vb = layouts.setdefault(
-                (g.stride, g.elements), {"uid": uids.new(), "rows": [], "count": 0, "users": [], "decl": g.decl}
-            )
-            pos_el = position_slot(g.elements)
-            material = material_of(g)
+            vb = vbs.get((g.stride, g.elements))
+            if vb is None:
+                vb = vbs[g.stride, g.elements] = _VertexBuffer(self.uids.new(), g.decl)
+            material, pos_el = self.material(g), position_slot(g.elements)
             for verts, tris in g.chunks():
-                sub = uids.new()
-                base = vb["count"]
-                vb["rows"].append(verts)
-                vb["count"] += len(verts)
-                vb["users"].append(sub)
+                sub = self.uids.new()
                 flat = tris.astype("<u2").ravel()
-                sbbh = struct.pack("<QQQQI12xQII8x", sub, material, vb["uid"], 0, base, ib_uid, n_indices, len(flat))
-                new_sbmc.append((sub, _like(t_sbmc, children=[_like(t_sbmc.children[0], sbbh)])))
+                base = vb.add(verts, sub)
+                sbbh = struct.pack("<QQQQI12xQII8x", sub, material, vb.uid, 0, base, ib_uid, n_indices, len(flat))
+                self.new["SBMC"].append((sub, _like(t_sbmc, children=[_like(t_sbmc.children[0], sbbh)])))
                 indices.append(flat)
                 n_indices += len(flat)
                 sub_uids.append(sub)
                 sub_flags.append(g.flag)
                 p = read_positions(verts, pos_el)
                 lo, hi = np.minimum(lo, p.min(0)), np.maximum(hi, p.max(0))
-                stats.submodels += 1
-                stats.triangles += len(tris)
-        for layout, vb in layouts.items():
-            data = np.vstack(vb["rows"]).tobytes()
-            users = vb["users"]
-            payloads = {
-                "VXHD": struct.pack("<QII", vb["uid"], vb["count"], layout[0]),
-                "VXDP": struct.pack(f"<{len(users)}Q", *users) + bytes(len(users)),
-                "VXDT": data,
-                "VDCL": vb["decl"],
-            }
-            kids = [_like(c, payloads[c.tag]) for c in t_vxck.children]
-            new_vxck.append((vb["uid"], _like(t_vxck, children=kids)))
-            stats.vertex_bytes += len(data)
-        idx = np.concatenate(indices).astype("<u2").tobytes()
-        payloads = {
-            "IXHD": struct.pack("<QII", ib_uid, n_indices, 2) + ixhd_tail,
-            "IXDP": struct.pack(f"<{len(sub_uids)}Q", *sub_uids),
-            "IXDT": idx,
-        }
-        new_ixck.append((ib_uid, _like(t_ixck, children=[_like(c, payloads[c.tag]) for c in t_ixck.children])))
-        stats.index_bytes += len(idx)
+                self.stats.submodels += 1
+                self.stats.triangles += len(tris)
+        for (stride, _), vb in vbs.items():
+            self._vertex_buffer(vb, stride)
+        self._index_buffer(ib_uid, sub_uids, np.concatenate(indices))
         lod.submodels, lod.flags = sub_uids, sub_flags
         part.box = _bounds_box(lo, hi)
         part.trailer = 0
-        for each in part.lods:
-            for f in each.flags:
-                part.trailer |= f
-        stats.cells += 1
-    stats.vertex_buffers, stats.index_buffers, stats.materials = len(new_vxck), len(new_ixck), len(new_maco)
-    if not new_sbmc:
-        return stats
+        for f in (f for each in part.lods for f in each.flags):
+            part.trailer |= f
+        self.stats.cells += 1
 
-    # DRSP groups, before the last stock DRSP (which holds MDID)
+    def _vertex_buffer(self, vb: _VertexBuffer, stride: int) -> None:
+        data = np.vstack(vb.rows).tobytes()
+        payloads = {
+            "VXHD": struct.pack("<QII", vb.uid, vb.count, stride),
+            "VXDP": struct.pack(f"<{len(vb.users)}Q", *vb.users) + bytes(len(vb.users)),
+            "VXDT": data,
+            "VDCL": vb.decl,
+        }
+        t = self.templates["VXCK"]
+        self.new["VXCK"].append((vb.uid, _like(t, children=[_like(c, payloads[c.tag]) for c in t.children])))
+        self.stats.vertex_bytes += len(data)
+
+    def _index_buffer(self, uid: int, users: list[int], indices: np.ndarray) -> None:
+        data = indices.astype("<u2").tobytes()
+        payloads = {
+            "IXHD": struct.pack("<QII", uid, len(indices), 2) + self.ixhd_tail,
+            "IXDP": struct.pack(f"<{len(users)}Q", *users),
+            "IXDT": data,
+        }
+        t = self.templates["IXCK"]
+        self.new["IXCK"].append((uid, _like(t, children=[_like(c, payloads[c.tag]) for c in t.children])))
+        self.stats.index_bytes += len(data)
+
+
+def _uid(a: Archive, e: Entry, header: str) -> int:
+    return struct.unpack_from("<Q", a.read(kid(e, header)))[0]
+
+
+def drsp_groups(entries: list[Entry]) -> list[list[Entry]]:
+    """entries in order, split into groups within the stock limits (children and bytes)."""
     groups: list[list[Entry]] = []
     size = 0
-    for _, e in new_maco + new_sbmc + new_vxck + new_ixck:
+    for e in entries:
         esize = entry_size(e)
         if not groups or len(groups[-1]) >= ENTRY_LIMIT or (size + esize > DRSP_BUDGET and groups[-1]):
             groups.append([])
             size = 0
         groups[-1].append(e)
         size += esize
+    return groups
+
+
+def insert_uids(ids: list[int], stock: dict[str, set[int]], new: dict[str, list[int]]) -> list[int]:
+    """MDID's UIDs with each kind's new UIDs after the last stock UID of that kind."""
+    out = list(ids)
+    for kind, uids in new.items():
+        if uids:
+            at = max(i for i, u in enumerate(out) if u in stock[kind]) + 1
+            out[at:at] = uids
+    return out
+
+
+def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> Stats:
+    """Modify the parsed GEGR entry tree in place."""
+    writer = _Writer(a, gegr, uids)
+    nonr = kid(gegr, "NONR")
+    parts = modl.parse_modl(a.read(kid(nonr, "MODL")))
+    by_uid = {p.uid: p for p in parts}
+    for cell in cells:
+        if cell.groups:
+            writer.cell(cell, by_uid[cell.part_uid])
+    stats, new = writer.stats, writer.new
+    stats.materials, stats.vertex_buffers, stats.index_buffers = (len(new[k]) for k in ("MACO", "VXCK", "IXCK"))
+    if not new["SBMC"]:
+        return stats
+
+    # new DRSP groups before the last stock one (which holds MDID)
+    mdxn = kid(gegr, "MDXN")
+    drsps = [c for c in mdxn.children if c.tag == "DRSP"]
+    new_drsps = [_like(drsps[0], children=g) for g in drsp_groups([e for k in KINDS for _, e in new[k]])]
     last = mdxn.children.index(drsps[-1])
-    new_drsps = [_like(t_drsp, children=g) for g in groups]
     mdxn.children[last:last] = new_drsps
     stats.drsp = len(new_drsps)
 
-    # MDID: new UIDs after the last stock UID of the same kind
-    out = list(old)
-    for kind, new in (("MACO", new_maco), ("SBMC", new_sbmc), ("VXCK", new_vxck), ("IXCK", new_ixck)):
-        if not new:
-            continue
-        at = max(i for i, u in enumerate(out) if u in stock[kind]) + 1
-        out[at:at] = [u for u, _ in new]
+    mdid = next(walk(gegr, "MDID"))
+    ids = list(struct.unpack_from(f"<{mdid.size // 8}Q", a.read(mdid)))
+    out = insert_uids(ids, writer.stock, {k: [u for u, _ in new[k]] for k in KINDS})
     mdid.payload = struct.pack(f"<{len(out)}Q", *out)
-
     kid(nonr, "MODL").payload = modl.build_modl(parts)
     return stats
 
@@ -272,7 +304,7 @@ def budgets(a: Archive, gesi: Entry) -> dict[int, int]:
     return {o: struct.unpack_from("<I", blob, o)[0] for o in (0x24, 0x28, 0x2C, 0x30)}
 
 
-def update_budgets(a: Archive, entries: list[Entry], stock_mdxn: int, stock_nonr: int) -> tuple[int, int]:
+def update_budgets(a: Archive, entries: list[Entry], stock_mdxn: int) -> tuple[int, int]:
     """Raise GESI's GEGR budgets by what GEGR's MDXN and NONR grew. Returns the new (MDXN, NONR) budgets."""
     gegr = next(e for e in entries if e.tag == "GEGR")
     gesi = kid(next(e for e in entries if e.tag == "GEGL"), "GESI")

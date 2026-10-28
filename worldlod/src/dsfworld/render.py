@@ -56,9 +56,26 @@ def _project(pts: np.ndarray, box, size: int, view: str):
     return sx.astype(np.int64), sy.astype(np.int64), depth
 
 
+def _sample_textures(colour: np.ndarray, uv: np.ndarray, bary: tuple[np.ndarray, np.ndarray], mi, images) -> None:
+    """Fill colour (n, 3) from each sample's material image at its UV (triangle UVs (n, 3, 2), barycentric u, v)."""
+    u, v = bary
+    uv = np.nan_to_num(uv.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)  # some stored UVs are inf
+    uv = uv[:, 0] + (uv[:, 1] - uv[:, 0]) * u[:, None] + (uv[:, 2] - uv[:, 0]) * v[:, None]
+    for m in np.unique(mi):
+        im = images[m]
+        if im is None:
+            continue
+        sel = mi == m
+        h, w, _ = im.shape
+        tx = (np.mod(uv[sel, 0], 1.0) * w).astype(np.int64) % w
+        ty = (np.mod(uv[sel, 1], 1.0) * h).astype(np.int64) % h
+        colour[sel] = im[ty, tx] / 255
+
+
 def render(
     mesh: Mesh,
     box: tuple[float, float, float, float],
+    *,
     size: int = 1024,
     view: str = "oblique",
     textures: dict[int, np.ndarray | None] | None = None,
@@ -111,17 +128,6 @@ def render(
             colour[:] = flat[mi]
         else:
             colour[:] = np.array(untextured)
-            uv = mesh.uv[t[idx]]
-            uv = np.nan_to_num(uv.astype(np.float64), nan=0.0, posinf=0.0, neginf=0.0)  # some stored UVs are inf
-            uv = uv[:, 0] + (uv[:, 1] - uv[:, 0]) * u[:, None] + (uv[:, 2] - uv[:, 0]) * v[:, None]
-            for m in np.unique(mi):
-                im = images[m]
-                if im is None:
-                    continue
-                sel = mi == m
-                h, w, _ = im.shape
-                tx = (np.mod(uv[sel, 0], 1.0) * w).astype(np.int64) % w
-                ty = (np.mod(uv[sel, 1], 1.0) * h).astype(np.int64) % h
-                colour[sel] = im[ty, tx] / 255
+            _sample_textures(colour, mesh.uv[t[idx]], (u, v), mi, images)
         img[key] = np.clip(colour * light[idx][:, None] * 255, 0, 255).astype(np.uint8)
     return img.reshape(size, size, 3)

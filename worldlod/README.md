@@ -9,11 +9,14 @@ freeway decks), props and building detail, but the engine only loads the few
 around the camera. This pipeline reads those regions from the player's own
 `san_francisco.dngc` and bakes them into a new base LOD. It ships no game data.
 
-Status: the bake works offline. It copies the detailed regions' ground (roads,
-kerbs, paving, freeway decks, terrain) into the base LOD in place of each
-cell's stock low-poly terrain, simplifies it and fills what it doesn't cover
-with the stock terrain: 1.05M triangles in 403 cells, 31 MB of vertex and
-index data. Installable with `worldlod install`; not yet tried in the game. Findings are in
+With the default settings it replaces each cell's stock low-poly terrain with
+the detailed regions' ground (simplified; the stock terrain fills what it
+doesn't cover), trees and bushes, building detail (storefronts, rooftop units,
+fire escapes, containers) and painted road text: 7.6M triangles in 408 cells,
+239 MB of vertex and index data. Tested in game (Shift, driving).
+
+The bigger base LOD needs DSF Enhanced's `[Limits]` fixes (on by default): the
+stock engine crashes loading it. Findings are in
 [research/world-lod.md](research/world-lod.md).
 
 ## Setup

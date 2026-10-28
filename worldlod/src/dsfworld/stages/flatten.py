@@ -50,7 +50,7 @@ def is_current(path: Path, digest: str) -> bool:
         return False
 
 
-def run(cfg: Config, world: World, force: bool = False) -> None:
+def run(cfg: Config, world: World, *, force: bool = False) -> None:
     out = output_dir(cfg)
     out.mkdir(parents=True, exist_ok=True)
     settings = cfg.section("flatten")
@@ -85,7 +85,7 @@ def run(cfg: Config, world: World, force: bool = False) -> None:
         rows.append([name, meta["column"], meta["row"], len(mesh.triangles), *counts.tolist()])
         print(f"[{n}/{len(names)}] {name} {state}: {len(mesh.triangles):,} triangles")
     header = ["region", "column", "row", "triangles", *world.class_names]
-    with open(out / "summary.tsv", "w", encoding="utf-8") as f:
+    with (out / "summary.tsv").open("w", encoding="utf-8") as f:
         f.write("\t".join(header) + "\n")
         f.writelines("\t".join(map(str, r)) + "\n" for r in rows)
     total = sum(r[3] for r in rows)

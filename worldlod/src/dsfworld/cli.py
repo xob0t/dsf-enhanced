@@ -5,9 +5,13 @@ from __future__ import annotations
 import argparse
 import tomllib
 from pathlib import Path
+from typing import TYPE_CHECKING
 
 from dsfworld import config
 from dsfworld.priority import set_priority
+
+if TYPE_CHECKING:
+    from dsfworld.world import World
 
 
 def dump_toml(data: dict) -> str:
@@ -34,7 +38,7 @@ def dump_toml(data: dict) -> str:
     return text
 
 
-def main(argv: list[str] | None = None) -> None:
+def parser() -> argparse.ArgumentParser:
     ap = argparse.ArgumentParser(prog="worldlod", description=__doc__)
     ap.add_argument("-c", "--config", type=Path, help=f"settings file (default: ./{config.USER_FILE} if present)")
     ap.add_argument("--archive", type=Path, help="read this world archive instead of the game's (e.g. a packed one)")
@@ -57,54 +61,50 @@ def main(argv: list[str] | None = None) -> None:
     p.add_argument("--force", action="store_true", help="rebuild regions that are up to date")
     p = sub.add_parser("pack", help="write the world archive with the baked cells in GEGR")
     p.add_argument("--verify", action="store_true", help="check the output (identity with no bake, references with)")
-    args = ap.parse_args(argv)
+    return ap
 
+
+def run_stage(cfg: config.Config, world: World, args: argparse.Namespace) -> None:
+    """Run the stage named by args.command on the open world."""
+    from dsfworld.stages import bake, flatten, info, pack, preview, render
+
+    if args.command == "render":
+        area, name = args.area, args.name
+        if args.cell:
+            area = world.archive.cell(world.archive.resource(args.cell)).box
+            name = name or args.cell
+        render.run(cfg, world, area=area, size=args.size, view=args.view, name=name)
+        return
+    stages = {
+        "info": lambda: info.run(world),
+        "flatten": lambda: flatten.run(cfg, world, force=args.force),
+        "preview": lambda: preview.run(cfg, world, base=args.base),
+        "bake": lambda: bake.run(cfg, world, force=args.force),
+        "pack": lambda: pack.run(cfg, world, verify=args.verify),
+    }
+    stages[args.command]()
+
+
+def main(argv: list[str] | None = None) -> None:
+    args = parser().parse_args(argv)
     cfg = config.load(args.config)
     if args.archive:
         cfg.data["game"]["archive"] = str(args.archive.resolve())
-    if args.command in ("install", "uninstall"):
-        from dsfworld.stages import install
-
-        set_priority(cfg.section("run")["priority"])
-        (install.install if args.command == "install" else install.uninstall)(cfg)
-        return
     if args.command == "config":
         print(dump_toml(cfg.data), end="")
         return
     set_priority(cfg.section("run")["priority"])
+    if args.command in ("install", "uninstall"):
+        from dsfworld.stages import install
+
+        (install.install if args.command == "install" else install.uninstall)(cfg)
+        return
 
     from dsfworld.world import World
 
     world = World.open(cfg)
     with world.archive:
-        if args.command == "info":
-            from dsfworld.stages import info
-
-            info.run(cfg, world)
-        elif args.command == "flatten":
-            from dsfworld.stages import flatten
-
-            flatten.run(cfg, world, force=args.force)
-        elif args.command == "preview":
-            from dsfworld.stages import preview
-
-            preview.run(cfg, world, base=args.base)
-        elif args.command == "render":
-            from dsfworld.stages import render
-
-            area, name = args.area, args.name
-            if args.cell:
-                area = world.archive.cell(world.archive.resource(args.cell)).box
-                name = name or args.cell
-            render.run(cfg, world, area, args.size, args.view, name)
-        elif args.command == "bake":
-            from dsfworld.stages import bake
-
-            bake.run(cfg, world, force=args.force)
-        elif args.command == "pack":
-            from dsfworld.stages import pack
-
-            pack.run(cfg, world, verify=args.verify)
+        run_stage(cfg, world, args)
 
 
 if __name__ == "__main__":

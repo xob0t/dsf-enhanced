@@ -12,7 +12,7 @@ from dsfworld.stages import flatten
 from dsfworld.world import World, clip_to_box
 
 
-def run(cfg: Config, world: World, base: bool = False) -> None:
+def run(cfg: Config, world: World, *, base: bool = False) -> None:
     flatten.run(cfg, world)
     out = cfg.work_dir / "preview"
     out.mkdir(parents=True, exist_ok=True)
@@ -26,11 +26,11 @@ def run(cfg: Config, world: World, base: bool = False) -> None:
     for name in names:
         mesh, meta = flatten.load(flatten.output_dir(cfg) / f"{name}.npz")
         box = tuple(meta["box"])
-        render.write_png(out / f"{name}.png", render.render(mesh, box, size, view))
+        render.write_png(out / f"{name}.png", render.render(mesh, box, size=size, view=view))
         line = f"{name}: {len(mesh.triangles):,} triangles"
         if base_mesh is not None:
             cell = clip_to_box(base_mesh, box)
-            render.write_png(out / f"{name}_base.png", render.render(cell, box, size, view))
+            render.write_png(out / f"{name}_base.png", render.render(cell, box, size=size, view=view))
             line += f", stock base {len(cell.triangles):,}"
         print(line)
     print(f"images in {out}")

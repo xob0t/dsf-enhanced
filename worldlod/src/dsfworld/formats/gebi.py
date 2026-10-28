@@ -67,7 +67,7 @@ def quat32(v: int) -> tuple[float, float, float, float]:
     total = q[ten] ** 2
     shift = 9
     for i in range(4):
-        if i != big and i != ten:
+        if i not in {big, ten}:
             q[i] = (((v >> shift) & 0x1FF) - 0xFF) * QUAT_9BIT
             total += q[i] ** 2
             shift = 0

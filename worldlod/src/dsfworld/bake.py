@@ -32,6 +32,7 @@ from dataclasses import dataclass, field
 import numpy as np
 
 from dsfworld.formats import gebi, modl
+from dsfworld.formats.archive import SubModel
 from dsfworld.world import World
 
 MAX_VERTICES = 0xFFFF
@@ -47,7 +48,7 @@ POSITION_TYPES = {INT16: ("<i2", 1 / 64), FLOAT16: ("<f2", 1.0), 9: ("<f4", 1.0)
 
 
 def _span(element) -> tuple[int, str, int]:
-    _, comps, typ, off = element
+    _, _, typ, off = element
     dtype = POSITION_TYPES[typ][0] if typ in POSITION_TYPES else "u1"
     return off, dtype, np.dtype(dtype).itemsize
 
@@ -156,16 +157,75 @@ class CardTemplate:
     decl: bytes
 
 
-def expand_cards(rows, elements, slot, linear, offset, inv_t, scale, cards: CardTemplate):
-    """Leaf-card vertices -> flat quad corners in the template layout, or None if out of range.
-    Returns (vertex rows, corner positions in the target frame)."""
-    data_off = next(e[3] for e in elements if e[0] == POSITION)
-    data = rows[:, data_off : data_off + 8].copy().view("<f2").astype(np.float64)  # u, v, angle, size
-    pivot = read_positions(rows, slot) @ linear + offset
-    angle, size = data[:, 2], data[:, 3] * scale
-    corner = np.stack([size * np.sin(angle), np.zeros_like(size), size * np.cos(angle)], 1) @ inv_t
+@dataclass(frozen=True)
+class BakeOptions:
+    """bake_region settings ([bake] in the config)."""
+
+    height_offset: float = 0.0  # metres, world Y; negative moves down
+    exclude: tuple[str, ...] = ()  # material path prefixes left out
+    min_size: dict[int, float] = field(default_factory=dict)  # class -> smallest placed model kept, metres
+    leaf_cards: str = "keep"  # "keep", "flat" (expand with cards) or "drop"
+    cards: CardTemplate | None = None
+
+
+@dataclass(frozen=True)
+class Placement:
+    """An instance's transform from its model's frame into the target part's frame (row vectors)."""
+
+    linear: np.ndarray  # source local -> target local
+    offset: np.ndarray
+    to_target: np.ndarray  # world directions -> target local
+    normal_matrix: np.ndarray
+    scale: float  # the instance's vertical scale
+
+    @classmethod
+    def of(cls, inst: gebi.Instance, target: np.ndarray, height_offset: float = 0.0) -> Placement:
+        a_t, t_t = target[:3, :3], target[3, :3]
+        a_s, t_s = inst.matrix[:3, :3], inst.matrix[3, :3]
+        to_target = np.linalg.inv(a_t)
+        linear = a_s @ to_target
+        offset = (t_s - t_t + (0.0, height_offset, 0.0)) @ to_target
+        return cls(linear, offset, to_target, np.linalg.inv(linear).T, float(inst.scale[1]))
+
+    def points(self, p: np.ndarray) -> np.ndarray:
+        return p @ self.linear + self.offset
+
+    def normals(self, n: np.ndarray) -> np.ndarray:
+        n = n @ self.normal_matrix
+        return n / (np.linalg.norm(n, axis=1, keepdims=True) + 1e-12)
+
+    @property
+    def mirrored(self) -> bool:
+        return bool(np.linalg.det(self.linear) < 0)
+
+    @property
+    def up(self) -> np.ndarray:
+        """World up in the target frame, unit length."""
+        up = np.array([0.0, 1.0, 0.0]) @ self.to_target
+        return up / np.linalg.norm(up)
+
+
+@dataclass
+class Vertices:
+    """One placed submodel's vertices (both streams side by side) and triangles."""
+
+    rows: np.ndarray  # (n, stride) uint8
+    triangles: np.ndarray  # (m, 3) int64
+    elements: tuple
+    layout: tuple  # (stride, elements)
+    decl: bytes
+
+
+def expand_cards(v: Vertices, place: Placement, cards: CardTemplate) -> np.ndarray | None:
+    """Turn leaf-card vertices into flat quad corners in the template layout, in place. None if they
+    don't fit the template's position type, else the corner positions in the target frame."""
+    data_off = next(e[3] for e in v.elements if e[0] == POSITION)
+    data = v.rows[:, data_off : data_off + 8].copy().view("<f2").astype(np.float64)  # u, v, angle, size
+    pivot = place.points(read_positions(v.rows, position_slot(v.elements)))
+    angle, size = data[:, 2], data[:, 3] * place.scale
+    corner = np.stack([size * np.sin(angle), np.zeros_like(size), size * np.cos(angle)], 1) @ place.to_target
     q = pivot + corner
-    out = np.zeros((len(rows), cards.stride), np.uint8)
+    out = np.zeros((len(v.rows), cards.stride), np.uint8)
     t_sems = {e[0]: e for e in cards.elements}
     p_el = t_sems[POSITION]
     if not write_positions(out, p_el, q):
@@ -173,14 +233,14 @@ def expand_cards(rows, elements, slot, linear, offset, inv_t, scale, cards: Card
     if p_el[2] == INT16 and p_el[1] == 4:
         out[:, p_el[3] + 6 : p_el[3] + 8] = np.frombuffer(struct.pack("<h", 64), np.uint8)  # w = 1.0
     uv = t_sems[8]
-    out[:, uv[3] : uv[3] + 4] = data[:, :2].astype("<f2").view(np.uint8).reshape(len(rows), 4)
+    out[:, uv[3] : uv[3] + 4] = data[:, :2].astype("<f2").view(np.uint8).reshape(len(out), 4)
     if NORMAL in t_sems:
-        up = np.array([0.0, 1.0, 0.0]) @ inv_t
-        up /= np.linalg.norm(up)
-        write_normals(out, t_sems[NORMAL], np.repeat(up[None], len(rows), 0))
+        write_normals(out, t_sems[NORMAL], np.repeat(place.up[None], len(out), 0))
         if t_sems[NORMAL][2] == UBYTE4:
             out[:, t_sems[NORMAL][3] + 3] = 255
-    return out, q
+    v.rows, v.elements, v.layout, v.decl = out, cards.elements, (cards.stride, cards.elements), cards.decl
+    v.triangles = face_up(v.triangles, q, place.up)
+    return q
 
 
 def face_up(tri: np.ndarray, q: np.ndarray, up: np.ndarray) -> np.ndarray:
@@ -202,8 +262,76 @@ class Result:
         return sum(len(g.triangles) for g in self.groups)
 
 
-def _frame(matrix: np.ndarray) -> tuple[np.ndarray, np.ndarray]:
-    return matrix[:3, :3], matrix[3, :3]
+def unsupported(elements: tuple) -> str | None:
+    """Why a vertex layout can't be baked, or None."""
+    sems = {e[0]: e for e in elements}
+    if len(sems) != len(elements):
+        return "semantic in both streams"
+    pos = position_slot(elements)
+    if pos is None or pos[2] not in POSITION_TYPES or pos[1] < 3:
+        return "unsupported position type"
+    if set(sems) - {POSITION, NORMAL} - COPIED:
+        return "unhandled semantic"
+    if NORMAL in sems and sems[NORMAL][2] not in (UBYTE4, FLOAT16):
+        return "unsupported semantic 5 type"
+    return None
+
+
+def gather(lib: modl.Library, sub: SubModel, skipped: Counter) -> Vertices | None:
+    """A submodel's vertices with its second vertex stream (the per-region colour of many props) folded
+    in; None (counted in skipped) if a buffer is missing or the layout unsupported."""
+    vb = lib.vbs.get(sub.vb)
+    if vb is None:
+        skipped["missing vertex buffer"] += 1
+        return None
+    vb2 = lib.vbs.get(sub.vb2) if sub.vb2 else None
+    if sub.vb2 and vb2 is None:
+        skipped["missing second vertex stream"] += 1
+        return None
+    elements, layout, decl = tuple(vb.elements), vb.layout, vb.decl
+    if vb2 is not None:
+        elements += tuple((e[0], e[1], e[2], e[3] + vb.stride) for e in vb2.elements)
+        layout, decl = (vb.stride + vb2.stride, elements), combined_decl(vb.decl, vb2.decl)
+    if problem := unsupported(elements):
+        skipped[problem] += 1
+        return None
+    idx = lib.ibs[sub.ib][sub.first_index : sub.first_index + sub.index_count].astype(np.int64) + sub.base_vertex
+    used, tri = np.unique(idx, return_inverse=True)
+    rows = vb.rows()[used].copy()
+    if vb2 is not None:
+        second = used - sub.base_vertex + sub.vb2_base
+        if second.max(initial=0) >= vb2.count:
+            skipped["second stream range"] += 1
+            return None
+        rows = np.hstack([rows, vb2.rows()[second]])
+    return Vertices(rows, tri.reshape(-1, 3), elements, layout, decl)
+
+
+def move(v: Vertices, place: Placement) -> bool:
+    """Move positions and normals into the target frame, in place; False if they don't fit."""
+    pos = position_slot(v.elements)
+    if not write_positions(v.rows, pos, place.points(read_positions(v.rows, pos))):
+        return False
+    normal = next((e for e in v.elements if e[0] == NORMAL), None)
+    if normal is not None and normal[2] == UBYTE4:
+        write_normals(v.rows, normal, place.normals(read_normals(v.rows, normal)))
+    if place.mirrored:
+        v.triangles = v.triangles[:, ::-1]
+    return True
+
+
+def weld(key: tuple, pieces: list[tuple[np.ndarray, np.ndarray]], decl: bytes) -> Group:
+    """One group from pieces of (rows, triangles), identical vertices merged, first-seen order kept."""
+    material, flag, (stride, elements), retarget = key
+    rows = np.vstack([r for r, _ in pieces])
+    base = np.cumsum([0] + [len(r) for r, _ in pieces[:-1]])
+    tris = np.vstack([t + b for (_, t), b in zip(pieces, base, strict=True)])
+    view = np.ascontiguousarray(rows).view(np.dtype((np.void, rows.shape[1]))).ravel()
+    _, first, inverse = np.unique(view, return_index=True, return_inverse=True)
+    order = np.argsort(first)
+    rank = np.empty_like(order)
+    rank[order] = np.arange(len(order))
+    return Group(material, flag, stride, elements, decl, rows[np.sort(first)], rank[inverse][tris], retarget)
 
 
 def bake_region(
@@ -212,129 +340,53 @@ def bake_region(
     instances: list[gebi.Instance],
     target: np.ndarray,
     keep: set[int],
-    height_offset: float = 0.0,
-    exclude: tuple[str, ...] = (),
-    min_size: dict[int, float] | None = None,
-    leaf_cards: str = "keep",
-    cards: CardTemplate | None = None,
-):
-    """Copy the submodels of the given classes placed by instances into the frame of target (a 4x4 matrix),
-    moved up by height_offset metres (world Y; negative moves down). Materials whose path starts with
-    one of exclude are left out, and so are a class's placed models smaller than min_size[class]
-    metres (longest box edge after instance scale). A second vertex stream (the per-region colour of
-    many props) is folded into the copied vertices. leaf_cards: "keep" (copy leaf-card trees as they
-    are), "flat" (expand them with the cards template) or "drop"."""
-    a_t, t_t = _frame(target)
-    inv_t = np.linalg.inv(a_t)
+    *,
+    options: BakeOptions | None = None,
+) -> Result:
+    """Copy the submodels of the classes in keep placed by instances into the frame of target (a 4x4
+    matrix), grouped by material, flag and vertex layout, with options' offset, exclusions, size limits
+    and leaf-card handling."""
+    options = options or BakeOptions()
     pieces: dict[tuple, list] = {}
-    skipped: Counter = Counter()
     decls: dict[tuple, bytes] = {}
+    skipped: Counter = Counter()
     for inst in instances:
         part = lib.parts.get(inst.model_uid)
-        if part is None:
-            continue
-        lod = part.finest_lod()
+        lod = part.finest_lod() if part else None
         if lod is None:
             continue
+        place = Placement.of(inst, target, options.height_offset)
         placed_size = part.size * float(inst.scale.max())
-        a_s, t_s = _frame(inst.matrix)
-        linear = a_s @ inv_t  # source local -> target local (row vectors)
-        offset = (t_s - t_t + (0.0, height_offset, 0.0)) @ inv_t
-        normal_m = np.linalg.inv(linear).T
-        flip = np.linalg.det(linear) < 0
         for su, flag in zip(lod.submodels, lod.flags, strict=True):
             sub = lib.submodels.get(su)
-            if sub is None or world.class_index(sub.material) not in keep:
+            if sub is None or not _wanted(world, sub.material, keep, options, placed_size):
                 continue
-            if exclude and world.materials.paths.get(sub.material, "").startswith(exclude):
+            v = gather(lib, sub, skipped)
+            if v is None:
                 continue
-            if min_size and placed_size < min_size.get(world.class_index(sub.material), 0.0):
+            key_flag, retarget = flag, 0
+            if position_slot(v.elements)[0] != NORMAL or options.leaf_cards == "keep":
+                fits = move(v, place)
+            elif options.leaf_cards == "flat" and options.cards is not None:
+                fits = expand_cards(v, place, options.cards) is not None
+                key_flag, retarget = options.cards.flag, options.cards.material
+            else:
                 continue
-            vb = lib.vbs.get(sub.vb)
-            if vb is None:
-                skipped["missing vertex buffer"] += 1
-                continue
-            vb2 = None
-            if sub.vb2:
-                vb2 = lib.vbs.get(sub.vb2)
-                if vb2 is None:
-                    skipped["missing second vertex stream"] += 1
-                    continue
-            elements = tuple(vb.elements)
-            if vb2 is not None:
-                elements += tuple((e[0], e[1], e[2], e[3] + vb.stride) for e in vb2.elements)
-            sems = {e[0]: e for e in elements}
-            if len(sems) != len(elements):
-                skipped["semantic in both streams"] += 1
-                continue
-            pos = position_slot(elements)
-            if pos is None or pos[2] not in POSITION_TYPES or pos[1] < 3:
-                skipped["unsupported position type"] += 1
-                continue
-            if set(sems) - {POSITION, NORMAL} - COPIED:
-                skipped["unhandled semantic"] += 1
-                continue
-            if NORMAL in sems and sems[NORMAL][2] not in (UBYTE4, FLOAT16):
-                skipped["unsupported semantic 5 type"] += 1
-                continue
-            idx = lib.ibs[sub.ib][sub.first_index : sub.first_index + sub.index_count].astype(np.int64)
-            idx += sub.base_vertex
-            used, tri = np.unique(idx, return_inverse=True)
-            rows = vb.rows()[used].copy()
-            if vb2 is not None:
-                second = used - sub.base_vertex + sub.vb2_base
-                if second.max(initial=0) >= vb2.count:
-                    skipped["second stream range"] += 1
-                    continue
-                rows = np.hstack([rows, vb2.rows()[second]])
-            if pos[0] == NORMAL and leaf_cards != "keep":
-                if leaf_cards == "drop" or cards is None:
-                    continue
-                expanded = expand_cards(rows, elements, pos, linear, offset, inv_t, float(inst.scale[1]), cards)
-                if expanded is None:
-                    skipped["outside the target frame"] += 1
-                    continue
-                rows, q = expanded
-                tri = face_up(tri.reshape(-1, 3), q, np.array([0.0, 1.0, 0.0]) @ inv_t)
-                layout = (cards.stride, cards.elements)
-                decls[layout] = cards.decl
-                pieces.setdefault((sub.material, cards.flag, layout, cards.material), []).append((rows, tri))
-                continue
-            if not write_positions(rows, pos, read_positions(rows, pos) @ linear + offset):
+            if not fits:
                 skipped["outside the target frame"] += 1
                 continue
-            if NORMAL in sems and sems[NORMAL][2] == UBYTE4:
-                n = read_normals(rows, sems[NORMAL]) @ normal_m
-                n /= np.linalg.norm(n, axis=1, keepdims=True) + 1e-12
-                write_normals(rows, sems[NORMAL], n)
-            tri = tri.reshape(-1, 3)
-            if flip:
-                tri = tri[:, ::-1]
-            if vb2 is None:
-                layout, decl = vb.layout, vb.decl
-            else:
-                layout = (vb.stride + vb2.stride, elements)
-                decl = combined_decl(vb.decl, vb2.decl)
-            key = (sub.material, flag, layout, 0)
-            decls[layout] = decl
-            pieces.setdefault(key, []).append((rows, tri))
-    groups = []
-    for (material, flag, layout, retarget), parts in pieces.items():
-        rows = np.vstack([r for r, _ in parts])
-        base = np.cumsum([0] + [len(r) for r, _ in parts[:-1]])
-        tris = np.vstack([t + b for (_, t), b in zip(parts, base, strict=True)])
-        # weld identical vertices
-        view = np.ascontiguousarray(rows).view(np.dtype((np.void, rows.shape[1]))).ravel()
-        _, first, inverse = np.unique(view, return_index=True, return_inverse=True)
-        order = np.argsort(first)  # keep the original vertex order
-        rank = np.empty_like(order)
-        rank[order] = np.arange(len(order))
-        groups.append(
-            Group(
-                material, flag, layout[0], layout[1], decls[layout], rows[np.sort(first)], rank[inverse][tris], retarget
-            )
-        )
-    return Result(groups, skipped)
+            decls[v.layout] = v.decl
+            pieces.setdefault((sub.material, key_flag, v.layout, retarget), []).append((v.rows, v.triangles))
+    return Result([weld(key, p, decls[key[2]]) for key, p in pieces.items()], skipped)
+
+
+def _wanted(world: World, material: int, keep: set[int], options: BakeOptions, placed_size: float) -> bool:
+    cls = world.class_index(material)
+    if cls not in keep:
+        return False
+    if options.exclude and world.materials.paths.get(material, "").startswith(options.exclude):
+        return False
+    return placed_size >= options.min_size.get(cls, 0.0)
 
 
 FILL_GRID = 2.0  # metres per coverage cell

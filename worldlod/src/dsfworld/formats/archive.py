@@ -56,7 +56,7 @@ class Cell:
 class Archive:
     def __init__(self, path: Path):
         self.path = path
-        self.f = open(path, "rb")  # noqa: SIM115 - lives as long as the archive
+        self.f = Path(path).open("rb")  # noqa: SIM115 - lives as long as the archive
         self.root = read_chunk(self.f)
         self.entries: list[Entry] = self.root.entries
 

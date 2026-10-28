@@ -133,7 +133,7 @@ def build_modl(parts: list[Part]) -> bytes:
     return bytes(out + uids + flags)
 
 
-def load(a: Archive, res, lib: Library | None = None, geometry: bool = True) -> Library:
+def load(a: Archive, res, lib: Library | None = None, *, geometry: bool = True) -> Library:
     """Add one resource's parts and submodels (and, with geometry, its buffers) to lib."""
     lib = lib if lib is not None else Library()
     modl = a.nonr(res, "MODL")

@@ -62,99 +62,129 @@ def card_template(world: World, path: str) -> bake.CardTemplate:
     raise SystemExit(f"[bake] leaf_card_material: no GEGR submodel draws {path!r} with a position and UV")
 
 
-def run(cfg: Config, world: World, force: bool = False) -> list[CellBake]:
+def options(cfg: Config, world: World) -> tuple[set[int], bake.BakeOptions]:
+    """The classes to bake and the bake options from [bake]."""
     settings = cfg.section("bake")
-    if not settings["classes"]:
-        return []
     unknown = set(settings["classes"]) - set(world.class_names)
     if unknown:
         raise SystemExit(f"[bake] classes: unknown class {', '.join(sorted(unknown))}")
+    if settings["leaf_cards"] not in ("flat", "keep", "drop"):
+        raise SystemExit('[bake] leaf_cards must be "flat", "keep" or "drop"')
     keep = {world.class_names.index(c) for c in settings["classes"]}
+    return keep, bake.BakeOptions(
+        height_offset=settings["height_offset"],
+        exclude=tuple(settings["exclude"]),
+        min_size={
+            world.class_names.index(c): v for c, v in settings["min_model_size"].items() if c in world.class_names
+        },
+        leaf_cards=settings["leaf_cards"],
+        cards=card_template(world, settings["leaf_card_material"]) if settings["leaf_cards"] == "flat" else None,
+    )
+
+
+def _classes(world: World, names: list[str]) -> set[int]:
+    return {world.class_names.index(c) for c in names if c in world.class_names}
+
+
+def bake_cell(
+    cfg: Config,
+    world: World,
+    name: str,
+    target: np.ndarray,
+    *,
+    stock_terrain: list[tuple[int, int]],
+    keep: set[int],
+    opts: bake.BakeOptions,
+) -> bake.Result:
+    """One region baked into the frame of target, simplified by class, with the stock terrain it leaves
+    uncovered kept as fill."""
+    settings = cfg.section("bake")
+    lib, g = world.region(name)
+    result = bake.bake_region(world, lib, g.instances, target, keep, options=opts)
+    s = cfg.section("simplify")
+    simplified = _classes(world, s["classes"])
+    to_simplify = [x for x in result.groups if world.class_index(x.material) in simplified]
+    rest = [x for x in result.groups if world.class_index(x.material) not in simplified]
+    to_simplify = simplify.cell(
+        to_simplify, s["error"], s["normal_weight"], s["colour_weight"], lock_border=s["lock_border"]
+    )
+    result.groups = to_simplify + rest
+    cover_classes = _classes(world, settings["fill_cover"])
+    cover = [x for x in result.groups if world.class_index(x.material) in cover_classes]
+    if cover and settings["fill_drop"] >= 0:
+        result.groups += bake.fill_from_stock(world.library, stock_terrain, cover, settings["fill_drop"])
+    return result
+
+
+def _load(path: Path, digest: str) -> dict | None:
+    if not path.exists():
+        return None
+    with path.open("rb") as f:
+        cached = pickle.load(f)
+    return cached if cached.get("digest") == digest else None
+
+
+def _save(path: Path, cached: dict) -> None:
+    tmp = path.with_suffix(".tmp")
+    with tmp.open("wb") as f:
+        pickle.dump(cached, f, protocol=pickle.HIGHEST_PROTOCOL)
+    tmp.replace(path)
+
+
+def run(cfg: Config, world: World, *, force: bool = False) -> list[CellBake]:
+    settings = cfg.section("bake")
+    if not settings["classes"]:
+        return []
+    keep, opts = options(cfg, world)
     out = output_dir(cfg)
     out.mkdir(parents=True, exist_ok=True)
     source = world.archive.path
     digest = f"{VERSION}:{cfg.digest(*SECTIONS)}:{source}:{source.stat().st_size}"
     stock = targets(world, settings["replace"])
-    if settings["leaf_cards"] not in ("flat", "keep", "drop"):
-        raise SystemExit('[bake] leaf_cards must be "flat", "keep" or "drop"')
-    cards = card_template(world, settings["leaf_card_material"]) if settings["leaf_cards"] == "flat" else None
     names = world.region_names(cfg.section("regions")["select"])
     cells, rows, no_target = [], [], []
     skipped_total: Counter = Counter()
     for n, name in enumerate(names, 1):
-        res = world.archive.resource(name)
-        cell = world.archive.cell(res)
+        cell = world.archive.cell(world.archive.resource(name))
         centre = (round(cell.min_x + cell.size / 2), round(cell.min_z + cell.size / 2))
         if centre not in stock:
             no_target.append(name)
             continue
         part_uid, matrix = stock[centre]
         lod = world.library.parts[part_uid].finest_lod()
-        replaced = [
-            world.materials.paths.get(world.library.submodels[s].material, "").startswith(settings["replace"])
-            for s in lod.submodels
-        ]
-        kept = [s for s, r in zip(lod.submodels, replaced, strict=True) if not r]
-        stock_terrain = [(s, f) for s, f, r in zip(lod.submodels, lod.flags, replaced, strict=True) if r]
+        flags = dict(zip(lod.submodels, lod.flags, strict=True))
+        replaced = {
+            s for s in lod.submodels
+            if world.materials.paths.get(world.library.submodels[s].material, "").startswith(settings["replace"])
+        }  # fmt: skip
         path = out / f"{name}.pkl"
-        cached = None
-        if not force and path.exists():
-            with path.open("rb") as f:
-                cached = pickle.load(f)
-            if cached.get("digest") != digest:
-                cached = None
+        cached = None if force else _load(path, digest)
+        state = "cached"
         if cached is None:
-            lib, g = world.region(name)
-            result = bake.bake_region(
-                world,
-                lib,
-                g.instances,
-                matrix,
-                keep,
-                settings["height_offset"],
-                tuple(settings["exclude"]),
-                {
-                    world.class_names.index(c): v
-                    for c, v in settings["min_model_size"].items()
-                    if c in world.class_names
-                },
-                settings["leaf_cards"],
-                cards,
-            )
-            s = cfg.section("simplify")
-            simplified = {world.class_names.index(c) for c in s["classes"] if c in world.class_names}
-            to_simplify = [x for x in result.groups if world.class_index(x.material) in simplified]
-            rest = [x for x in result.groups if world.class_index(x.material) not in simplified]
-            result.groups = (
-                simplify.cell(to_simplify, s["error"], s["normal_weight"], s["colour_weight"], s["lock_border"]) + rest
-            )
-            cover_classes = {world.class_names.index(c) for c in settings["fill_cover"] if c in world.class_names}
-            cover = [x for x in result.groups if world.class_index(x.material) in cover_classes]
-            if cover and settings["fill_drop"] >= 0:
-                result.groups += bake.fill_from_stock(world.library, stock_terrain, cover, settings["fill_drop"])
+            terrain = [(s, flags[s]) for s in lod.submodels if s in replaced]
+            result = bake_cell(cfg, world, name, matrix, stock_terrain=terrain, keep=keep, opts=opts)
             cached = {"digest": digest, "part": part_uid, "groups": result.groups, "skipped": result.skipped}
-            with path.with_suffix(".tmp").open("wb") as f:
-                pickle.dump(cached, f, protocol=pickle.HIGHEST_PROTOCOL)
-            path.with_suffix(".tmp").replace(path)
+            _save(path, cached)
             state = "built"
-        else:
-            state = "cached"
         groups = cached["groups"]
         tris = sum(len(g.triangles) for g in groups)
-        verts = sum(len(g.vertices) for g in groups)
         skipped_total.update(cached["skipped"])
-        cells.append(CellBake(part_uid, groups, kept))
-        rows.append([name, len(groups), verts, tris, sum(cached["skipped"].values())])
+        cells.append(CellBake(part_uid, groups, [s for s in lod.submodels if s not in replaced]))
+        rows.append([name, len(groups), sum(len(g.vertices) for g in groups), tris, sum(cached["skipped"].values())])
         print(f"[{n}/{len(names)}] {name} {state}: {tris:,} triangles in {len(groups)} groups")
-    with open(out / "summary.tsv", "w", encoding="utf-8") as f:
+    _report(out, rows, no_target, skipped_total)
+    return cells
+
+
+def _report(out: Path, rows: list[list], no_target: list[str], skipped: Counter) -> None:
+    with (out / "summary.tsv").open("w", encoding="utf-8") as f:
         f.write("region\tgroups\tvertices\ttriangles\tskipped_placements\n")
         f.writelines("\t".join(map(str, r)) + "\n" for r in rows)
-    print(f"{len(cells)} cells baked, {sum(r[3] for r in rows):,} triangles; summary in {out / 'summary.tsv'}")
+    print(f"{len(rows)} cells baked, {sum(r[3] for r in rows):,} triangles; summary in {out / 'summary.tsv'}")
     if no_target:
         print(
             f"{len(no_target)} regions have no stock part to replace: {', '.join(no_target[:12])}"
             f"{' ...' if len(no_target) > 12 else ''}"
         )
-    if skipped_total:
-        print("skipped submodel placements: " + ", ".join(f"{k} {v}" for k, v in skipped_total.most_common()))
-    return cells
+    if skipped:
+        print("skipped submodel placements: " + ", ".join(f"{k} {v}" for k, v in skipped.most_common()))

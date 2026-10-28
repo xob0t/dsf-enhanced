@@ -12,7 +12,7 @@ def _565(c: np.ndarray) -> np.ndarray:
     return np.stack([(c >> 11) & 31, (c >> 5) & 63, c & 31], -1) * np.array([255 / 31, 255 / 63, 255 / 31])
 
 
-def _colour_blocks(b: np.ndarray, dxt1: bool) -> np.ndarray:
+def _colour_blocks(b: np.ndarray, *, dxt1: bool) -> np.ndarray:
     """(n, 8) colour blocks -> (n, 16, 3) float RGB."""
     c0 = b[:, 0].astype(np.uint16) | (b[:, 1].astype(np.uint16) << 8)
     c1 = b[:, 2].astype(np.uint16) | (b[:, 3].astype(np.uint16) << 8)
@@ -35,7 +35,7 @@ def _unblock(blocks: np.ndarray, w: int, h: int) -> np.ndarray:
 
 def _mip_sizes(w: int, h: int, fourcc: bytes, bpp: int):
     while True:
-        if fourcc in (b"DXT1",):
+        if fourcc == b"DXT1":
             size = max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * 8
         elif fourcc in (b"DXT3", b"DXT5"):
             size = max(1, (w + 3) // 4) * max(1, (h + 3) // 4) * 16
@@ -62,9 +62,9 @@ def decode(dds: bytes, max_size: int = 0) -> np.ndarray:
         offset += size
     data = np.frombuffer(dds, np.uint8, size, offset)
     if fourcc == b"DXT1":
-        rgb = _colour_blocks(data.reshape(-1, 8), True)
+        rgb = _colour_blocks(data.reshape(-1, 8), dxt1=True)
     elif fourcc in (b"DXT3", b"DXT5"):
-        rgb = _colour_blocks(data.reshape(-1, 16)[:, 8:], False)
+        rgb = _colour_blocks(data.reshape(-1, 16)[:, 8:], dxt1=False)
     elif bpp == 32:
         return data.reshape(mh, mw, 4)[:, :, [2, 1, 0]].copy()
     else:

@@ -47,7 +47,7 @@ def _meshoptimizer():
 
 
 def cell(
-    groups: list[Group], error: float, normal_weight: float, colour_weight: float, lock_border: bool
+    groups: list[Group], error: float, normal_weight: float, colour_weight: float, *, lock_border: bool
 ) -> list[Group]:
     """One cell's groups with fewer triangles, within error metres; empty groups dropped.
 

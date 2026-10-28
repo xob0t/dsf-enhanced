@@ -29,7 +29,18 @@ line-length = 120
 target-version = "py313"
 
 [tool.ruff.lint]
-select = ["E", "F", "I", "UP", "B"]
+select = [
+    "E", "W", "F", "I", "N", "UP", "B", "A", "C4", "SIM", "RET", "PTH", "PERF", "FURB", "RUF", "PIE",
+    "PL", "FBT", "ARG", "ERA", "LOG", "G", "T10", "FLY",
+]
+ignore = [
+    "PLR2004",  # binary formats compare against their own constants (tags, offsets, types)
+    "PLR0913",  # pipeline functions take their settings as arguments
+    "PLC0415",  # lazy imports keep optional dependencies (meshoptimizer) optional
+]
+
+[tool.ruff.lint.per-file-ignores]
+"tests/*" = ["PLR0917"]  # vertex builders take coordinates
 
 [tool.pytest.ini_options]
 testpaths = ["tests"]

@@ -13,7 +13,7 @@ ELEMENTS = [(0, 4, 1, 0), (8, 2, 8, 8), (5, 4, 6, 12)]
 
 
 class Classes:
-    def class_index(self, material):
+    def class_index(self, _material):
         return 0
 
 
@@ -98,7 +98,9 @@ def test_height_offset_moves_in_world_space():
         [vertex(0, 0, 0, 0, 0, (0, 1, 0)), vertex(1, 0, 0, 0, 0, (0, 1, 0)), vertex(0, 0, 1, 0, 0, (0, 1, 0))],
         [0, 1, 2],
     )
-    (g,) = bake.bake_region(Classes(), lib, [Instance(4, 0, np.eye(4))], np.eye(4), {0}, height_offset=-0.25).groups
+    (g,) = bake.bake_region(
+        Classes(), lib, [Instance(4, 0, np.eye(4))], np.eye(4), {0}, options=bake.BakeOptions(height_offset=-0.25)
+    ).groups
     pos = g.vertices[:, 0:6].copy().view("<i2").astype(float) / 64
     np.testing.assert_allclose(pos[:, 1], -0.25)
 
@@ -121,7 +123,7 @@ def test_cell_simplification_keeps_material_boundaries_closed():
     from dsfworld import simplify
 
     left, right = grid_group(1, 0, 5), grid_group(2, 5, 10)
-    out = simplify.cell([left, right], 0.05, 0.1, 1.0, True)
+    out = simplify.cell([left, right], 0.05, 0.1, 1.0, lock_border=True)
     assert sum(len(g.triangles) for g in out) < len(left.triangles) + len(right.triangles) // 4
 
     def boundary(g):  # positions used on x == 5
@@ -196,7 +198,9 @@ def test_flat_leaf_cards_become_upward_quads_in_the_template_layout():
     lib.parts[4] = Part(4, np.zeros((4, 4)), [Lod(2, [3], [1])], 1)
     cards = bake.CardTemplate(0xBB, 17, 16, tuple(ELEMENTS), b"palm")
     inst = Instance(4, 0, yaw(0, (10, 0, 20)))
-    (g,) = bake.bake_region(Classes(), lib, [inst], np.eye(4), {0}, leaf_cards="flat", cards=cards).groups
+    (g,) = bake.bake_region(
+        Classes(), lib, [inst], np.eye(4), {0}, options=bake.BakeOptions(leaf_cards="flat", cards=cards)
+    ).groups
     assert (g.material, g.retarget, g.flag, g.stride, g.elements, g.decl) == (
         0xAA,
         0xBB,
@@ -212,7 +216,12 @@ def test_flat_leaf_cards_become_upward_quads_in_the_template_layout():
     t = g.triangles
     n = np.cross(pos[t[:, 1]] - pos[t[:, 0]], pos[t[:, 2]] - pos[t[:, 0]])
     assert np.all(n[:, 1] > 0)  # wound like the stock ground: facing up
-    assert bake.bake_region(Classes(), lib, [inst], np.eye(4), {0}, leaf_cards="drop", cards=cards).groups == []
+    assert (
+        bake.bake_region(
+            Classes(), lib, [inst], np.eye(4), {0}, options=bake.BakeOptions(leaf_cards="drop", cards=cards)
+        ).groups
+        == []
+    )
 
 
 def test_material_clone_takes_the_source_texture():

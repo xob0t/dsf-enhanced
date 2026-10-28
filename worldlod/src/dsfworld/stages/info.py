@@ -4,11 +4,10 @@ from __future__ import annotations
 
 from collections import Counter
 
-from dsfworld.config import Config
 from dsfworld.world import World
 
 
-def run(cfg: Config, world: World) -> None:
+def run(world: World) -> None:
     a = world.archive
     regions = a.regions()
     detailed = [r for r in regions if a.nonr(r, "GEBI")]

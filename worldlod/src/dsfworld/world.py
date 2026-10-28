@@ -92,7 +92,7 @@ class World:
         return gebi.parse(self.archive.nonr(self.archive.global_region(), "GEBI")).instances
 
     def flatten(
-        self, lib: modl.Library, instances, keep_classes: set[int], min_size: float = 0.0, uv: bool = False
+        self, lib: modl.Library, instances, keep_classes: set[int], min_size: float = 0.0, *, uv: bool = False
     ) -> Mesh:
         """Place every instance's finest LOD in world space, keeping the given classes (with UVs if asked)."""
         ps, ts, ms, cs, uvs = [], [], [], [], []

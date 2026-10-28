@@ -150,11 +150,11 @@ def _align(value: int, alignment: int) -> int:
 
 def entry_size(entry: Entry, memo: dict | None = None) -> int:
     if entry.children is not None:
-        return layout(entry.children, memo, entry.pad_end)[0]
+        return layout(entry.children, memo, pad_end=entry.pad_end)[0]
     return len(entry.payload) if entry.payload is not None else entry.size
 
 
-def layout(entries: list[Entry], memo: dict | None = None, pad_end: bool = True) -> tuple[int, list[int], list[int]]:
+def layout(entries: list[Entry], memo: dict | None = None, *, pad_end: bool = True) -> tuple[int, list[int], list[int]]:
     """Return (total_size, payload offsets, payload sizes) for a CHNK holding entries.
     `memo` (id of a children list -> its layout, for one write_chunk call while the
     lists don't change): each nested chunk is laid out once, not once per level above it."""
@@ -187,6 +187,7 @@ def write_chunk(
     entries: list[Entry],
     version: int = 3,
     _memo: dict | None = None,
+    *,
     pad_end: bool = True,
 ) -> int:
     """Write a CHNK holding ``entries`` at the current position of ``out``.
@@ -196,25 +197,25 @@ def write_chunk(
     """
     if _memo is None:
         _memo = {}
-    total, offsets, sizes = layout(entries, _memo, pad_end)
+    total, offsets, sizes = layout(entries, _memo, pad_end=pad_end)
     out.write(HEADER.pack(MAGIC, total, len(entries), version))
-    for entry, offset, size in zip(entries, offsets, sizes, strict=True):
-        out.write(
-            ENTRY.pack(
-                entry.tag.encode("latin-1"),
-                offset,
-                entry.version,
-                len(entry.name_raw),
-                entry.align_log2,
-                entry.reserved,
-                size,
-            )
+    out.writelines(
+        ENTRY.pack(
+            entry.tag.encode("latin-1"),
+            offset,
+            entry.version,
+            len(entry.name_raw),
+            entry.align_log2,
+            entry.reserved,
+            size,
         )
+        for entry, offset, size in zip(entries, offsets, sizes, strict=True)
+    )
     position = HEADER.size + ENTRY.size * len(entries)
     for entry, offset, size in zip(entries, offsets, sizes, strict=True):
         _fill(out, position, offset)
         if entry.children is not None:
-            write_chunk(out, source, entry.children, entry.chunk_version, _memo, entry.pad_end)
+            write_chunk(out, source, entry.children, entry.chunk_version, _memo, pad_end=entry.pad_end)
         elif entry.payload is not None:
             out.write(entry.payload)
         else:
@@ -236,7 +237,7 @@ def write_chunk(
 
 def walk(entries: list[Entry], path: tuple[int, ...] = ()) -> Iterator[tuple[tuple[int, ...], Entry]]:
     for index, entry in enumerate(entries):
-        here = path + (index,)
+        here = (*path, index)
         yield here, entry
         if entry.children:
             yield from walk(entry.children, here)
@@ -255,7 +256,7 @@ def walk_collapsed(entries: list[Entry], path: tuple[int, ...] = ()) -> Iterator
             and entries[index + run].name == entry.name
         ):
             run += 1
-        here = path + (index,)
+        here = (*path, index)
         yield here, entry, run
         if entry.children:
             yield from walk_collapsed(entry.children, here)
