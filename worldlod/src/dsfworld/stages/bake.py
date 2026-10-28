@@ -21,7 +21,7 @@ from dsfworld.world import World
 
 SECTIONS = ("game", "classes", "bake", "simplify")
 # Part of the cache key: raise when the bake or simplification output changes for the same settings.
-VERSION = 6
+VERSION = 7
 
 
 def output_dir(cfg: Config) -> Path:
@@ -43,6 +43,25 @@ def targets(world: World, prefix: str) -> dict[tuple[int, int], tuple[int, np.nd
     return out
 
 
+def card_template(world: World, path: str) -> bake.CardTemplate:
+    """The GEGR material at path, with the vertex layout and MODL flag of a GEGR submodel drawn with it."""
+    uid = next((u for u, p in world.materials.paths.items() if p == path), None)
+    if uid is None:
+        raise SystemExit(f"[bake] leaf_card_material: no material {path!r}")
+    lib = world.library
+    for part in lib.parts.values():
+        for lod in part.lods:
+            for su, flag in zip(lod.submodels, lod.flags, strict=True):
+                sub = lib.submodels.get(su)
+                if sub is None or sub.material != uid or sub.vb2 or sub.vb not in lib.vbs:
+                    continue
+                vb = lib.vbs[sub.vb]
+                sems = {e[0]: e for e in vb.elements}
+                if bake.POSITION in sems and 8 in sems and bake.position_slot(vb.elements) == sems[bake.POSITION]:
+                    return bake.CardTemplate(uid, flag, vb.stride, tuple(vb.elements), vb.decl)
+    raise SystemExit(f"[bake] leaf_card_material: no GEGR submodel draws {path!r} with a position and UV")
+
+
 def run(cfg: Config, world: World, force: bool = False) -> list[CellBake]:
     settings = cfg.section("bake")
     if not settings["classes"]:
@@ -56,6 +75,9 @@ def run(cfg: Config, world: World, force: bool = False) -> list[CellBake]:
     source = world.archive.path
     digest = f"{VERSION}:{cfg.digest(*SECTIONS)}:{source}:{source.stat().st_size}"
     stock = targets(world, settings["replace"])
+    if settings["leaf_cards"] not in ("flat", "keep", "drop"):
+        raise SystemExit('[bake] leaf_cards must be "flat", "keep" or "drop"')
+    cards = card_template(world, settings["leaf_card_material"]) if settings["leaf_cards"] == "flat" else None
     names = world.region_names(cfg.section("regions")["select"])
     cells, rows, no_target = [], [], []
     skipped_total: Counter = Counter()
@@ -96,6 +118,8 @@ def run(cfg: Config, world: World, force: bool = False) -> list[CellBake]:
                     for c, v in settings["min_model_size"].items()
                     if c in world.class_names
                 },
+                settings["leaf_cards"],
+                cards,
             )
             s = cfg.section("simplify")
             simplified = {world.class_names.index(c) for c in s["classes"] if c in world.class_names}

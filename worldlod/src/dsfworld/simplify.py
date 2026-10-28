@@ -98,5 +98,7 @@ def cell(
         if not len(mine):
             continue
         used, remap = np.unique(mine, return_inverse=True)
-        result.append(Group(g.material, g.flag, g.stride, g.elements, g.decl, g.vertices[used], remap.reshape(-1, 3)))
+        result.append(
+            Group(g.material, g.flag, g.stride, g.elements, g.decl, g.vertices[used], remap.reshape(-1, 3), g.retarget)
+        )
     return result

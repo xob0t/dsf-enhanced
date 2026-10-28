@@ -99,6 +99,7 @@ def run(cfg: Config, world: World, verify: bool = False) -> Path:
         stats = gegr.apply(a, g, cells, uid.Allocator(uid.existing(a)))
         print(
             f"GEGR: {stats.cells} parts replaced, {stats.submodels:,} submodels, {stats.triangles:,} triangles, "
+            f"{stats.materials} cloned materials, "
             f"{(stats.vertex_bytes + stats.index_bytes) / 1e6:.1f} MB of buffers in {stats.drsp} new groups"
         )
         mdxn, nonr = gegr.update_budgets(a, a.entries, stock_mdxn, stock_nonr)

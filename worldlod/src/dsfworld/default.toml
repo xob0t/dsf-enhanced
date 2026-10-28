@@ -56,6 +56,13 @@ exclude = [
 # overlays on the base's building shells and the street furniture: storefronts,
 # rooftop units, fire escapes, containers, pallets, rocks.
 min_model_size = { buildings = 2.0 }
+# Leaf-card trees (most trees and bushes) light themselves with a per-object
+# sample that the base LOD never sets, so baked as they are they draw black.
+# "flat" lays each card flat, facing up, and draws it with a clone of
+# leaf_card_material that holds the tree's texture; "keep" copies the cards as
+# they are; "drop" leaves them out.
+leaf_cards = "flat"
+leaf_card_material = "trees/palm_02.matxml"
 # The stock submodels to replace: those whose material path starts with this
 # prefix (the vertex-coloured low-poly terrain). The part holding them, one at
 # the centre of 420 of the 532 detailed cells, receives the baked cell; its

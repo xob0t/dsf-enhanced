@@ -10,6 +10,11 @@ unreferenced. Submodels of the target LOD that the bake doesn't replace (the
 shared sea and low-detail trees that 192 stock terrain parts carry next to the
 terrain) stay in it.
 
+Groups with a retarget (expanded leaf cards) are drawn with a clone of that
+material (MACO): a new UID, and every g_texDiffuseMap and g_hAlphaTestRefValue
+the clone has set to the group's own material's. The clones come first in the
+new DRSP groups; MDID gains them after the last stock material.
+
 Entry headers (tags, versions, alignment, names) are copied from stock GEGR
 entries of the same kind.
 
@@ -48,6 +53,7 @@ class CellBake:
 @dataclass
 class Stats:
     cells: int = 0
+    materials: int = 0
     submodels: int = 0
     vertex_buffers: int = 0
     index_buffers: int = 0
@@ -81,6 +87,44 @@ def _bounds_box(lo: np.ndarray, hi: np.ndarray) -> np.ndarray:
     return box
 
 
+CLONED_PARAMS = (b"g_texDiffuseMap", b"g_hAlphaTestRefValue")
+
+
+def _read(a: Archive, e: Entry) -> bytes:
+    return e.payload if e.payload is not None else a.read(e)
+
+
+def _param_name(marp: bytes) -> bytes:
+    return marp[:32].split(b"\0")[0]
+
+
+def clone_material(a: Archive, template: Entry, source: Entry, uid: int) -> Entry:
+    """template (a MACO) under a new UID, its CLONED_PARAMS values taken from source (a MACO).
+
+    MARP: {char name[32], u8 value[16], u32 type}."""
+    values = {}
+    for marc in (c for c in source.children if c.tag == "MARC"):
+        for p in (c for c in marc.children if c.tag == "MARP"):
+            b = _read(a, p)
+            if _param_name(b) in CLONED_PARAMS:
+                values.setdefault(_param_name(b), b[32:48])
+    if b"g_texDiffuseMap" not in values:
+        raise ValueError(f"material {source.name!r} has no g_texDiffuseMap")
+
+    def leaf(e: Entry) -> Entry:
+        b = _read(a, e)
+        if e.tag == "MAHE":
+            b = struct.pack("<Q", uid) + b[8:]
+        elif e.tag == "MARP" and _param_name(b) in values:
+            b = b[:32] + values[_param_name(b)] + b[48:]
+        return _like(e, b)
+
+    def rebuild(e: Entry) -> Entry:
+        return _like(e, children=[rebuild(c) for c in e.children]) if e.children else leaf(e)
+
+    return rebuild(template)
+
+
 def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> Stats:
     """Modify the parsed GEGR entry tree in place."""
     stats = Stats()
@@ -97,6 +141,20 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
         "VXCK": {struct.unpack_from("<Q", a.read(kid(e, "VXHD")))[0] for e in walk(gegr, "VXCK")},
         "IXCK": {struct.unpack_from("<Q", a.read(kid(e, "IXHD")))[0] for e in walk(gegr, "IXCK")},
     }
+    macos = {struct.unpack_from("<Q", a.read(kid(e, "MAHE")))[0]: e for e in walk(gegr, "MACO")}
+    stock["MACO"] = set(macos)
+    clones: dict[tuple[int, int], int] = {}  # (template, material) -> clone UID
+    new_maco: list[tuple[int, Entry]] = []
+
+    def material_of(g: Group) -> int:
+        if not g.retarget:
+            return g.material
+        key = (g.retarget, g.material)
+        if key not in clones:
+            clones[key] = uids.new()
+            new_maco.append((clones[key], clone_material(a, macos[g.retarget], macos[g.material], clones[key])))
+        return clones[key]
+
     mdid = next(walk(gegr, "MDID"))
     old = list(struct.unpack_from(f"<{mdid.size // 8}Q", a.read(mdid)))
 
@@ -125,6 +183,7 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
                 (g.stride, g.elements), {"uid": uids.new(), "rows": [], "count": 0, "users": [], "decl": g.decl}
             )
             pos_el = position_slot(g.elements)
+            material = material_of(g)
             for verts, tris in g.chunks():
                 sub = uids.new()
                 base = vb["count"]
@@ -132,7 +191,7 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
                 vb["count"] += len(verts)
                 vb["users"].append(sub)
                 flat = tris.astype("<u2").ravel()
-                sbbh = struct.pack("<QQQQI12xQII8x", sub, g.material, vb["uid"], 0, base, ib_uid, n_indices, len(flat))
+                sbbh = struct.pack("<QQQQI12xQII8x", sub, material, vb["uid"], 0, base, ib_uid, n_indices, len(flat))
                 new_sbmc.append((sub, _like(t_sbmc, children=[_like(t_sbmc.children[0], sbbh)])))
                 indices.append(flat)
                 n_indices += len(flat)
@@ -169,15 +228,15 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
             for f in each.flags:
                 part.trailer |= f
         stats.cells += 1
-    stats.vertex_buffers, stats.index_buffers = len(new_vxck), len(new_ixck)
+    stats.vertex_buffers, stats.index_buffers, stats.materials = len(new_vxck), len(new_ixck), len(new_maco)
     if not new_sbmc:
         return stats
 
     # DRSP groups, before the last stock DRSP (which holds MDID)
     groups: list[list[Entry]] = []
     size = 0
-    for _, e in new_sbmc + new_vxck + new_ixck:
-        esize = sum(len(c.payload) for c in e.children) + 64 * len(e.children) + 128
+    for _, e in new_maco + new_sbmc + new_vxck + new_ixck:
+        esize = entry_size(e)
         if not groups or len(groups[-1]) >= ENTRY_LIMIT or (size + esize > DRSP_BUDGET and groups[-1]):
             groups.append([])
             size = 0
@@ -190,7 +249,9 @@ def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> St
 
     # MDID: new UIDs after the last stock UID of the same kind
     out = list(old)
-    for kind, new in (("SBMC", new_sbmc), ("VXCK", new_vxck), ("IXCK", new_ixck)):
+    for kind, new in (("MACO", new_maco), ("SBMC", new_sbmc), ("VXCK", new_vxck), ("IXCK", new_ixck)):
+        if not new:
+            continue
         at = max(i for i, u in enumerate(out) if u in stock[kind]) + 1
         out[at:at] = [u for u, _ in new]
     mdid.payload = struct.pack(f"<{len(out)}Q", *out)

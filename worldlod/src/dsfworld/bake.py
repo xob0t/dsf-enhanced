@@ -9,7 +9,15 @@ Leaf-card trees (Trees_Functions.hlsl; half4 semantic 0 and half4 semantic 5) ar
 laid out differently: the card's pivot in object space is semantic 5's y, z, w
 (the vertex shader transforms (v1.yzw, 1) by g_ObjectToWorld), and semantic 0
 holds per-card data (v0.z rotation, v0.w size) used to expand the card on screen.
-So for that layout the pivot is moved and semantic 0 is copied unchanged.
+So for that layout the pivot is moved and semantic 0 is copied unchanged
+(leaf_cards "keep"). That shader also multiplies all its lighting by
+g_vLightMapSingleSample, which only the dynamic-object renderers set
+(FUN_006BD960), so in the base LOD such trees come out black. With a
+CardTemplate (leaf_cards "flat") each card is expanded offline instead: v0.xy is
+its UV, v0.z the corner's angle (radians) and v0.w its size, and the shader puts
+the corner at size * (sin, cos)(angle) on screen; the bake puts it there in the
+horizontal plane, so the cards lie flat facing up, and draws them with a clone
+of an ordinary alpha-tested material (a palm's) holding the tree's texture.
 Float16 positions lose precision away from the cell centre (0.25 m beyond 256 m),
 which only foliage uses. Copies are grouped by material, flag and vertex layout, welded, and
 split into submodels of at most 65,535 vertices (16-bit indices).
@@ -113,6 +121,7 @@ class Group:
     decl: bytes
     vertices: np.ndarray  # (n, stride) uint8
     triangles: np.ndarray  # (m, 3) int64
+    retarget: int = 0  # if set: draw with a clone of this material holding `material`'s diffuse texture
 
     def chunks(self):
         """(vertices, triangles) pieces of at most MAX_VERTICES vertices, indices local to the piece."""
@@ -134,6 +143,53 @@ class Group:
             remap = np.vectorize(used.__getitem__)(self.triangles[start:end])
             yield self.vertices[order], remap
             start = end
+
+
+@dataclass
+class CardTemplate:
+    """The ordinary material (and its vertex layout and MODL flag) whose clones draw expanded leaf cards."""
+
+    material: int
+    flag: int
+    stride: int
+    elements: tuple
+    decl: bytes
+
+
+def expand_cards(rows, elements, slot, linear, offset, inv_t, scale, cards: CardTemplate):
+    """Leaf-card vertices -> flat quad corners in the template layout, or None if out of range.
+    Returns (vertex rows, corner positions in the target frame)."""
+    data_off = next(e[3] for e in elements if e[0] == POSITION)
+    data = rows[:, data_off : data_off + 8].copy().view("<f2").astype(np.float64)  # u, v, angle, size
+    pivot = read_positions(rows, slot) @ linear + offset
+    angle, size = data[:, 2], data[:, 3] * scale
+    corner = np.stack([size * np.sin(angle), np.zeros_like(size), size * np.cos(angle)], 1) @ inv_t
+    q = pivot + corner
+    out = np.zeros((len(rows), cards.stride), np.uint8)
+    t_sems = {e[0]: e for e in cards.elements}
+    p_el = t_sems[POSITION]
+    if not write_positions(out, p_el, q):
+        return None
+    if p_el[2] == INT16 and p_el[1] == 4:
+        out[:, p_el[3] + 6 : p_el[3] + 8] = np.frombuffer(struct.pack("<h", 64), np.uint8)  # w = 1.0
+    uv = t_sems[8]
+    out[:, uv[3] : uv[3] + 4] = data[:, :2].astype("<f2").view(np.uint8).reshape(len(rows), 4)
+    if NORMAL in t_sems:
+        up = np.array([0.0, 1.0, 0.0]) @ inv_t
+        up /= np.linalg.norm(up)
+        write_normals(out, t_sems[NORMAL], np.repeat(up[None], len(rows), 0))
+        if t_sems[NORMAL][2] == UBYTE4:
+            out[:, t_sems[NORMAL][3] + 3] = 255
+    return out, q
+
+
+def face_up(tri: np.ndarray, q: np.ndarray, up: np.ndarray) -> np.ndarray:
+    """Triangles wound so that their normal points along up."""
+    n = np.cross(q[tri[:, 1]] - q[tri[:, 0]], q[tri[:, 2]] - q[tri[:, 0]])
+    down = n @ up < 0
+    tri = tri.copy()
+    tri[down] = tri[down][:, ::-1]
+    return tri
 
 
 @dataclass
@@ -159,12 +215,15 @@ def bake_region(
     height_offset: float = 0.0,
     exclude: tuple[str, ...] = (),
     min_size: dict[int, float] | None = None,
+    leaf_cards: str = "keep",
+    cards: CardTemplate | None = None,
 ):
     """Copy the submodels of the given classes placed by instances into the frame of target (a 4x4 matrix),
     moved up by height_offset metres (world Y; negative moves down). Materials whose path starts with
     one of exclude are left out, and so are a class's placed models smaller than min_size[class]
     metres (longest box edge after instance scale). A second vertex stream (the per-region colour of
-    many props) is folded into the copied vertices."""
+    many props) is folded into the copied vertices. leaf_cards: "keep" (copy leaf-card trees as they
+    are), "flat" (expand them with the cards template) or "drop"."""
     a_t, t_t = _frame(target)
     inv_t = np.linalg.inv(a_t)
     pieces: dict[tuple, list] = {}
@@ -228,6 +287,19 @@ def bake_region(
                     skipped["second stream range"] += 1
                     continue
                 rows = np.hstack([rows, vb2.rows()[second]])
+            if pos[0] == NORMAL and leaf_cards != "keep":
+                if leaf_cards == "drop" or cards is None:
+                    continue
+                expanded = expand_cards(rows, elements, pos, linear, offset, inv_t, float(inst.scale[1]), cards)
+                if expanded is None:
+                    skipped["outside the target frame"] += 1
+                    continue
+                rows, q = expanded
+                tri = face_up(tri.reshape(-1, 3), q, np.array([0.0, 1.0, 0.0]) @ inv_t)
+                layout = (cards.stride, cards.elements)
+                decls[layout] = cards.decl
+                pieces.setdefault((sub.material, cards.flag, layout, cards.material), []).append((rows, tri))
+                continue
             if not write_positions(rows, pos, read_positions(rows, pos) @ linear + offset):
                 skipped["outside the target frame"] += 1
                 continue
@@ -243,11 +315,11 @@ def bake_region(
             else:
                 layout = (vb.stride + vb2.stride, elements)
                 decl = combined_decl(vb.decl, vb2.decl)
-            key = (sub.material, flag, layout)
+            key = (sub.material, flag, layout, 0)
             decls[layout] = decl
             pieces.setdefault(key, []).append((rows, tri))
     groups = []
-    for (material, flag, layout), parts in pieces.items():
+    for (material, flag, layout, retarget), parts in pieces.items():
         rows = np.vstack([r for r, _ in parts])
         base = np.cumsum([0] + [len(r) for r, _ in parts[:-1]])
         tris = np.vstack([t + b for (_, t), b in zip(parts, base, strict=True)])
@@ -258,7 +330,9 @@ def bake_region(
         rank = np.empty_like(order)
         rank[order] = np.arange(len(order))
         groups.append(
-            Group(material, flag, layout[0], layout[1], decls[layout], rows[np.sort(first)], rank[inverse][tris])
+            Group(
+                material, flag, layout[0], layout[1], decls[layout], rows[np.sort(first)], rank[inverse][tris], retarget
+            )
         )
     return Result(groups, skipped)
 

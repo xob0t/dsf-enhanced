@@ -181,3 +181,59 @@ def test_second_stream_is_folded_into_the_vertex():
     assert g.stride == 20 and g.elements[-1] == (19, 4, 6, 16)
     assert g.vertices[:, 16:20].tolist() == [[10, 0, 0, 255], [0, 20, 0, 255], [0, 0, 30, 255]]
     assert struct.unpack_from("<I", g.decl)[0] == 4 and g.decl.endswith(struct.pack("<4I", 19, 4, 6, 0xC0))
+
+
+def test_flat_leaf_cards_become_upward_quads_in_the_template_layout():
+    # one card: pivot (0, 1, 0), corners at 45, 135, 225 and 315 degrees, size sqrt(2)
+    elements = [(0, 4, 8, 0), (5, 4, 8, 8)]
+    angles = np.radians([45, 135, 225, 315])
+    uvs = ((1, 0), (1, 1), (0, 1), (0, 0))
+    rows = [struct.pack("<4e4e", u, v, a, 2**0.5, 7, 0, 1, 0) for (u, v), a in zip(uvs, angles, strict=True)]
+    lib = Library()
+    lib.vbs[1] = VertexBuffer(4, 16, elements, b"".join(rows), b"decl")
+    lib.ibs[2] = np.array([0, 2, 1, 0, 3, 2], np.uint16)
+    lib.submodels[3] = SubModel(3, 0xAA, 1, 0, 0, 2, 0, 6)
+    lib.parts[4] = Part(4, np.zeros((4, 4)), [Lod(2, [3], [1])], 1)
+    cards = bake.CardTemplate(0xBB, 17, 16, tuple(ELEMENTS), b"palm")
+    inst = Instance(4, 0, yaw(0, (10, 0, 20)))
+    (g,) = bake.bake_region(Classes(), lib, [inst], np.eye(4), {0}, leaf_cards="flat", cards=cards).groups
+    assert (g.material, g.retarget, g.flag, g.stride, g.elements, g.decl) == (
+        0xAA,
+        0xBB,
+        17,
+        16,
+        tuple(ELEMENTS),
+        b"palm",
+    )
+    pos = bake.positions(g)
+    np.testing.assert_allclose(pos, [(11, 1, 21), (11, 1, 19), (9, 1, 19), (9, 1, 21)], atol=0.02)
+    assert g.vertices[:, 8:12].copy().view("<f2").reshape(-1, 2).tolist() == [list(uv) for uv in uvs]
+    np.testing.assert_allclose(g.vertices[:, 12:15].astype(float) / 255 * 2 - 1, [[0, 1, 0]] * 4, atol=0.01)
+    t = g.triangles
+    n = np.cross(pos[t[:, 1]] - pos[t[:, 0]], pos[t[:, 2]] - pos[t[:, 0]])
+    assert np.all(n[:, 1] > 0)  # wound like the stock ground: facing up
+    assert bake.bake_region(Classes(), lib, [inst], np.eye(4), {0}, leaf_cards="drop", cards=cards).groups == []
+
+
+def test_material_clone_takes_the_source_texture():
+    from dsfworld import gegr
+    from dsfworld.formats.chnk import Entry
+
+    def marp(name, value, typ):
+        return Entry(
+            "MARP", 0, 52, 0, 2, None, payload=name.ljust(32, b"\0") + value.ljust(16, b"\0") + struct.pack("<I", typ)
+        )
+
+    def maco(uid, params):
+        mahe = Entry("MAHE", 0, 16, 0, 2, None, payload=struct.pack("<QII", uid, 1, 0))
+        marc = Entry("MARC", 0, 0, 0, 2, None, children=[Entry("MARH", 0, 40, 0, 2, None, payload=bytes(40)), *params])
+        return Entry("MACO", 0, 0, 0, 2, None, children=[mahe, marc])
+
+    palm = maco(1, [marp(b"g_hAlphaTestRefValue", struct.pack("<f", 0.3), 1), marp(b"g_texDiffuseMap", b"P" * 8, 9)])
+    leaf = maco(2, [marp(b"g_texDiffuseMap", b"L" * 8, 9), marp(b"g_hAlphaTestRefValue", struct.pack("<f", 0.75), 1)])
+    clone = gegr.clone_material(None, palm, leaf, 3)
+    assert struct.unpack_from("<QII", clone.children[0].payload) == (3, 1, 0)
+    alpha, diffuse = clone.children[1].children[1:]
+    assert struct.unpack_from("<f", alpha.payload, 32)[0] == 0.75 and diffuse.payload[32:40] == b"L" * 8
+    assert diffuse.payload[:15] == b"g_texDiffuseMap" and struct.unpack_from("<I", diffuse.payload, 48)[0] == 9
+    assert palm.children[1].children[2].payload[32:40] == b"P" * 8  # the template is unchanged
