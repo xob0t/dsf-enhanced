@@ -298,3 +298,32 @@ same inside and outside the loaded area.
 Default result: 403 parts replaced, 7,995 submodels, 1,049,811 triangles
 (931k baked ground and 118k stock fill; 1.57M before simplification), 30.6 MB of
 buffers in 20 DRSP groups.
+
+## Trees and building detail (2026-10-28)
+
+- **Leaf-card lighting.** Of all GEGR materials, the far technique
+  (0xF59DDF6D) of exactly 32 reads `g_vLightMapSingleSample`: the leaf-card
+  foliage (bushes, park and urban trees). Every other material, buildings and
+  props included, reads `g_vLightMapOffsetScale` like the ground. The single
+  sample is set only by the dynamic-object renderers, so those 32 drew black in
+  the base; `[bake] leaf_cards = "flat"` draws them as flat quads with clones of
+  `trees/palm_02` (lit in game, 2026-10-28).
+- **Winding.** Stock GEGR terrain and palms are wound so that
+  cross(b - a, c - a) points along the stored normal (172,008 of 172,058
+  terrain triangles), so the flat cards are wound that way facing up.
+- **Building detail.** With `buildings` baked (2 m minimum model size, Bay and
+  Carquinez girders left out): 5.0M of the 7.6M triangles, 72% of those in one
+  atlas material, `alley_01_cream_groundfloor` (storefronts, rooftop units,
+  signs). That material spans 48,470 distinct models, mostly placed once; the
+  40 largest contribute 4%, so no per-model cut helps much. Cell-wide
+  simplification of the buildings keeps 82% at 0.5 m with locked borders, 69%
+  unlocked (23 sample cells): small open meshes.
+- **Submodel table limit.** The engine's table of loaded submodels (UID ->
+  submodel; owner pointer 0x19BBA74, table at +0x30) takes its 24-byte nodes
+  from a pool of 15,000 (table +0x10..+0x57E50) with no end check, followed by
+  its 15,013 buckets. The SBMC loader inserts (0xBBB6C5 -> 0xBBBE40), releasing
+  a submodel erases (0xBBBCA0). The full build (21,845 GEGR submodels) faulted
+  at 0xBBBE70 while loading; DSF Enhanced `[Limits] SubmodelTableExtraNodes`
+  continues the pool in an extension block. With it, the VM run loaded, drove
+  and Shifted; the table peaked at about 15,400. Peak process memory: 1,873 MB
+  virtual (ground only 1,432 MB); Driver.exe is large-address-aware.
