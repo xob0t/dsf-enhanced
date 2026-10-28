@@ -70,6 +70,61 @@ constexpr DWORD kPendingResourceReferenceCountRva = 0x0148A6B8; // resource mana
 // pointer, and the next acquire faults reading garbage (0xBAEDC7).
 constexpr DWORD kResourceHashBumpRva = 0x007AEDB6;          // mov eax,[ecx+0x127AC4]; lea ebx,[eax+18h]; mov [ecx+0x127AC4],ebx; jmp
 constexpr DWORD kResourceHashBumpContinueRva = 0x007AEDD0;  // fills the node in eax
+// The same manager's list of pending resource references: a slot pointer at +0x127AC8 (0x185A6B8)
+// and the referenced UID at +0x137AC8 (0x186A6B8) per entry, count at +0x157AC8 (0x188A6B8), 16,384
+// entries with no bound check. Loading a model appends every submodel UID of its MODL; FUN_00BAE790
+// resolves them later. Entry 16,385 writes its UID over the count, and the next append faults
+// (0x6A594F). A world archive whose global region holds more than about 16,000 submodels hits it.
+constexpr DWORD kResourceManagerRva = 0x01332BF0;
+constexpr DWORD kPendingPtrsRva = 0x0145A6B8;
+constexpr DWORD kPendingPairsRva = 0x0146A6B8;
+constexpr int kPendingStockCapacity = 16384;
+enum PendingArray { kPendingPtrs, kPendingPairs };
+struct PendingSite
+{
+    DWORD rva;
+    std::uint8_t disp_offset;  // of the instruction's disp32
+    DWORD expected;            // its stock value
+    PendingArray array;
+    std::uint8_t plus;         // 4 for the UID's high dword
+    bool relative;             // disp32 is added to the manager pointer (always 0x1732BF0), not absolute
+};
+// Every instruction that addresses the two arrays (static disassembly of Driver.exe 1.04): the
+// appenders 0x6A51B0, 0x6A58F0, 0x6A59F0, 0x6CC640, 0xBA9FD0, 0xBAA270 and 0xBAA300, and the
+// consumers 0xBAE790 and 0xBAEA80, whose callers all pass the manager in ecx.
+constexpr PendingSite kPendingSites[] = {
+    {0x002A51BD, 3, 0x00137AC8, kPendingPairs, 0, true},   // mov [ecx+eax*8+0x137AC8], esi
+    {0x002A51C7, 3, 0x00137ACC, kPendingPairs, 4, true},   // mov [ecx+eax*8+0x137ACC], esi
+    {0x002A51D4, 3, 0x00127AC8, kPendingPtrs, 0, true},    // mov [ecx+eax*4+0x127AC8], edx
+    {0x002A593F, 3, 0x0186A6B8, kPendingPairs, 0, false},  // mov [edi*8+0x186A6B8], edx
+    {0x002A594F, 3, 0x0186A6BC, kPendingPairs, 4, false},  // mov [edi*8+0x186A6BC], edx
+    {0x002A595C, 3, 0x0185A6B8, kPendingPtrs, 0, false},   // mov [edx*4+0x185A6B8], eax
+    {0x002A5A19, 3, 0x0186A6B8, kPendingPairs, 0, false},  // mov [ecx*8+0x186A6B8], edx
+    {0x002A5A29, 3, 0x0186A6BC, kPendingPairs, 4, false},  // mov [ecx*8+0x186A6BC], edx
+    {0x002A5A36, 3, 0x0185A6B8, kPendingPtrs, 0, false},   // mov [edx*4+0x185A6B8], eax
+    {0x002CC661, 3, 0x0186A6B8, kPendingPairs, 0, false},  // mov [edx*8+0x186A6B8], ecx
+    {0x002CC671, 3, 0x0186A6BC, kPendingPairs, 4, false},  // mov [ecx*8+0x186A6BC], eax
+    {0x002CC683, 3, 0x0185A6B8, kPendingPtrs, 0, false},   // mov [edx*4+0x185A6B8], esi
+    {0x007AA038, 3, 0x0186A6B8, kPendingPairs, 0, false},  // mov [edx*8+0x186A6B8], ecx
+    {0x007AA048, 3, 0x0186A6BC, kPendingPairs, 4, false},  // mov [edx*8+0x186A6BC], ecx
+    {0x007AA055, 3, 0x0185A6B8, kPendingPtrs, 0, false},   // mov [ecx*4+0x185A6B8], eax
+    {0x007AA2CB, 3, 0x0186A6B8, kPendingPairs, 0, false},  // mov [ecx*8+0x186A6B8], eax
+    {0x007AA2DA, 3, 0x0186A6BC, kPendingPairs, 4, false},  // mov [eax*8+0x186A6BC], edx
+    {0x007AA2E7, 3, 0x0185A6B8, kPendingPtrs, 0, false},   // mov [ecx*4+0x185A6B8], esi
+    {0x007AA342, 3, 0x0186A6B8, kPendingPairs, 0, false},  // mov [ecx*8+0x186A6B8], eax
+    {0x007AA351, 3, 0x0186A6BC, kPendingPairs, 4, false},  // mov [eax*8+0x186A6BC], edx
+    {0x007AA35E, 3, 0x0185A6B8, kPendingPtrs, 0, false},   // mov [ecx*4+0x185A6B8], esi
+    {0x007AE7AE, 2, 0x00137AC8, kPendingPairs, 0, true},   // lea eax, [esi+0x137AC8]
+    {0x007AE7B9, 2, 0x00127AC8, kPendingPtrs, 0, true},    // lea ebp, [esi+0x127AC8]
+    {0x007AE8D9, 3, 0x00127AC8, kPendingPtrs, 0, true},    // mov eax, [esi+eax*4+0x127AC8]
+    {0x007AE8ED, 3, 0x00137AC8, kPendingPairs, 0, true},   // mov edx, [esi+eax*8+0x137AC8]
+    {0x007AE8F6, 3, 0x00137ACC, kPendingPairs, 4, true},   // mov eax, [esi+eax*8+0x137ACC]
+    {0x007AEAAD, 2, 0x00137AC8, kPendingPairs, 0, true},   // lea ecx, [esi+0x137AC8]
+    {0x007AEAB3, 2, 0x00127AC8, kPendingPtrs, 0, true},    // lea edx, [esi+0x127AC8]
+    {0x007AEAD0, 3, 0x00127AC8, kPendingPtrs, 0, true},    // mov eax, [esi+eax*4+0x127AC8]
+    {0x007AEADF, 3, 0x00137AC8, kPendingPairs, 0, true},   // mov ebp, [esi+eax*8+0x137AC8]
+    {0x007AEAE8, 3, 0x00137ACC, kPendingPairs, 4, true},   // mov eax, [esi+eax*8+0x137ACC]
+};
 constexpr DWORD kErrorMessageUpdateRva = 0x0032AD80;
 constexpr DWORD kEngineSingletonRva = 0x00BE7228;
 constexpr DWORD kLodDirtyFlagRva = 0x00D8D6E0;
@@ -176,6 +231,9 @@ std::uint8_t* volatile g_arena_extension_next = nullptr;
 std::uint8_t* g_arena_extension_end = nullptr;
 void* g_arena_bump_continue = nullptr;
 DWORD g_arena_extension_logged_nodes = 0;
+int g_pending_reference_capacity = 131072;
+bool g_pending_reference_patch_applied = false;
+DWORD g_pending_reference_logged_peak = 0;
 void* g_error_message_update_continue = nullptr;
 volatile LONG g_ubisoft_server_lost_prompt_log_count = 0;
 
@@ -361,6 +419,8 @@ void LoadConfig()
         ClampInt(GetPrivateProfileIntA("Limits", "ResourceArenaExtraNodes", 135000, ini_path), 0, 2000000);
     g_resource_arena_stock_nodes =
         ClampInt(GetPrivateProfileIntA("Limits", "ResourceArenaStockNodes", 45000, ini_path), 1, 45000);
+    g_pending_reference_capacity =
+        ClampInt(GetPrivateProfileIntA("Limits", "PendingResourceReferences", 131072, ini_path), 0, 4194304);
     LoadFlareConfig(ini_path);
 }
 
@@ -2344,6 +2404,78 @@ void LogResourceArenaUse()
     }
 }
 
+// Moves the pending-reference list to bigger arrays by rewriting the disp32 of every instruction
+// that addresses it; the count stays where it is. All sites are checked first: on any mismatch
+// nothing is patched.
+void ApplyPendingReferencePatch(const ModuleRange& range)
+{
+    if (g_pending_reference_capacity <= kPendingStockCapacity) {
+        return;
+    }
+    for (const auto& site : kPendingSites) {
+        if (!IsRvaInRange(range, site.rva + site.disp_offset, 4)) {
+            Log("PendingReferences: site RVA 0x%08lX outside the loaded image; not patched", static_cast<unsigned long>(site.rva));
+            return;
+        }
+        DWORD current = 0;
+        std::memcpy(&current, range.base + site.rva + site.disp_offset, sizeof(current));
+        if (current != site.expected) {
+            Log(
+                "PendingReferences: RVA 0x%08lX holds 0x%08lX, expected 0x%08lX; not patched",
+                static_cast<unsigned long>(site.rva),
+                static_cast<unsigned long>(current),
+                static_cast<unsigned long>(site.expected)
+            );
+            return;
+        }
+    }
+    const size_t capacity = static_cast<size_t>(g_pending_reference_capacity);
+    auto* ptrs = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, capacity * 4, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    auto* pairs = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, capacity * 8, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (ptrs == nullptr || pairs == nullptr) {
+        Log("PendingReferences: could not allocate %lu entries", static_cast<unsigned long>(capacity));
+        return;
+    }
+    std::memcpy(ptrs, range.base + kPendingPtrsRva, kPendingStockCapacity * 4);
+    std::memcpy(pairs, range.base + kPendingPairsRva, kPendingStockCapacity * 8);
+    const auto manager = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(range.base + kResourceManagerRva));
+    const int total = static_cast<int>(sizeof(kPendingSites) / sizeof(kPendingSites[0]));
+    int patched = 0;
+    for (const auto& site : kPendingSites) {
+        const auto* array = site.array == kPendingPtrs ? ptrs : pairs;
+        DWORD value = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(array)) + site.plus;
+        if (site.relative) {
+            value -= manager;
+        }
+        if (WriteMemory(range.base + site.rva + site.disp_offset, &value, sizeof(value))) {
+            ++patched;
+        }
+    }
+    g_pending_reference_patch_applied = patched == total;
+    Log(
+        "PendingReferences: %d of %d sites patched; %lu entries at 0x%p / 0x%p (stock %d)",
+        patched,
+        total,
+        static_cast<unsigned long>(capacity),
+        ptrs,
+        pairs,
+        kPendingStockCapacity
+    );
+}
+
+void LogPendingReferencePeak(const ModuleRange& range)
+{
+    if (!g_pending_reference_patch_applied) {
+        return;
+    }
+    DWORD count = 0;
+    std::memcpy(&count, range.base + kPendingResourceReferenceCountRva, sizeof(count));
+    if (count > static_cast<DWORD>(kPendingStockCapacity) && count > g_pending_reference_logged_peak) {
+        g_pending_reference_logged_peak = count;
+        Log("PendingReferences: %lu pending (stock limit %d)", static_cast<unsigned long>(count), kPendingStockCapacity);
+    }
+}
+
 // When the legal screen ends, state 4 calls the loading screen's begin function 0x4A20C0, which
 // ends by clearing the resource manager's list of unresolved resource references (count at
 // 0x188A6B8: mov dword [0x188A6B8],0 at 0x4A2153). After the stock 5 s wait the startup packages
@@ -3135,6 +3267,7 @@ void ApplyPatches()
 
     PatchDirect3DCreate9Import(exe);
     PatchBinkImports(exe);
+    ApplyPendingReferencePatch(exe);
     ApplyResourceArenaPatch(exe);
     ApplyStartupPatches(exe);
     ApplyUbisoftServerLostPromptPatch(exe);
@@ -3168,6 +3301,7 @@ DWORD WINAPI InitThread(LPVOID)
         ApplyLodThresholds(exe, "Loop");
         ApplyDrlFlareCurves(exe);
         LogTrafficDiagnostics(exe);
+        LogPendingReferencePeak(exe);
         if (tick % 4 == 0) {
             LogResourceArenaUse();
         }
