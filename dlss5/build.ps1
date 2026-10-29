@@ -40,15 +40,19 @@ $ngxLibs = @("`"$sdk\lib\nvsdk_ngx_s.lib`"", "d3d12.lib", "dxgi.lib", "advapi32.
 # /DEPENDENTLOADFLAG:0x800 (LOAD_LIBRARY_SEARCH_SYSTEM32) makes the loader resolve the
 # executables' DLL imports (d3d12, dxgi, wintrust, ...) from System32 only, never from the
 # application folder.
-# vcvarsall looks for vswhere on PATH.
+# vcvarsall runs vswhere by name, so its folder must be on PATH. Set it in this process's
+# environment, which cmd inherits, rather than on the cmd line.
 $installerDir = Split-Path -Parent $vswhere
+if (($env:PATH -split ";") -notcontains $installerDir) {
+  $env:PATH = "$env:PATH;$installerDir"
+}
 function Invoke-Cl([string]$arch, [string]$name, [string[]]$arguments) {
   $outDir = Join-Path $build $arch
   $rsp = Join-Path $outDir "$name.rsp"
   $all = $common + $arguments + @("/Fo`"$outDir\\`"", "/Fe`"$outDir\$name.exe`"")
   Set-Content -LiteralPath $rsp -Value ($all -join "`r`n") -Encoding ascii
   $machine = if ($arch -eq "x64") { "X64" } else { "X86" }
-  cmd /d /c "set `"PATH=%PATH%;$installerDir`" && call `"$vcvarsall`" $arch >nul && cl @`"$rsp`" /link /MACHINE:$machine /DEPENDENTLOADFLAG:0x800"
+  cmd /d /c "call `"$vcvarsall`" $arch >nul && cl @`"$rsp`" /link /MACHINE:$machine /DEPENDENTLOADFLAG:0x800"
   if ($LASTEXITCODE -ne 0) {
     throw "Building $name ($arch) failed with exit code $LASTEXITCODE"
   }
@@ -57,6 +61,7 @@ function Invoke-Cl([string]$arch, [string]$name, [string[]]$arguments) {
 $offscreen = @("`"$root\tests\offscreen_test.cpp`"", "`"$root\tests\synthetic_scene.cpp`"", "`"$root\src\image_io.cpp`"")
 Invoke-Cl "x64" "dsf-dlss5-offscreen" ($ngx + $offscreen + $shared + $ngxLibs)
 Invoke-Cl "x64" "dsf-dlss5-helper" ($ngx + @("`"$root\src\helper_main.cpp`"") + $shared + $ngxLibs)
+Invoke-Cl "x64" "dsf-dlss5-gpu-wait-test" (@("`"$root\tests\gpu_wait_test.cpp`"", "`"$root\src\d3d12_util.cpp`"", "d3d12.lib", "dxgi.lib"))
 if (-not $SkipClient) {
   $client = @("`"$root\tests\client_test.cpp`"", "`"$root\tests\synthetic_scene.cpp`"", "`"$root\src\image_io.cpp`"")
   Invoke-Cl "x86" "dsf-dlss5-client-test" ($client + @("d3d11.lib", "dxgi.lib", "user32.lib", "ole32.lib"))

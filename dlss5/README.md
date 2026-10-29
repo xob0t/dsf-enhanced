@@ -18,6 +18,7 @@ Design notes, the NGX interface and the test record are in [`research/dlss5-help
 | `src/ngx_trust.*` | Checks that `nvngx_dlssnr.dll` has a valid NVIDIA Corporation signature and is version 310.9.16 or later. |
 | `tests/offscreen_test.cpp` | `dsf-dlss5-offscreen.exe` (x64): runs DLSS 5 on a synthetic scene or a saved image and writes PNGs. No window, no game. |
 | `tests/client_test.cpp` | `dsf-dlss5-client-test.exe` (x86): stands in for the game. It starts the helper and drives the full 32 → 64-bit protocol with D3D11 shared textures. |
+| `tests/gpu_wait_test.cpp` | `dsf-dlss5-gpu-wait-test.exe` (x64): checks that a wait after a timed-out submission does not return before the GPU is done. |
 | `tests/synthetic_scene.*` | A small CPU ray-traced street scene with exact depth and motion vectors. |
 
 ## Requirements
@@ -41,7 +42,7 @@ This project does not ship NVIDIA's runtime and never will. The DLSS SDK license
 1. Download `rtx-remix-for-x64-games-release-remix-1.6.1.zip` from https://github.com/NVIDIAGameWorks/rtx-remix/releases/tag/remix-1.6.1.
 2. Extract `nvngx_dlssnr.dll` from the root of the zip into a folder of your choice, for example `out\ngx`.
 
-The file used for testing was version 310.9.16.0, 266,424,944 bytes, SHA-256 `2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f`, signed by NVIDIA Corporation. The helper and the offscreen test accept only runtimes whose SHA-256 is on the allowlist in `src/ngx_trust.h` (today only that file). The file must also carry a valid NVIDIA Corporation signature and be version 310.9.16 or later. Patched or pre-release copies therefore fail. When NVIDIA publishes a newer `nvngx_dlssnr.dll`, allow it explicitly with `--allow-runtime-sha256 <hash>`; the signature and version checks still apply. The checked file stays locked against changes until NGX shuts down, and the helper refuses to run if NGX maps any other copy.
+The file used for testing was version 310.9.16.0, 266,424,944 bytes, SHA-256 `2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f`, signed by NVIDIA Corporation. The helper and the offscreen test accept only runtimes whose SHA-256 is on the allowlist in `src/ngx_trust.h` (today only that file). The file must also carry a valid NVIDIA Corporation signature and be version 310.9.16 or later. Patched or pre-release copies therefore fail. When NVIDIA publishes a newer `nvngx_dlssnr.dll`, allow it explicitly with `--allow-runtime-sha256 <hash>`; the signature and version checks still apply. The checked file stays locked against changes until NGX shuts down, and the helper refuses to run if NGX maps any other copy. That last check happens after NGX has loaded the module, so it detects a different copy but cannot prevent loading it.
 
 ## Run the tests
 
@@ -56,6 +57,9 @@ The file used for testing was version 310.9.16.0, 266,424,944 bytes, SHA-256 `2b
 .\dlss5\build\x86\dsf-dlss5-client-test.exe --helper dlss5\build\x64\dsf-dlss5-helper.exe --runtime out\ngx --out out\dlss5-client
 .\dlss5\build\x86\dsf-dlss5-client-test.exe ... --host-creates   # the helper creates the shared textures (the DXVK direction)
 .\dlss5\build\x86\dsf-dlss5-client-test.exe ... --robustness     # then exercise the timeout and error paths
+
+# Regression test for waits after a timed-out submission (D3D12 only, no NGX runtime needed)
+.\dlss5\build\x64\dsf-dlss5-gpu-wait-test.exe
 ```
 
 The offscreen test writes `input_first.png`, `input_last.png`, `output_last.png`, and `compare_last.png` (input | output | difference ×4). It also logs per-evaluate GPU time and how much the output differs from the input. Exit code 0 means every evaluate succeeded.

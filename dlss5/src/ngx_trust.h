@@ -8,6 +8,8 @@
 //  - it has a valid Authenticode signature from NVIDIA Corporation and is at least the
 //    first public version.
 // After NGX creates the feature, IsSameFile confirms the module NGX mapped is this file.
+// That check runs after the module is loaded and its DllMain has run: it detects a
+// different copy and stops the helper from using it, but cannot prevent the load.
 
 #pragma once
 

@@ -57,8 +57,12 @@
 //
 //   Timeout: if fence_in = n does not arrive within about 2 s, the helper signals
 //   fence_in = n itself so its queue drains, answers DSF_DLSS5_ERR_TIMEOUT and becomes
-//   unconfigured until the next CONFIGURE. The game should likewise give up on a missing
-//   ACK after a few seconds (see dsf_dlss5_pipe.h for reads with a timeout).
+//   unconfigured until the next CONFIGURE. From then on the game must treat fence_in = n
+//   as consumed: it must not signal n (or anything <= n) on that fence again, because a
+//   late signal would not be greater than the fence's value, which is invalid for a
+//   Vulkan timeline semaphore. In practice: drop both fences, send CONFIGURE, and use the
+//   new fences from 1. The game should likewise give up on a missing ACK after a few
+//   seconds (see dsf_dlss5_pipe.h for reads with a timeout).
 //
 //   Every slot is single-buffered. The helper reads the inputs and writes Output until
 //   fence_out = n, so the game must not write the inputs for n+1, or read Output for n,

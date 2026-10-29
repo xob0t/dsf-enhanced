@@ -428,6 +428,11 @@ bool AcceptGame(HANDLE pipe, DWORD gamePid) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  // /DEPENDENTLOADFLAG only covers static imports. Make every later LoadLibrary by name
+  // search System32 (and folders added with AddDllDirectory) too, never the application
+  // or current folder. NGX loads its core and nvngx_dlssnr.dll by full path, which this
+  // does not affect.
+  SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
   Args args;
   if (!ParseArgs(argc, argv, &args)) {
     std::fprintf(stderr,

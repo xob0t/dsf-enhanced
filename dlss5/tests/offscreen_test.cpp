@@ -147,6 +147,8 @@ struct Inputs {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  // Same DLL search policy as the helper: System32 only for loads by name.
+  SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
   Options o;
   if (!ParseArgs(argc, argv, &o)) {
     std::fprintf(stderr, "usage: see the comment at the top of offscreen_test.cpp\n");

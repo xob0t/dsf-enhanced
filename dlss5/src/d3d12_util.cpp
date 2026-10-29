@@ -124,9 +124,20 @@ Gpu::SubmitResult Gpu::Submit(const Sync& sync, double* gpuMs) {
 }
 
 bool Gpu::WaitIdle(DWORD timeoutMs) {
-  if (fence_->GetCompletedValue() < fenceValue_) {
-    fence_->SetEventOnCompletion(fenceValue_, fenceEvent_);
-    if (WaitForSingleObject(fenceEvent_, timeoutMs) != WAIT_OBJECT_0) return false;
+  // Only the fence value decides. fenceEvent_ is auto-reset, and a wait that timed out
+  // leaves its SetEventOnCompletion registered: when that value completes, the event can be
+  // left signalled for the next, unrelated wait. So a wake-up only means "look again".
+  // (On device removal the completed value reads as UINT64_MAX, which also ends the loop.)
+  const ULONGLONG deadline = timeoutMs == INFINITE ? 0 : GetTickCount64() + timeoutMs;
+  while (fence_->GetCompletedValue() < fenceValue_) {
+    DWORD wait = INFINITE;
+    if (timeoutMs != INFINITE) {
+      const ULONGLONG now = GetTickCount64();
+      if (now >= deadline) return false;
+      wait = static_cast<DWORD>(deadline - now);
+    }
+    if (FAILED(fence_->SetEventOnCompletion(fenceValue_, fenceEvent_))) return false;
+    if (WaitForSingleObject(fenceEvent_, wait) == WAIT_FAILED) return false;
   }
   staging_.clear();
   return device_->GetDeviceRemovedReason() == S_OK;

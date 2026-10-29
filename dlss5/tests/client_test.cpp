@@ -296,6 +296,8 @@ bool Expect(bool condition, const char* what) {
 }  // namespace
 
 int wmain(int argc, wchar_t** argv) {
+  // Same DLL search policy as the helper: System32 only for loads by name.
+  SetDefaultDllDirectories(LOAD_LIBRARY_SEARCH_SYSTEM32 | LOAD_LIBRARY_SEARCH_USER_DIRS);
   Options o;
   for (int i = 1; i < argc; ++i) {
     const std::wstring a = argv[i];

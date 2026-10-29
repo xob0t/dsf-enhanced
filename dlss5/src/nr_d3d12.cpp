@@ -114,7 +114,10 @@ bool NrD3D12::CreateFeature(ID3D12GraphicsCommandList* list, uint32_t width, uin
     return Fail("NVSDK_NGX_D3D12_CreateFeature(DLSSNR)", result);
   }
   // NGX could pick another copy (its model cache, the driver store); only the file we
-  // verified is acceptable.
+  // verified is acceptable. This runs after NGX has already loaded the module and its
+  // DllMain has run, so it detects a substitution and refuses to use it, but cannot
+  // prevent the load. What prevents substitution of our copy is the lock VerifiedRuntime
+  // holds; another copy is NGX's own choice and has passed NGX's own signature check.
   const std::wstring loaded = LoadedRuntimePath();
   if (!runtime_->IsSameFile(loaded)) {
     ReleaseFeature();
