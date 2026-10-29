@@ -18,7 +18,7 @@ import numpy as np
 
 from dsfworld import gegr, ui
 from dsfworld.config import Config
-from dsfworld.formats import modl, uid
+from dsfworld.formats import gebi, modl, scnd, uid
 from dsfworld.formats.archive import Archive, SubModel, gesi, kid, walk
 from dsfworld.formats.chnk import ENTRY_LIMIT, Entry, write_chunk
 from dsfworld.stages import bake
@@ -76,6 +76,24 @@ def _budget_problems(a: Archive, g: Entry) -> list[str]:
     return [f"GESI +{o:#x} budget {b[o]:#x} < {need:#x}" for o, need in needs.items() if need > b[o]]
 
 
+def _gebi_problems(a: Archive, g: Entry) -> list[str]:
+    """GEGR's instances must place its own parts, be in the SCND quadtree once and fit the engine's
+    per-region arrays."""
+    blob = a.nonr(g, "GEBI")
+    placed = gebi.parse(blob)
+    parts = {p.uid for p in modl.parse_modl(a.nonr(g, "MODL"))}
+    problems = [
+        f"GEBI instance of {i.model_uid:#x}: no such part" for i in placed.instances if i.model_uid not in parts
+    ]
+    listed = sorted(i for node in scnd.parse(a.nonr(g, "SCND")).nodes for i in node)
+    if listed != list(range(len(placed.instances))):
+        problems.append("SCND doesn't list every GEBI instance once")
+    models = struct.unpack_from("<H", blob, 0x1E)[0]
+    if len(placed.instances) > gebi.MAX_INSTANCES or models > gebi.MAX_MODELS:
+        problems.append(f"GEBI: {len(placed.instances)} instances of {models} models, over the engine's arrays")
+    return problems
+
+
 def check(path: Path) -> list[str]:
     """Problems in GEGR of the archive at path (empty when consistent)."""
     problems: list[str] = []
@@ -99,6 +117,7 @@ def check(path: Path) -> list[str]:
         if missing:
             problems.append(f"MDID lacks {len(missing)} resource UIDs")
         problems += [f"DRSP with {len(d.children)} children" for d in walk(g, "DRSP") if len(d.children) > ENTRY_LIMIT]
+        problems += _gebi_problems(a, g)
         problems += _budget_problems(a, g)
     return problems
 
@@ -136,13 +155,20 @@ def run(cfg: Config, world: World, *, force: bool = False, show_file: bool = Tru
         with ui.status("Writing the baked cells into the base LOD"):
             g = a.global_region()
             stock_mdxn = kid(g, "MDXN").size
-            stats = gegr.apply(a, g, cells, uid.Allocator(uid.existing(a)))
+            b = cfg.section("bake")
+            atlas = b["leaf_cards"] == "flat" and b["leaf_card_atlas"]
+            stats = gegr.apply(a, g, cells, uid.Allocator(uid.existing(a)), leaf_atlas=atlas)
             mdxn, _ = gegr.update_budgets(a, a.entries, stock_mdxn)
+        side = cfg.section("bake")["block_cells"]
+        atlas_note = f", drawing one {stats.atlas_bytes / 1e6:.1f} MB atlas" if stats.atlas_bytes else ""
         rows = [
-            ("Cells rebuilt", f"{stats.cells}"),
+            (
+                "Cells rebuilt",
+                f"{stats.cells}" + (f", and {stats.blocks} blocks of {side} x {side} cells" if stats.blocks else ""),
+            ),
             ("Triangles", f"{stats.triangles:,}"),
             ("Submodels", f"{stats.submodels:,}"),
-            ("Tree materials", f"{stats.materials} lit copies for the leaf-card trees"),
+            ("Tree materials", f"{stats.materials} lit copies for the leaf-card trees" + atlas_note),
             ("Geometry", f"{(stats.vertex_bytes + stats.index_bytes) / 1e6:.0f} MB in {stats.drsp} new groups"),
             ("Streamer budget", f"{mdxn / 1e6:.0f} MB for the base LOD"),
         ]

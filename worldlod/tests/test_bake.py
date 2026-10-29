@@ -317,3 +317,19 @@ def test_packaged_class_names_missing_from_a_user_classes_table_are_skipped():
     cfg = config.load(None)
     assert stage.class_indices(cfg, world, "bake", "min_model_size") == {}
     assert stage.class_indices(cfg, world, "bake", "classes") == {"ground": 0}
+
+
+def test_placements_beyond_the_target_frame_go_to_the_fallback():
+    lib = library(
+        [vertex(0, 0, 0, 0, 0, (0, 1, 0)), vertex(1, 0, 0, 0, 0, (0, 1, 0)), vertex(0, 0, 1, 0, 0, (0, 1, 0))],
+        [0, 1, 2],
+    )
+    block, cell = np.eye(4), np.eye(4)
+    block[3, 0], cell[3, 0] = 256, -256
+    near, far = Instance(4, 0, yaw(0, (100, 0, 0))), Instance(4, 0, yaw(0, (-300, 0, 0)))  # far is 556 m from block
+    result = bake.bake_region(Classes(), lib, [near, far], block, {0}, fallback=cell)
+    by_frame = {g.frame: g for g in result.groups}
+    assert sorted(by_frame) == [0, 1]
+    x = {f: g.vertices[0, 0:2].copy().view("<i2")[0] / 64 for f, g in by_frame.items()}
+    assert x == {0: 100 - 256, 1: -300 + 256}
+    assert not result.skipped

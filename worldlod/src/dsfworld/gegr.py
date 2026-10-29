@@ -15,6 +15,15 @@ material (MACO): a new UID, and every g_texDiffuseMap and g_hAlphaTestRefValue
 the clone has set to the group's own material's. The clones come first in the
 new DRSP groups; MDID gains them after the last stock material.
 
+Block parts: the block classes' groups of all cells in a block (CellBake.block)
+are merged by material, flag and vertex layout into a new MODL part, placed by
+a new GEBI instance at the block's centre that copies a terrain instance
+(flags 1: always the far technique) and listed in SCND's quadtree, which the
+engine walks once per GEBI instance. A draw is a submodel, so a block of four
+cells draws each of its materials once instead of once per cell. Their part
+trailer lacks bit 4: the per-cell lightmap binding would light the whole block
+with the one cell its centre falls in.
+
 Entry headers (tags, versions, alignment, names) are copied from stock GEGR
 entries of the same kind.
 
@@ -30,14 +39,16 @@ from __future__ import annotations
 
 import copy
 import struct
-from dataclasses import dataclass, field
+from dataclasses import dataclass, field, replace
 
 import numpy as np
 
-from dsfworld.bake import Group, position_slot, read_positions
-from dsfworld.formats import modl
+from dsfworld import atlas
+from dsfworld.bake import MAX_VERTICES, Group, position_slot, read_positions
+from dsfworld.formats import gebi, modl, scnd
 from dsfworld.formats.archive import Archive, gesi, kid, walk
 from dsfworld.formats.chnk import ENTRY_LIMIT, Entry, entry_size
+from dsfworld.formats.modl import UV0
 from dsfworld.formats.uid import Allocator
 
 DRSP_BUDGET = 2_600_000  # bytes, about the stock group size
@@ -49,11 +60,15 @@ class CellBake:
     part_uid: int  # stock part whose finest LOD gets the baked groups
     groups: list[Group]
     keep: list[int] = field(default_factory=list)  # stock submodels of that LOD that stay
+    block: tuple[float, float, float] | None = None  # world position of its block's centre
+    block_groups: list[Group] = field(default_factory=list)  # in the frame of that centre
 
 
 @dataclass
 class Stats:
     cells: int = 0
+    blocks: int = 0
+    atlas_bytes: int = 0
     materials: int = 0
     submodels: int = 0
     triangles: int = 0
@@ -96,18 +111,27 @@ def _param_name(marp: bytes) -> bytes:
     return marp[:32].split(b"\0")[0]
 
 
-def clone_material(a: Archive, template: Entry, source: Entry, uid: int) -> Entry:
-    """template (a MACO) under a new UID, its CLONED_PARAMS values taken from source (a MACO).
+def material_params(a: Archive, maco: Entry) -> dict[bytes, bytes]:
+    """A material's CLONED_PARAMS values (the first of each), by name.
 
-    MARP: {char name[32], u8 value[16], u32 type}."""
+    MARP: {char name[32], u8 value[16], u32 type}; a texture's value starts with its u64 UID."""
     values = {}
-    for marc in (c for c in source.children if c.tag == "MARC"):
+    for marc in (c for c in maco.children if c.tag == "MARC"):
         for p in (c for c in marc.children if c.tag == "MARP"):
             b = _read(a, p)
             if _param_name(b) in CLONED_PARAMS:
                 values.setdefault(_param_name(b), b[32:48])
+    return values
+
+
+def clone_material(a: Archive, template: Entry, source: Entry, uid: int, diffuse: int | None = None) -> Entry:
+    """template (a MACO) under a new UID, its CLONED_PARAMS values taken from source (a MACO), and its
+    diffuse texture diffuse if given."""
+    values = material_params(a, source)
     if b"g_texDiffuseMap" not in values:
         raise ValueError(f"material {source.name!r} has no g_texDiffuseMap")
+    if diffuse is not None:
+        values[b"g_texDiffuseMap"] = struct.pack("<Q", diffuse) + values[b"g_texDiffuseMap"][8:]
 
     def leaf(e: Entry) -> Entry:
         b = _read(a, e)
@@ -123,7 +147,7 @@ def clone_material(a: Archive, template: Entry, source: Entry, uid: int) -> Entr
     return rebuild(template)
 
 
-KINDS = ("MACO", "SBMC", "VXCK", "IXCK")  # new resources, in the order they go into DRSP groups
+KINDS = ("TEXC", "MACO", "SBMC", "VXCK", "IXCK")  # new resources, in the order they go into DRSP groups
 
 
 @dataclass
@@ -154,6 +178,7 @@ class _Writer:
         self.stock = {kind: {a.uid(e) for e in walk(gegr, kind)} for kind in KINDS}
         self.new: dict[str, list[tuple[int, Entry]]] = {kind: [] for kind in KINDS}
         self.clones: dict[tuple[int, int], int] = {}  # (template, material) -> clone UID
+        self.diffuse: dict[int, int] = {}  # material -> texture its clones draw instead of its own
         self.stats = Stats()
 
     def material(self, g: Group) -> int:
@@ -163,7 +188,10 @@ class _Writer:
         key = (g.retarget, g.material)
         if key not in self.clones:
             uid = self.clones[key] = self.uids.new()
-            self.new["MACO"].append((uid, clone_material(self.a, self.macos[g.retarget], self.macos[g.material], uid)))
+            maco = clone_material(
+                self.a, self.macos[g.retarget], self.macos[g.material], uid, self.diffuse.get(g.material)
+            )
+            self.new["MACO"].append((uid, maco))
         return self.clones[key]
 
     def cell(self, cell: CellBake, part: modl.Part) -> None:
@@ -234,6 +262,50 @@ class _Writer:
         self.stats.index_bytes += len(data)
 
 
+def _world_xz(part: modl.Part, at: tuple[float, float, float]) -> tuple[tuple[float, float], tuple[float, float]]:
+    """(min x, min z), (max x, max z) of part's box placed unrotated at at."""
+    corners = _box_corners(part.box) + at
+    return (corners[:, 0].min(), corners[:, 2].min()), (corners[:, 0].max(), corners[:, 2].max())
+
+
+PER_CELL_BINDING = 4  # part trailer bit: FUN_006BA750 binds the instance's cell's lightmap
+
+
+def _concat(groups: list[Group]) -> Group:
+    first = groups[0]
+    if len(groups) == 1:
+        return first
+    base = np.cumsum([0] + [len(g.vertices) for g in groups[:-1]])
+    tris = np.vstack([g.triangles + b for g, b in zip(groups, base, strict=True)])
+    return Group(
+        first.material, first.flag, first.stride, first.elements, first.decl,
+        np.vstack([g.vertices for g in groups]), tris, first.retarget,
+    )  # fmt: skip
+
+
+def merge_groups(groups: list[Group]) -> list[Group]:
+    """groups with the same material, flag, vertex layout and retarget joined into as few groups of at
+    most MAX_VERTICES vertices as first-fit packing finds (a bigger group stays as it is)."""
+    by_key: dict[tuple, list[Group]] = {}
+    for g in groups:
+        by_key.setdefault((g.material, g.flag, g.stride, g.elements, g.retarget), []).append(g)
+    out = []
+    for same in by_key.values():
+        bins: list[list] = []  # [vertex count, groups]
+        for g in sorted(same, key=lambda g: -len(g.vertices)):
+            if len(g.vertices) > MAX_VERTICES:
+                out.append(g)
+                continue
+            fit = next((b for b in bins if b[0] + len(g.vertices) <= MAX_VERTICES), None)
+            if fit is None:
+                bins.append([len(g.vertices), [g]])
+            else:
+                fit[0] += len(g.vertices)
+                fit[1].append(g)
+        out += [_concat(gs) for _, gs in bins]
+    return out
+
+
 def drsp_groups(entries: list[Entry]) -> list[list[Entry]]:
     """entries in order, split into groups within the stock limits (children and bytes)."""
     groups: list[list[Entry]] = []
@@ -258,15 +330,77 @@ def insert_uids(ids: list[int], stock: dict[str, set[int]], new: dict[str, list[
     return out
 
 
-def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator) -> Stats:
-    """Modify the parsed GEGR entry tree in place."""
+def use_atlas(writer: _Writer, gegr: Entry, cells: list[CellBake]) -> None:
+    """Draw the flat leaf cards (groups with a retarget) from one atlas of their textures: their UVs move
+    into its tiles, and groups of trees with the same alpha-test reference take the material of the first
+    of them, whose clones draw the atlas."""
+    a = writer.a
+    trees = sorted({g.material for c in cells for g in c.groups + c.block_groups if g.retarget})
+    if not trees:
+        return
+    textures = {a.uid(t): t for t in walk(gegr, "TEXC")}
+    params = {m: material_params(a, writer.macos[m]) for m in trees}
+    diffuse = [struct.unpack_from("<Q", params[m][b"g_texDiffuseMap"])[0] for m in trees]
+    sheet = atlas.build([_read(a, kid(textures[t], "DXTC")) for t in diffuse])
+    uid = writer.uids.new()
+    t = writer.templates["TEXC"]
+    payloads = {"UIDC": struct.pack("<Q", uid), "DXTC": sheet.dds}
+    writer.new["TEXC"].append((uid, _like(t, children=[_like(c, payloads[c.tag]) for c in t.children])))
+    first: dict[bytes, int] = {}
+    stand_in = {m: first.setdefault(params[m].get(b"g_hAlphaTestRefValue", b""), m) for m in trees}
+    for m in set(stand_in.values()):
+        writer.diffuse[m] = uid
+    tiles = dict(zip(trees, sheet.tiles, strict=True))
+
+    def moved(g: Group) -> Group:
+        if not g.retarget:
+            return g
+        uv = next(e for e in g.elements if e[0] == UV0)[3]
+        rows = g.vertices.copy()
+        old = rows[:, uv : uv + 4].copy().view("<f2").astype(np.float64)
+        rows[:, uv : uv + 4] = sheet.uv(tiles[g.material], old).astype("<f2").view(np.uint8)
+        return replace(g, material=stand_in[g.material], vertices=rows)
+
+    for c in cells:
+        c.groups = [moved(g) for g in c.groups]
+        c.block_groups = [moved(g) for g in c.block_groups]
+    writer.stats.atlas_bytes = len(sheet.dds)
+
+
+def apply(a: Archive, gegr: Entry, cells: list[CellBake], uids: Allocator, *, leaf_atlas: bool = False) -> Stats:
+    """Modify the parsed GEGR entry tree in place. leaf_atlas: draw the flat leaf cards from one texture."""
     writer = _Writer(a, gegr, uids)
+    if leaf_atlas:
+        use_atlas(writer, gegr, cells)
     nonr = kid(gegr, "NONR")
     parts = modl.parse_modl(a.read(kid(nonr, "MODL")))
     by_uid = {p.uid: p for p in parts}
     for cell in cells:
         if cell.groups:
             writer.cell(cell, by_uid[cell.part_uid])
+    blocks: dict[tuple[float, float, float], list[Group]] = {}
+    for cell in cells:
+        if cell.block is not None and cell.block_groups:
+            blocks.setdefault(cell.block, []).extend(cell.block_groups)
+    placed = []
+    for centre, groups in blocks.items():
+        part = modl.Part(uids.new(), np.zeros((4, 4)), [modl.Lod(7, [], [])], 0)
+        writer.cell(CellBake(part.uid, merge_groups(groups)), part)
+        part.trailer &= ~PER_CELL_BINDING
+        parts.append(part)
+        by_uid[part.uid] = part
+        placed.append((part.uid, *centre))
+    writer.stats.cells -= len(blocks)
+    writer.stats.blocks = len(blocks)
+    if placed:
+        info = kid(nonr, "GEBI")
+        blob = a.read(info)
+        stock = gebi.parse(blob).instances
+        template = next(i for i, inst in enumerate(stock) if inst.flags == 1)
+        info.payload = gebi.add_instances(blob, template, placed)
+        scene = kid(nonr, "SCND")
+        boxes = [(len(stock) + k, *_world_xz(by_uid[uid], (x, y, z))) for k, (uid, x, y, z) in enumerate(placed)]
+        scene.payload = scnd.add(a.read(scene), boxes)
     stats, new = writer.stats, writer.new
     stats.materials = len(new["MACO"])
     if not new["SBMC"]:

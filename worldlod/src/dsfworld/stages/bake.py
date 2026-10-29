@@ -1,5 +1,10 @@
 """bake: copy each detailed region's chosen classes into the stock base part at its cell.
 
+[bake] block_classes go into a shared part per block of block_cells x block_cells
+cells instead, in the frame of the block's centre (gegr.apply writes those parts).
+A placement that doesn't fit that frame (int16 positions reach 512 m from it)
+stays in its cell's part.
+
 Writes <work_dir>/bake/<region>.pkl (the baked groups) and bake/summary.tsv.
 A region is rebuilt when its file is missing or its cache key changed: VERSION,
 the [game], [classes], [bake] and [simplify] settings, and the source archive's
@@ -11,7 +16,7 @@ from __future__ import annotations
 
 import pickle
 from collections import Counter
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from pathlib import Path
 
 import numpy as np
@@ -24,7 +29,8 @@ from dsfworld.world import World
 
 SECTIONS = ("game", "classes", "bake", "simplify")
 # Part of the cache key: raise when the bake or simplification output changes for the same settings.
-VERSION = 9
+VERSION = 10
+CELL_SIZE = 512.0  # metres; cells are centred on its multiples (SCND)
 
 
 def output_dir(cfg: Config) -> Path:
@@ -93,6 +99,8 @@ class Settings:
     normal_weight: float
     colour_weight: float
     lock_border: bool
+    block_classes: frozenset[int] = frozenset()  # classes baked into block parts
+    block_cells: int = 1  # cells per block side; 1: no blocks
 
 
 def settings(cfg: Config, world: World) -> Settings:
@@ -100,6 +108,8 @@ def settings(cfg: Config, world: World) -> Settings:
     if b["leaf_cards"] not in ("flat", "keep", "drop"):
         raise SystemExit('[bake] leaf_cards must be "flat", "keep" or "drop"')
     min_size = class_indices(cfg, world, "bake", "min_model_size")
+    if b["block_cells"] not in (1, 2):
+        raise SystemExit("[bake] block_cells must be 1 or 2 (int16 positions reach 512 m from a block's centre)")
     options = bake.BakeOptions(
         height_offset=b["height_offset"],
         exclude=tuple(b["exclude"]),
@@ -118,26 +128,57 @@ def settings(cfg: Config, world: World) -> Settings:
         normal_weight=s["normal_weight"],
         colour_weight=s["colour_weight"],
         lock_border=s["lock_border"],
+        block_classes=frozenset(class_indices(cfg, world, "bake", "block_classes").values()),
+        block_cells=b["block_cells"],
     )
 
 
+def block_centre(x: float, z: float, cells: int) -> tuple[float, float]:
+    """The centre of the block of cells x cells cells holding the cell centred at (x, z)."""
+
+    def axis(v: float) -> float:
+        first = round(v / CELL_SIZE) // cells * cells
+        return (first + (cells - 1) / 2) * CELL_SIZE
+
+    return axis(x), axis(z)
+
+
+def _simplified(world: World, groups: list[bake.Group], s: Settings) -> list[bake.Group]:
+    """groups with those of the simplified classes simplified as one mesh."""
+    to_simplify = [x for x in groups if world.class_index(x.material) in s.simplified]
+    rest = [x for x in groups if world.class_index(x.material) not in s.simplified]
+    return simplify.cell(to_simplify, s.error, s.normal_weight, s.colour_weight, lock_border=s.lock_border) + rest
+
+
 def bake_cell(
-    world: World, name: str, target: np.ndarray, *, stock_terrain: list[tuple[int, int]], settings: Settings
-) -> tuple[bake.Result, bool]:
+    world: World,
+    name: str,
+    target: np.ndarray,
+    *,
+    stock_terrain: list[tuple[int, int]],
+    settings: Settings,
+    block: np.ndarray | None = None,
+) -> tuple[bake.Result, bool, list[bake.Group]]:
     """One region baked into the frame of target, simplified by class, with the stock terrain it leaves
-    uncovered kept as fill. Also whether the bake covers the stock terrain at all: if not, the cell keeps
-    its stock terrain submodels as they are."""
+    uncovered kept as fill. Also whether the bake covers the stock terrain at all (if not, the cell keeps
+    its stock terrain submodels as they are), and with a block frame given, the block classes' groups
+    in it (their placements that don't fit it are in the result, in target's frame)."""
     s = settings
     lib, g = world.region(name)
-    result = bake.bake_region(world, lib, g.instances, target, s.keep, options=s.options)
-    to_simplify = [x for x in result.groups if world.class_index(x.material) in s.simplified]
-    rest = [x for x in result.groups if world.class_index(x.material) not in s.simplified]
-    to_simplify = simplify.cell(to_simplify, s.error, s.normal_weight, s.colour_weight, lock_border=s.lock_border)
-    result.groups = to_simplify + rest
-    cover = [x for x in result.groups if world.class_index(x.material) in s.fill_cover]
+    blocked = s.keep & s.block_classes if block is not None else frozenset()
+    result = bake.bake_region(world, lib, g.instances, target, s.keep - blocked, options=s.options)
+    in_block: list[bake.Group] = []
+    if blocked:
+        extra = bake.bake_region(world, lib, g.instances, block, blocked, options=s.options, fallback=target)
+        result.skipped.update(extra.skipped)
+        result.groups += [replace(x, frame=0) for x in extra.groups if x.frame == 1]
+        in_block = _simplified(world, [replace(x, frame=1) for x in extra.groups if x.frame == 0], s)
+    result.groups = _simplified(world, result.groups, s)
+    cover = [x for x in result.groups + in_block if world.class_index(x.material) in s.fill_cover]
     if cover and s.fill_drop >= 0:
-        result.groups += bake.fill_from_stock(world.library, stock_terrain, cover, s.fill_drop)
-    return result, bool(cover)
+        shift = None if block is None else (block[3, :3] - target[3, :3]) @ np.linalg.inv(target[:3, :3])
+        result.groups += bake.fill_from_stock(world.library, stock_terrain, cover, s.fill_drop, shift)
+    return result, bool(cover), in_block
 
 
 def _load(path: Path, digest: str) -> dict | None:
@@ -179,20 +220,31 @@ def _bake_one(run: _Run, name: str) -> tuple[CellBake, dict] | None:
     replaced = _replaced(world, lod, run.settings.replace)
     path = run.out / f"{name}.pkl"
     cached = None if run.force else _load(path, run.digest)
+    centre = None
+    if run.settings.block_cells > 1 and run.settings.keep & run.settings.block_classes:
+        centre = block_centre(matrix[3, 0], matrix[3, 2], run.settings.block_cells)
     if cached is None:
         flags = dict(zip(lod.submodels, lod.flags, strict=True))
         terrain = [(s, flags[s]) for s in lod.submodels if s in replaced]
-        result, covered = bake_cell(world, name, matrix, stock_terrain=terrain, settings=run.settings)
+        block = None
+        if centre is not None:
+            block = matrix.copy()
+            block[3, 0], block[3, 2] = centre
+        result, covered, in_block = bake_cell(
+            world, name, matrix, stock_terrain=terrain, settings=run.settings, block=block
+        )
         cached = {
             "digest": run.digest,
             "part": part_uid,
             "groups": result.groups,
+            "block_groups": in_block,
             "skipped": result.skipped,
             "covered": covered,
         }
         _save(path, cached)
     kept = [s for s in lod.submodels if s not in replaced or not cached["covered"]]
-    return CellBake(part_uid, cached["groups"], kept), cached
+    block_at = (centre[0], float(matrix[3, 1]), centre[1]) if centre is not None else None
+    return CellBake(part_uid, cached["groups"], kept, block_at, cached["block_groups"]), cached
 
 
 def run(cfg: Config, world: World, *, force: bool = False) -> list[CellBake]:
@@ -225,9 +277,9 @@ def run(cfg: Config, world: World, *, force: bool = False) -> list[CellBake]:
             cell, cached = done
             cells.append(cell)
             skipped.update(cached["skipped"])
-            tris = sum(len(g.triangles) for g in cell.groups)
-            verts = sum(len(g.vertices) for g in cell.groups)
-            rows.append([name, len(cell.groups), verts, tris, sum(cached["skipped"].values())])
+            tris = sum(len(g.triangles) for g in cell.groups + cell.block_groups)
+            verts = sum(len(g.vertices) for g in cell.groups + cell.block_groups)
+            rows.append([name, len(cell.groups) + len(cell.block_groups), verts, tris, sum(cached["skipped"].values())])
     _report(out, rows, no_target, skipped)
     return cells
 

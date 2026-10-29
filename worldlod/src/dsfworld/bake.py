@@ -120,6 +120,7 @@ class Group:
     vertices: np.ndarray  # (n, stride) uint8
     triangles: np.ndarray  # (m, 3) int64
     retarget: int = 0  # if set: draw with a clone of this material holding `material`'s diffuse texture
+    frame: int = 0  # bake_region's target the vertices are in: 0, or 1 for its fallback
 
     def chunks(self):
         """(vertices, triangles) pieces of at most MAX_VERTICES vertices, indices local to the piece."""
@@ -314,7 +315,7 @@ def move(v: Vertices, place: Placement) -> bool:
 
 def weld(key: tuple, pieces: list[tuple[np.ndarray, np.ndarray]], decl: bytes) -> Group:
     """One group from pieces of (rows, triangles), identical vertices merged, first-seen order kept."""
-    material, flag, (stride, elements), retarget = key
+    material, flag, (stride, elements), retarget, frame = key
     rows = np.vstack([r for r, _ in pieces])
     base = np.cumsum([0] + [len(r) for r, _ in pieces[:-1]])
     tris = np.vstack([t + b for (_, t), b in zip(pieces, base, strict=True)])
@@ -323,7 +324,7 @@ def weld(key: tuple, pieces: list[tuple[np.ndarray, np.ndarray]], decl: bytes) -
     order = np.argsort(first)
     rank = np.empty_like(order)
     rank[order] = np.arange(len(order))
-    return Group(material, flag, stride, elements, decl, rows[np.sort(first)], rank[inverse][tris], retarget)
+    return Group(material, flag, stride, elements, decl, rows[np.sort(first)], rank[inverse][tris], retarget, frame)
 
 
 def bake_region(
@@ -334,11 +335,14 @@ def bake_region(
     keep: set[int],
     *,
     options: BakeOptions | None = None,
+    fallback: np.ndarray | None = None,
 ) -> Result:
     """Copy the submodels of the classes in keep placed by instances into the frame of target (a 4x4
     matrix), grouped by material, flag and vertex layout, with options' offset, exclusions, size limits
-    and leaf-card handling."""
+    and leaf-card handling. A placement whose positions don't fit target's frame goes into fallback's
+    (its groups have frame 1) when given."""
     options = options or BakeOptions()
+    targets = [target] if fallback is None else [target, fallback]
     pieces: dict[tuple, list] = {}
     decls: dict[tuple, bytes] = {}
     skipped: Counter = Counter()
@@ -347,7 +351,7 @@ def bake_region(
         lod = part.finest_lod() if part else None
         if lod is None:
             continue
-        place = Placement.of(inst, target, options.height_offset)
+        places = [Placement.of(inst, t, options.height_offset) for t in targets]
         placed_size = part.size * float(inst.scale.max())
         for su, flag in zip(lod.submodels, lod.flags, strict=True):
             sub = lib.submodels.get(su)
@@ -357,18 +361,20 @@ def bake_region(
             if v is None:
                 continue
             key_flag, retarget = flag, 0
-            if position_slot(v.elements)[0] != NORMAL or options.leaf_cards == "keep":
-                fits = move(v, place)
-            elif options.leaf_cards == "flat" and options.cards is not None:
-                fits = expand_cards(v, place, options.cards)
-                key_flag, retarget = options.cards.flag, options.cards.material
-            else:
+            cards = position_slot(v.elements)[0] == NORMAL and options.leaf_cards != "keep"
+            if cards and (options.leaf_cards != "flat" or options.cards is None):
                 continue
-            if not fits:
+            if cards:
+                key_flag, retarget = options.cards.flag, options.cards.material
+            # neither move nor expand_cards changes v when the positions don't fit
+            frame = next(
+                (i for i, p in enumerate(places) if (expand_cards(v, p, options.cards) if cards else move(v, p))), None
+            )
+            if frame is None:
                 skipped["outside the target frame"] += 1
                 continue
             decls[v.layout] = v.decl
-            pieces.setdefault((sub.material, key_flag, v.layout, retarget), []).append((v.rows, v.triangles))
+            pieces.setdefault((sub.material, key_flag, v.layout, retarget, frame), []).append((v.rows, v.triangles))
     return Result([weld(key, p, decls[key[2]]) for key, p in pieces.items()], skipped)
 
 
@@ -397,13 +403,18 @@ def _samples(tri: np.ndarray, per_area: float, rng: np.random.Generator, cap: in
     return a + (tri[idx, 1] - a) * u[:, None] + (tri[idx, 2] - a) * v[:, None], idx
 
 
-def fill_from_stock(lib: modl.Library, stock: list[tuple[int, int]], baked: list[Group], drop: float) -> list[Group]:
+def fill_from_stock(
+    lib: modl.Library, stock: list[tuple[int, int]], baked: list[Group], drop: float, shift: np.ndarray | None = None
+) -> list[Group]:
     """The stock submodels' triangles that baked geometry leaves (mostly) uncovered, seen from above,
-    moved down by drop metres. stock: (submodel UID, flag) in the target part's frame."""
+    moved down by drop metres. stock: (submodel UID, flag) in the target part's frame; baked groups of
+    frame 1 are in a frame shift metres from it (a block's)."""
     rng = np.random.default_rng(0)
     covered: set[tuple[int, int]] = set()
     for g in baked:
         p, _ = _samples(positions(g)[g.triangles], 2 / FILL_GRID**2, rng)
+        if g.frame == 1 and shift is not None:
+            p = p + shift
         covered.update(map(tuple, np.floor(p[:, [0, 2]] / FILL_GRID).astype(np.int64).tolist()))
     out = []
     for su, flag in stock:

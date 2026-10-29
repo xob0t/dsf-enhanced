@@ -66,6 +66,11 @@ min_model_size = { buildings = 2.0 }
 # they are; "drop" leaves them out.
 leaf_cards = "flat"
 leaf_card_material = "trees/palm_02.matxml"
+# With "flat": put the trees' textures into one atlas, so that the flat cards of
+# all trees with the same alpha-test reference share a material (4 instead of 32)
+# and a block draws its trees in a few submodels instead of one per kind of tree.
+# Adds a 5.6 MB texture.
+leaf_card_atlas = true
 # The stock submodels to replace: those whose material path starts with this
 # prefix (the vertex-coloured low-poly terrain). The part holding them, one at
 # the centre of 420 of the 532 detailed cells, receives the baked cell; its
@@ -83,6 +88,14 @@ height_offset = 0.05
 # ground where the two meet. A negative value turns the fill off. A cell whose
 # bake has no ground at all keeps its stock terrain as it is either way.
 fill_drop = 2.0
+# Classes baked into one shared part per block of block_cells x block_cells cells
+# instead of into each cell's part. The game draws each submodel (a material in a
+# part) separately, so a 2 x 2 block draws a material once instead of up to four
+# times: the upper-Shift overview queues about a fifth fewer draws. 1 turns blocks
+# off; 2 is the most, as positions reach only 512 m from a part's centre. Ground
+# stays per cell: its parts keep the cells' lightmap binding and the gap fill.
+block_classes = ["buildings", "foliage", "props"]
+block_cells = 2
 # Baked classes that count as covering the stock terrain (seen from above) for
 # that fill. Trees don't: the ground under them still needs filling.
 fill_cover = ["ground"]

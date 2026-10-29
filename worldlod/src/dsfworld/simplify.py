@@ -14,6 +14,8 @@ triangles remain, cell-wide 62% (normal weight 0.1), crack-free.
 
 from __future__ import annotations
 
+from dataclasses import replace
+
 import numpy as np
 
 from dsfworld import meshopt
@@ -67,7 +69,5 @@ def cell(
         if not len(mine):
             continue
         used, remap = np.unique(mine, return_inverse=True)
-        result.append(
-            Group(g.material, g.flag, g.stride, g.elements, g.decl, g.vertices[used], remap.reshape(-1, 3), g.retarget)
-        )
+        result.append(replace(g, vertices=g.vertices[used], triangles=remap.reshape(-1, 3)))
     return result
