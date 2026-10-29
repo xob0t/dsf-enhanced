@@ -61,6 +61,7 @@ void D5BridgeFrame(IDirect3DDevice9* device);
 bool D5CreateIntzDepth(IDirect3DDevice9* device, UINT w, UINT h, IDirect3DSurface9** out);
 void D5FrameTimeTick();
 bool g_d5_trace_dump = false;
+bool g_d5_trace_scan = false;   // TraceScan: look for the VP in game memory (stalls that frame for seconds)
 bool g_d5_export = false;
 int g_d5_trace_start_seconds = 60;
 int g_d5_trace_interval_seconds = 20;
@@ -74,6 +75,7 @@ void LoadDlss5Config(const char* ini_path)
 {
     g_d5_trace = GetPrivateProfileIntA("DLSS5", "Trace", 0, ini_path) != 0;
     g_d5_trace_dump = GetPrivateProfileIntA("DLSS5", "TraceDump", 0, ini_path) != 0;
+    g_d5_trace_scan = GetPrivateProfileIntA("DLSS5", "TraceScan", 0, ini_path) != 0;
     g_d5_export = GetPrivateProfileIntA("DLSS5", "Export", 0, ini_path) != 0;
     g_d5_helper = g_d5_export && GetPrivateProfileIntA("DLSS5", "Helper", 0, ini_path) != 0;
     LoadDlss5BridgeConfig(ini_path);
@@ -849,6 +851,193 @@ void D5LogMatrix(const char* label, const float* m)
     }
 }
 
+double D5NowMs();
+
+// Per-object motion, measurement only (Trace=1): which scene draws move between two traced
+// frames, and how wrong camera-only motion vectors are for them. Each scene draw is keyed by
+// its vertex shader and draw parameters; its world rows (c4-c6) are compared with the previous
+// frame's draws of the same key: equal means static, otherwise the nearest one by translation
+// is taken as the same object one frame earlier. research/dlss5-renderer.md, "Per-object motion".
+
+struct D5ObjectDraw
+{
+    DWORD key;
+    float wvp[16];
+    float world[12];
+};
+
+std::vector<D5ObjectDraw> g_d5_object_draws;        // this traced frame's scene draws
+std::vector<D5ObjectDraw> g_d5_object_draws_prev;   // the previous traced frame's, VP-checked
+float g_d5_object_vp_prev[16] = {};
+double g_d5_object_time_prev = 0.0;
+LONG g_d5_object_frame_prev = -100;
+DWORD g_d5_draw_key = 0;   // set by the draw hooks before D5BeforeDraw
+
+DWORD D5DrawKey(DWORD a, DWORD b, DWORD c, DWORD d)
+{
+    DWORD hash = 2166136261u;
+    const DWORD values[5] = {D5ShaderHash(g_d5.vs), a, b, c, d};
+    for (DWORD v : values) {
+        for (int i = 0; i < 4; ++i) {
+            hash ^= (v >> (i * 8)) & 0xFF;
+            hash *= 16777619u;
+        }
+    }
+    return hash;
+}
+
+void D5RecordObjectDraw()
+{
+    if (g_d5_object_draws.size() >= 8000) {
+        return;
+    }
+    D5ObjectDraw draw = {};
+    draw.key = g_d5_draw_key;
+    for (int row = 0; row < 4; ++row) {
+        std::memcpy(&draw.wvp[row * 4], g_d5.vs_c[g_d5_wvp_register + row].v, sizeof(float) * 4);
+    }
+    for (int row = 0; row < 3; ++row) {
+        std::memcpy(&draw.world[row * 4], g_d5.vs_c[g_d5_world_register + row].v, sizeof(float) * 4);
+    }
+    g_d5_object_draws.push_back(draw);
+}
+
+bool D5Project(const float* vp, const float* p, float* px)
+{
+    float clip[4] = {};
+    for (int row = 0; row < 4; ++row) {
+        clip[row] = vp[row * 4 + 0] * p[0] + vp[row * 4 + 1] * p[1] + vp[row * 4 + 2] * p[2] + vp[row * 4 + 3];
+    }
+    if (clip[3] <= 0.01f) {
+        return false;
+    }
+    px[0] = (clip[0] / clip[3] * 0.5f + 0.5f) * static_cast<float>(g_backbuffer_width);
+    px[1] = (0.5f - clip[1] / clip[3] * 0.5f) * static_cast<float>(g_backbuffer_height);
+    return true;
+}
+
+// Scene end of a traced frame: keep the draws whose constants give this frame's VP, then compare
+// with the previous traced frame when it was the frame just before.
+void D5AnalyseObjectMotion()
+{
+    std::vector<D5ObjectDraw> valid;
+    for (const D5ObjectDraw& draw : g_d5_object_draws) {
+        D5Constant c[8] = {};
+        for (int row = 0; row < 4; ++row) {
+            std::memcpy(c[g_d5_wvp_register + row].v, &draw.wvp[row * 4], sizeof(float) * 4);
+        }
+        for (int row = 0; row < 3; ++row) {
+            std::memcpy(c[g_d5_world_register + row].v, &draw.world[row * 4], sizeof(float) * 4);
+        }
+        float vp[16] = {};
+        if (g_d5_wvp_register + 4 <= 8 && g_d5_world_register + 3 <= 8 && D5SolveViewProj(c, vp) && D5SameMatrix(vp, g_d5_vp_current)) {
+            valid.push_back(draw);
+        }
+    }
+    const double now = D5NowMs();
+    if (g_d5_object_frame_prev == g_d5_frame_index - 1 && !g_d5_object_draws_prev.empty()) {
+        std::unordered_map<DWORD, std::vector<const D5ObjectDraw*>> previous;
+        for (const D5ObjectDraw& draw : g_d5_object_draws_prev) {
+            previous[draw.key].push_back(&draw);
+        }
+        struct Moving
+        {
+            float world[12];
+            float prev_t[3];
+            int draws;
+            float speed;
+            float error_px;
+            bool on_screen;
+        };
+        std::vector<Moving> objects;
+        int unchanged = 0;
+        int moved = 0;
+        int unmatched = 0;
+        const float dt = static_cast<float>(std::max(1.0, now - g_d5_object_time_prev)) / 1000.0f;
+        for (const D5ObjectDraw& draw : valid) {
+            auto it = previous.find(draw.key);
+            if (it == previous.end()) {
+                ++unmatched;
+                continue;
+            }
+            const D5ObjectDraw* best = nullptr;
+            float best_distance = 1e30f;
+            for (const D5ObjectDraw* old : it->second) {
+                if (std::memcmp(old->world, draw.world, sizeof(draw.world)) == 0) {
+                    best = old;
+                    best_distance = 0.0f;
+                    break;
+                }
+                const float dx = old->world[3] - draw.world[3];
+                const float dy = old->world[7] - draw.world[7];
+                const float dz = old->world[11] - draw.world[11];
+                const float distance = std::sqrt(dx * dx + dy * dy + dz * dz);
+                if (distance < best_distance) {
+                    best_distance = distance;
+                    best = old;
+                }
+            }
+            if (best_distance == 0.0f) {
+                ++unchanged;
+                continue;
+            }
+            if (best == nullptr || best_distance > 10.0f) {
+                ++unmatched;
+                continue;
+            }
+            ++moved;
+            // One object = one world matrix; its draws share it.
+            Moving* object = nullptr;
+            for (Moving& m : objects) {
+                if (std::memcmp(m.world, draw.world, sizeof(m.world)) == 0) {
+                    object = &m;
+                    break;
+                }
+            }
+            if (object == nullptr) {
+                objects.push_back(Moving{});
+                object = &objects.back();
+                std::memcpy(object->world, draw.world, sizeof(object->world));
+                object->prev_t[0] = best->world[3];
+                object->prev_t[1] = best->world[7];
+                object->prev_t[2] = best->world[11];
+                object->speed = best_distance / dt;
+                // The object's origin now, where it was, and where camera-only motion says it was.
+                const float now_p[3] = {draw.world[3], draw.world[7], draw.world[11]};
+                float px_now[2] = {};
+                float px_true[2] = {};
+                float px_camera[2] = {};
+                object->on_screen = D5Project(g_d5_vp_current, now_p, px_now) && px_now[0] >= 0.0f &&
+                    px_now[0] < static_cast<float>(g_backbuffer_width) && px_now[1] >= 0.0f &&
+                    px_now[1] < static_cast<float>(g_backbuffer_height);
+                if (D5Project(g_d5_object_vp_prev, object->prev_t, px_true) && D5Project(g_d5_object_vp_prev, now_p, px_camera)) {
+                    object->error_px = std::sqrt((px_true[0] - px_camera[0]) * (px_true[0] - px_camera[0]) +
+                        (px_true[1] - px_camera[1]) * (px_true[1] - px_camera[1]));
+                }
+            }
+            ++object->draws;
+        }
+        std::sort(objects.begin(), objects.end(), [](const Moving& a, const Moving& b) { return a.error_px > b.error_px; });
+        int on_screen = 0;
+        for (const Moving& m : objects) {
+            on_screen += m.on_screen ? 1 : 0;
+        }
+        Log("DLSS5  objects frame %ld (%.1f ms after the last): %u VP-layout scene draws, %d unchanged, %d moved (%u objects, %d on screen), %d new or unmatched",
+            static_cast<long>(g_d5_frame_index), dt * 1000.0f, static_cast<unsigned>(valid.size()), unchanged, moved,
+            static_cast<unsigned>(objects.size()), on_screen, unmatched);
+        for (size_t i = 0; i < objects.size() && i < 10; ++i) {
+            const Moving& m = objects[i];
+            Log("DLSS5  object at %.1f %.1f %.1f, %d draws, %.1f km/h, camera-only motion off by %.1f px%s", m.world[3], m.world[7],
+                m.world[11], m.draws, m.speed * 3.6f, m.error_px, m.on_screen ? "" : " (off screen)");
+        }
+    }
+    g_d5_object_draws_prev.swap(valid);
+    std::memcpy(g_d5_object_vp_prev, g_d5_vp_current, sizeof(g_d5_object_vp_prev));
+    g_d5_object_time_prev = now;
+    g_d5_object_frame_prev = g_d5_frame_index;
+    g_d5_object_draws.clear();
+}
+
 // Called once per frame at the scene end: the best bucket becomes this frame's VP.
 void D5FinishViewProj()
 {
@@ -893,6 +1082,9 @@ void D5FinishViewProj()
             Log("DLSS5  second view-proj (%d draws):", g_d5_vp_buckets[second].count);
             D5LogMatrix("view-proj-2", g_d5_vp_buckets[second].vp);
         }
+        if (g_d5_vp_valid) {
+            D5AnalyseObjectMotion();
+        }
     }
 }
 
@@ -918,6 +1110,22 @@ void D5BeforeDraw(IDirect3DDevice9* device, UINT prims, UINT vertices)
     if (D5IsScenePass()) {
         ++g_d5_scene_draws_this_frame;
         const int bucket = D5AddViewProjCandidate();
+        if (g_d5_trace_frame != nullptr) {
+            D5RecordObjectDraw();
+            // Draws whose c0-c6 do not give a perspective VP: dump c0-c19 (other constant layouts).
+            float vp[16] = {};
+            static int layout_lines = 0;
+            if (g_d5_trace_pair_step == 2 && layout_lines < 400 && !(D5SolveViewProj(g_d5.vs_c, vp) && D5LooksLikeViewProj(vp))) {
+                ++layout_lines;
+                char text[1200] = {};
+                size_t used = std::snprintf(text, sizeof(text), "DLSS5  layout vs=%08lX prims=%u:", static_cast<unsigned long>(D5ShaderHash(g_d5.vs)), prims);
+                for (int reg = 0; reg < 20 && used < sizeof(text) - 64; ++reg) {
+                    const float* v = g_d5.vs_c[reg].v;
+                    used += std::snprintf(text + used, sizeof(text) - used, " c%d=%.2f,%.2f,%.2f,%.1f", reg, v[0], v[1], v[2], v[3]);
+                }
+                Log("%s", text);
+            }
+        }
         if (g_d5_trace_frame != nullptr && g_d5_scene_draws_this_frame <= 150 &&
             g_d5_trace_frame->draw_line_count < kD5MaxDrawLines) {
             const D5Constant* c = g_d5.vs_c;
@@ -1206,7 +1414,7 @@ void D5FrameEnd(IDirect3DDevice9* device)
         D5LogTrace(t, g_d5_trace_pair_step == 2 ? g_d5_prev_trace : nullptr);
         if (g_d5_trace_pair_step == 1 && g_d5_traces_done < 2) {
             // Where does the game keep this frame's view-projection? (first two pairs only)
-            if (g_d5_vp_valid) {
+            if (g_d5_vp_valid && g_d5_trace_scan) {
                 const float* m = g_d5_vp_current;
                 const float column[4] = {m[0], m[4], m[8], m[12]};
                 D5ScanMemoryFor(m, "view-proj row0");
@@ -1471,6 +1679,7 @@ HRESULT STDMETHODCALLTYPE D5DrawPrimitive(IDirect3DDevice9* device, D3DPRIMITIVE
         return g_d5_draw_primitive(device, type, start, prims);
     }
     D5NoteBusiestPass();
+    g_d5_draw_key = g_d5_trace_frame != nullptr ? D5DrawKey(start, prims, 0, 1) : 0;
     D5BeforeDraw(device, prims, 0);
     const HRESULT hr = g_d5_draw_primitive(device, type, start, prims);
     D5AfterDraw(device);
@@ -1484,6 +1693,7 @@ HRESULT STDMETHODCALLTYPE D5DrawIndexedPrimitive(IDirect3DDevice9* device, D3DPR
         return g_d5_draw_indexed_primitive(device, type, base, min_index, vertices, start, prims);
     }
     D5NoteBusiestPass();
+    g_d5_draw_key = g_d5_trace_frame != nullptr ? D5DrawKey(static_cast<DWORD>(base), start, prims, vertices) : 0;
     D5BeforeDraw(device, prims, vertices);
     const HRESULT hr = g_d5_draw_indexed_primitive(device, type, base, min_index, vertices, start, prims);
     D5AfterDraw(device);
@@ -1496,6 +1706,7 @@ HRESULT STDMETHODCALLTYPE D5DrawPrimitiveUP(IDirect3DDevice9* device, D3DPRIMITI
         return g_d5_draw_primitive_up(device, type, prims, data, stride);
     }
     D5NoteBusiestPass();
+    g_d5_draw_key = g_d5_trace_frame != nullptr ? D5DrawKey(prims, stride, 0, 2) : 0;
     D5BeforeDraw(device, prims, 0);
     const HRESULT hr = g_d5_draw_primitive_up(device, type, prims, data, stride);
     D5AfterDraw(device);
@@ -1509,6 +1720,7 @@ HRESULT STDMETHODCALLTYPE D5DrawIndexedPrimitiveUP(IDirect3DDevice9* device, D3D
         return g_d5_draw_indexed_primitive_up(device, type, min_index, vertices, prims, indices, index_format, data, stride);
     }
     D5NoteBusiestPass();
+    g_d5_draw_key = g_d5_trace_frame != nullptr ? D5DrawKey(prims, vertices, stride, 3) : 0;
     D5BeforeDraw(device, prims, vertices);
     const HRESULT hr = g_d5_draw_indexed_primitive_up(device, type, min_index, vertices, prims, indices, index_format, data, stride);
     D5AfterDraw(device);

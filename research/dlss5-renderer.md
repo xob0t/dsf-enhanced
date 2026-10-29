@@ -1,9 +1,11 @@
 # DLSS 5 for Driver SF: the renderer, the bring-up routes and the game side
 
-Status 2026-10-29: phase 0 done. The renderer questions are answered from D3D9 captures taken
-inside the game, and a game-side prototype runs DLSS 5 in game through the open-source helper of
-PR #14 (`dlss5/`). The prototype copies each frame through the CPU, so it costs about 14 ms a
-frame. It works, but it is too slow to ship.
+Status 2026-10-29: the renderer questions are answered from D3D9 captures taken inside the game,
+and DSF Enhanced runs DLSS 5 in game through the open-source helper of PR #14 (`dlss5/`). Under
+DXVK the frames go GPU to GPU. On the RTX 5070 Ti with the test VMs off, a frame with DLSS 5 takes
+about as long as one without it (8.3-8.5 ms). Elsewhere (native D3D9, dgVoodoo2) the frames go
+through the CPU, which adds 2 to 6 ms a frame. Motion vectors are camera-only, so the cars are
+still open.
 
 Evidence levels: *runtime* (seen in a capture or a dump in the run named), *static*
 (disassembly), *inferred* (follows from the runtime evidence but was not observed directly).
@@ -142,7 +144,9 @@ registered through the exported `DSFE_RegisterPreHudCallback`. The callbacks run
 thread with the game's device, the current colour target and the scene depth. A ReShade add-on can
 render its effects at the pre-HUD point this way.
 
-**DLSS 5 through the helper** (`Helper=1`, PR #14's protocol version 1):
+**DLSS 5 through the helper** (`Helper=1`, PR #14's protocol version 1). This first version
+copied every frame through the CPU. The next section covers the GPU path under DXVK, the
+protocol rework and the frame times.
 
 1. The back-buffer-sized `D24S8` depth surfaces are created as the top level of an `INTZ`
    texture, so the scene depth can be sampled (logged as "created as INTZ").
@@ -178,12 +182,126 @@ buildings stream outwards from the vanishing point, as they should while driving
 chase view (bottom) the player's car gets the road's motion. It moves with the camera, so its
 true motion is close to zero. That is the main gap in these motion vectors (below).
 
+## GPU-to-GPU under DXVK, robustness, frame times
+
+**Transport.** `HelperTransport=0` (the default) picks Vulkan under DXVK and the CPU copy
+everywhere else; 1 and 2 force one. The Vulkan transport (`dlss5_bridge.inl`, `D5VkFrame`):
+
+1. DXVK's D3D9 interop (`ID3D9VkInteropDevice`, `ID3D9VkInteropTexture`; declarations in
+   `src/vk_min.h`) gives the VkImage of the HUD target `T#1`, of our depth and motion textures and
+   of the composite texture, plus DXVK's VkDevice and queue. DXVK 3.1.1 enables
+   `VK_KHR_external_memory_win32` and `VK_KHR_external_semaphore_win32` when the GPU has them.
+2. The helper creates the shared textures and fences on D3D12 (the protocol's helper-creates
+   direction, `DSF_DLSS5_API_VULKAN`). DSF Enhanced imports them as Vulkan external memory
+   (`VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT`, dedicated allocation) and timeline
+   semaphores (`..._D3D12_FENCE_BIT`).
+3. Per frame, holding the D3D9 device lock: transition the four images, flush DXVK, lock its
+   queue, submit our copies (colour, depth, motion into the shared textures) with
+   `fence_in = n`, unlock.
+4. FRAME n, then FRAME_ACK n. The helper sends the ACK after its GPU work, so `fence_out >= n`.
+   Only after an OK ACK: lock the queue, submit the output copy that waits on `fence_out = n`,
+   unlock.
+5. Transition back and draw the composite texture over `T#1`. The output is `R8G8B8A8`; the
+   composite shader swaps red and blue.
+
+Checked on the host: the output matches the CPU path. The per-channel means of input and output
+are equal to 0.1 of 255, with the same 2-2.3 of 255 DLSS 5 difference (`host-20261029-112007`).
+
+**Protocol rework of #14** (head 8eaadef). The pipe is opened for overlapped I/O and every
+message has a timeout (HELLO and CONFIGURE 20 s, FRAME and FRAME_ACK 3 s). HELLO and CONFIGURE
+run on a worker thread, so the render thread never waits for the helper to start or to create
+the feature. Until CONFIGURE is done, frames go out without DLSS 5. Frame numbers restart at 1
+after each CONFIGURE. A FRAME_ACK with an error status shows the game's own frame and triggers a
+new CONFIGURE, three times at most. A timeout, a closed pipe or an ERROR message turns DLSS 5 off
+for the session. No GPU wait on `fence_out` is queued before an OK ACK.
+
+**Fault tests** (host, `out\dlss5\scripts\fault-run.ps1` in the harness worktree; it only touches
+the helper whose parent is the run's own `Driver.exe`):
+
+| Test | Run | What happened |
+| --- | --- | --- |
+| Helper suspended 40 s into DLSS 5 (pssuspend) | `host-20261029-162224`, `-171932` | FRAME timed out after 3 s and DLSS 5 went off for the session. One 3 s frame, then 8.3-8.5 ms frames without DLSS 5 to the end of the run |
+| Helper killed 40 s into DLSS 5 | `host-20261029-171753` | "FRAME got no answer (pipe closed)". One 85 ms frame, then normal frames to the end |
+
+**A crash, found and fixed.** The first Vulkan builds crashed in about 1 run of 4: 6 crashes in
+about 20 runs (`host-20261029-114455`, `-162404`, `-163039`, `-163245`, `-164447`, `-164643`).
+Each ended in DriverNGHook's "We got an fatal error" dialog, 25-50 s into DLSS 5. A vectored
+exception handler registered ahead of DriverNGHook's (`D5LogException`, on while `Helper=1`)
+caught it: an access violation reading 0x4 at DXVK's `d3d9.dll`+0x24696, on the game's main
+thread, while the render thread was in the bridge's `FlushRenderingCommands`. The handler's
+minidump (`dsf_dlss5_crash_<pid>.dmp`, `host-20261029-165651`) shows the main thread at
+`Driver.exe` 0xBB9021, a vertex or index buffer `Lock` (vtable slot 11). The game creates its
+device with `D3DCREATE_MULTITHREADED` (behaviour flags 0x44) and locks dynamic buffers from the
+main thread while the render thread draws. DXVK's interop calls don't take the device lock that
+D3D9 calls take, so the flush raced the `Lock`. The bridge now holds `LockDevice` around its
+interop calls and releases it while the helper works. Ten runs after the fix had no crash
+(`host-20261029-170028` to `-171522`).
+
+**Frame times.** `FrameTimeLog=1` logs present-to-present intervals in 600-frame windows. All
+runs use the same probe (cockpit drive at 20 and 40 mph, then the chase view), 1280x720 and
+`RemoveVSync=1`, on the RTX 5070 Ti:
+
+| Configuration | Test VMs | Runs | Mean frame | Bridge on the render thread | Evaluate |
+| --- | --- | --- | --- | --- | --- |
+| No DLSS 5 (`Helper=0`) | idle or off | `host-20261029-162xxx`, `-1724xx` | 8.35-8.7 ms | | |
+| CPU copy | idle or off | `host-20261029-172110` | 10.6-14.0 ms | 6.6-8.4 ms | 1.6 ms |
+| Vulkan | idle or off | `host-20261029-171753`, `-171932`, `-170028` to `-171522` | 8.3-9.1 ms | 2.6-3.7 ms | 1.6 ms |
+| No DLSS 5 | both running series | `host-20261029-112503`, `-113629` | 8.5-9.1 ms | | |
+| CPU copy | both running series | `host-20261029-112851` | 21.7-22.3 ms | 14.5-15.9 ms | 1.6 ms |
+| Vulkan | both running series | `host-20261029-113240`, `-113940` | 10.9-13.2 ms | 5.2-5.9 ms | 1.6 ms |
+
+The test VMs render on the same GPU and their load moves every number, so each comparison was run
+back to back under one condition. The Vulkan frame barely grows because the bridge's
+render-thread time overlaps with GPU work. Most of those 3 ms is the render thread waiting for
+the helper's evaluate, while the GPU would be finishing the frame anyway. The bridge waits for
+each frame's ACK, since the protocol acks after the helper's GPU work. A frame-lagged mode could
+hide that wait at the cost of a frame of latency.
+
+## Per-object motion (measured, not built)
+
+The motion vectors are camera-only. To see how much that misses, traced frame pairs (`Trace=1`,
+`D5AnalyseObjectMotion`) key each scene draw by its vertex shader and draw parameters. They keep
+the draws whose `c0-c3`/`c4-c6` give the frame's VP and compare their world rows with the
+previous frame (`host-20261029-172933`):
+
+- Those draws are the static world and props. In eight frame pairs there were 739 to 7,404 of
+  them. All were unchanged except a handful: one object at 187 km/h, off by 9.5 px with
+  camera-only motion, and 15 small objects drifting under 1 km/h.
+- The cars are not among them. A second run dumped `c0-c19` of the scene draws that don't give
+  a VP (`host-20261029-173201`, 400 draws, 24 vertex shaders). The busiest skinned shaders
+  (`09F253A9`, `0F92BA98`, `2E410648`, `1141C8D3`) start with a bone palette at `c0` (rotation
+  rows, no translation), so the car's own transform lives in higher registers that were not
+  dumped. Some terrain shaders (`8DCC1218`, 106 draws) upload a plain VP at `c16-c19`, which
+  could serve as a second VP source.
+
+Per-object motion for cars needs three things, in this order:
+
+1. The skinned car shaders' constant layout: where the object-to-world matrix or the WVP sits.
+   A wider dump or the shader bytecode would show it.
+2. An object key that survives a frame: the vertex buffer and draw parameters, or the engine's
+   vehicle pointer.
+3. Per-pixel object identity in the motion pass. The plan is to re-issue the moving objects'
+   draws at the pre-HUD point into an ID target, depth-tested against the scene depth. That
+   means hooking `SetStreamSource`, `SetIndices` and `SetVertexDeclaration` and holding
+   references to the buffers until the replay. The motion pass then uses each object's
+   `VP_prev·W_prev·W_cur⁻¹·VP_cur⁻¹`.
+
+None of it is started.
+
 ## Tools
 
 - `[DLSS5] Trace=1` logs a few frame pairs: every pass (target, depth, target set, draws,
   render-target textures read, pixel shader hashes), per-draw lines outside the scene and for the
-  first 150 scene draws, the VP solve, and a memory scan for the solved VP. `TraceDump=1` writes
-  BMPs (scene end, pre-HUD, the HUD pass after draws 1 to 48, and the helper's depth and motion).
+  first 150 scene draws, the VP solve and the per-object motion measurement. `TraceScan=1` adds
+  the memory scan for the solved VP, which stalls that frame for seconds. `TraceDump=1` writes BMPs
+  (scene end, pre-HUD, the HUD pass after draws 1 to 48, and the helper's depth and motion).
+- `FrameTimeLog=1` logs frame times every 600 frames.
+- With `Helper=1` a vectored exception handler logs exceptions and writes the first non-routine
+  one to `dsf_dlss5_crash_<pid>.dmp` beside `Driver.exe`. The harness copies it into the run
+  folder.
+- `tests/vk_min_check.cpp` checks `src/vk_min.h` against the Khronos Vulkan headers when
+  `build.ps1` runs with `VULKAN_HEADERS_INCLUDE` set. It passes against Vulkan-Headers
+  `vulkan-sdk-1.4.363.0`.
 - driversf-forza: a separate PR makes `run-test.ps1` keep every `*.log` beside `Driver.exe`
   (`ReShade.log`, DXVK's `Driver_d3d9.log`).
 
@@ -200,13 +318,12 @@ true motion is close to zero. That is the main gap in these motion vectors (belo
 ## Open
 
 - **Per-object motion.** Cars, traffic and the player's car in the chase view get camera motion
-  only. Every scene draw already uploads its WVP. Keeping last frame's WVP per object (keyed by
-  vertex buffer and draw parameters, or by the engine's object) and redrawing moving objects into
-  the motion target would fix it.
-- **Zero-copy transfer.** The CPU bridge costs about 14 ms a frame. On DXVK the fast path is the
-  helper-creates direction: import the helper's textures and fences into DXVK's Vulkan device
-  through `ID3D9VkInteropDevice` and copy with the GPU. On dgVoodoo DSF Enhanced has no access to
-  the D3D11 device, so it needs a different approach.
+  only. What it takes is in "Per-object motion" above.
+- **dgVoodoo2 without the CPU copy.** dgVoodoo gives the game side no access to its device, so
+  DSF Enhanced would need its own D3D11 path into dgVoodoo's swap chain. Not tried, because DXVK
+  is the open route and already has the GPU path.
+- **The per-frame wait.** The render thread waits for each FRAME_ACK (2.6-3.7 ms with idle VMs).
+  A frame-lagged mode would hide it at the cost of a frame of latency.
 - **Mask.** No `ControlMask` yet. The Shift-mode edge glow and the 3D HUD meshes are drawn in the
   HUD pass, so they stay out of DLSS already. Fog, particles and tyre smoke are in the scene and
   get the full effect.
