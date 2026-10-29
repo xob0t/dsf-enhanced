@@ -177,7 +177,7 @@ int ToggleTextRects(const char* text, LONG x, LONG y, LONG scale, D3DRECT* rects
 // At Present: the lines whose time is not up, on the back buffer. Clear needs no shaders or
 // vertex states, only the targets (all four saved and put back), the viewport, the scissor test
 // and the colour write mask.
-void ToggleDrawIndicator(IDirect3DDevice9* device, DWORD now)
+void ToggleDrawIndicator(IDirect3DDevice9* device)
 {
     IDirect3DSurface9* back = nullptr;
     D3DSURFACE_DESC desc = {};
@@ -258,6 +258,6 @@ void TogglesFrameEnd(IDirect3DDevice9* device)
         shown = shown || key.showing;
     }
     if (shown && g_toggle_indicator) {
-        ToggleDrawIndicator(device, now);
+        ToggleDrawIndicator(device);
     }
 }
