@@ -23,6 +23,7 @@ struct Frame {
   std::vector<float> color;   // RGBA
   std::vector<float> depth;   // 1 channel
   std::vector<float> motion;  // RG
+  std::vector<float> linear;  // RGBA, the scene's linear values before ToneMap (DLAA's HDR input)
 };
 
 // frame is the index along the camera path; jitter is in pixels.
@@ -30,5 +31,8 @@ void Render(uint32_t width, uint32_t height, int frame, float jitterX, float jit
 
 // Halton (2, 3) sample minus 0.5, the jitter sequence Remix and the DLSS samples use.
 void HaltonJitter(int index, float* x, float* y);
+
+// The tone map from linear to colour (ACES fit, then sRGB encoding).
+float ToneMapValue(float linear);
 
 }  // namespace synthetic

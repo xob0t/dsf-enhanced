@@ -6,12 +6,17 @@
 //
 //   dsf-dlss5-client-test.exe --helper <dsf-dlss5-helper.exe> --runtime <dir> --out <dir>
 //       [--frames N] [--width W --height H] [--host-creates] [--bypass] [--style 0..2]
-//       [--robustness]
+//       [--feature nr|dlaa|both] [--robustness]
+//
+// --feature picks what runs (protocol version 2): DLSS 5 (nr, the default, needs
+// nvngx_dlssnr.dll), DLAA (needs nvngx_dlss.dll; it gets the scene's linear values in f16), or
+// both over the one pipe, each with its own textures, fences and frame numbers, frame by frame.
 //
 // --robustness then checks the failure paths: a repeated frame number, a frame whose
 // fence_in never arrives (the helper must time out, reach fence_out and ask for a new
-// CONFIGURE), a frame while unconfigured, a fresh CONFIGURE with frames after it, and a
-// bad header.
+// CONFIGURE), a frame while unconfigured, a fresh CONFIGURE with frames after it, an unknown
+// feature in FRAME and CONFIGURE, and a version 1 header. With one feature it also sends a
+// FRAME for the other, unconfigured one.
 //
 // Exit code 0 means every frame and check came back as expected and the output was written.
 
@@ -25,6 +30,7 @@
 #include <chrono>
 #include <cmath>
 #include <cstdio>
+#include <memory>
 #include <string>
 #include <vector>
 
@@ -54,7 +60,12 @@ struct Options {
   bool bypass = false;
   bool robustness = false;
   uint32_t style = 0;
+  bool features[DSF_DLSS5_FEATURE_COUNT] = {true, false};
 };
+
+const char* FeatureName(uint32_t feature) { return feature == DSF_DLSS5_FEATURE_DLAA ? "DLAA" : "DLSS 5"; }
+
+uint8_t ToByte(float v) { return static_cast<uint8_t>(std::lround(std::clamp(v, 0.0f, 1.0f) * 255.0f)); }
 
 std::wstring FullPath(const std::wstring& path) {
   wchar_t buffer[MAX_PATH] = {};
@@ -113,20 +124,26 @@ HANDLE StartHelper(const Options& o, PROCESS_INFORMATION* pi) {
 
 class Client {
  public:
-  Client(const Options& o, ID3D11Device5* device, ID3D11DeviceContext4* context, HANDLE pipe)
-      : o_(o), device_(device), context_(context), pipe_(pipe) {}
+  Client(const Options& o, ID3D11Device5* device, ID3D11DeviceContext4* context, HANDLE pipe, uint32_t feature)
+      : o_(o), device_(device), context_(context), pipe_(pipe), feature_(feature) {}
+
+  uint32_t Feature() const { return feature_; }
+  bool Dlaa() const { return feature_ == DSF_DLSS5_FEATURE_DLAA; }
 
   // Sends CONFIGURE and opens what the helper returns. Frame numbers restart at 1.
   bool Configure() {
     for (auto& t : textures_) t.Reset();
     fenceIn_.Reset();
     fenceOut_.Reset();
-    const DXGI_FORMAT formats[DSF_DLSS5_SLOT_COUNT] = {DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT,
-                                                      DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_UNKNOWN};
+    // DLAA: linear HDR in and out.
+    const DXGI_FORMAT colorFormat = Dlaa() ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
+    const DXGI_FORMAT formats[DSF_DLSS5_SLOT_COUNT] = {colorFormat, colorFormat, DXGI_FORMAT_R32_FLOAT, DXGI_FORMAT_R16G16_FLOAT,
+                                                      DXGI_FORMAT_UNKNOWN};
     DsfDlss5Configure configure = {};
     configure.width = o_.width;
     configure.height = o_.height;
-    configure.preset = 2;
+    configure.preset = Dlaa() ? 11 : 2;   // K for DLAA, B (Remix) for DLSS 5
+    configure.feature = feature_;
     for (int slot = 0; slot < DSF_DLSS5_SLOT_COUNT; ++slot) configure.formats[slot] = formats[slot];
     if (!o_.hostCreates) {
       configure.flags |= DSF_DLSS5_CONFIG_CLIENT_CREATES;
@@ -152,7 +169,7 @@ class Client {
       Say("CONFIGURE failed on the pipe (error message: status %d, %s)", error.status, error.message);
       return false;
     }
-    Say("configure: status %d, %s", ack.status, ack.message);
+    Say("configure %s: status %d, %s", FeatureName(feature_), ack.status, ack.message);
     if (ack.status != DSF_DLSS5_OK) return false;
     if (o_.hostCreates) {
       for (int slot = 0; slot < DSF_DLSS5_SLOT_MASK; ++slot) {
@@ -186,8 +203,10 @@ class Client {
   // Converts a rendered frame to the texture formats (CPU work a game would not have).
   void Prepare(const synthetic::Frame& s) {
     colorBytes_.resize(s.color.size());
-    for (size_t i = 0; i < colorBytes_.size(); ++i) {
-      colorBytes_[i] = static_cast<uint8_t>(std::lround(std::clamp(s.color[i], 0.0f, 1.0f) * 255.0f));
+    for (size_t i = 0; i < colorBytes_.size(); ++i) colorBytes_[i] = ToByte(s.color[i]);
+    if (Dlaa()) {
+      colorHalves_.resize(s.linear.size());
+      for (size_t i = 0; i < colorHalves_.size(); ++i) colorHalves_[i] = XMConvertFloatToHalf(s.linear[i]);
     }
     depth_ = s.depth;
     motionHalves_.resize(s.motion.size());
@@ -197,7 +216,11 @@ class Client {
   // Uploads the prepared inputs. signalIn=false leaves fence_in alone (a stalled game).
   void Upload(uint64_t n, bool signalIn) {
     const UINT pitch = o_.width * 4;
-    context_->UpdateSubresource(textures_[DSF_DLSS5_SLOT_COLOR].Get(), 0, nullptr, colorBytes_.data(), pitch, 0);
+    if (Dlaa()) {
+      context_->UpdateSubresource(textures_[DSF_DLSS5_SLOT_COLOR].Get(), 0, nullptr, colorHalves_.data(), pitch * 2, 0);
+    } else {
+      context_->UpdateSubresource(textures_[DSF_DLSS5_SLOT_COLOR].Get(), 0, nullptr, colorBytes_.data(), pitch, 0);
+    }
     context_->UpdateSubresource(textures_[DSF_DLSS5_SLOT_DEPTH].Get(), 0, nullptr, depth_.data(), pitch, 0);
     context_->UpdateSubresource(textures_[DSF_DLSS5_SLOT_MOTION].Get(), 0, nullptr, motionHalves_.data(), pitch, 0);
     if (signalIn) context_->Signal(fenceIn_.Get(), n);
@@ -218,6 +241,7 @@ class Client {
     frame.tone_strength = 0.3f;
     frame.structure_strength = 0.7f;
     frame.skin_strength = 0.5f;
+    frame.feature = feature_;
     DsfDlss5Error error = {};
     if (!PipeSend(pipe_, DSF_DLSS5_MSG_FRAME, frame, kFrameTimeoutMs) ||
         !PipeReceive(pipe_, DSF_DLSS5_MSG_FRAME_ACK, ack, kFrameTimeoutMs, &error)) {
@@ -237,8 +261,17 @@ class Client {
     if (out != nullptr) {
       *out = {o_.width, o_.height, std::vector<uint8_t>(static_cast<size_t>(o_.width) * o_.height * 4)};
       for (uint32_t y = 0; y < o_.height; ++y) {
-        std::memcpy(out->pixels.data() + static_cast<size_t>(y) * o_.width * 4, static_cast<uint8_t*>(mapped.pData) + y * mapped.RowPitch,
-                    o_.width * 4);
+        const uint8_t* row = static_cast<uint8_t*>(mapped.pData) + y * mapped.RowPitch;
+        uint8_t* dst = out->pixels.data() + static_cast<size_t>(y) * o_.width * 4;
+        if (Dlaa()) {
+          // Linear HDR: through the scene's tone map, to compare with the colour input.
+          const uint16_t* halves = reinterpret_cast<const uint16_t*>(row);
+          for (uint32_t i = 0; i < o_.width * 4; ++i) {
+            dst[i] = ToByte(synthetic::ToneMapValue(DirectX::PackedVector::XMConvertHalfToFloat(halves[i])));
+          }
+        } else {
+          std::memcpy(dst, row, o_.width * 4);
+        }
       }
       for (size_t i = 3; i < out->pixels.size(); i += 4) out->pixels[i] = 255;
     }
@@ -280,10 +313,12 @@ class Client {
   ID3D11Device5* device_;
   ID3D11DeviceContext4* context_;
   HANDLE pipe_;
+  uint32_t feature_;
   ComPtr<ID3D11Texture2D> textures_[DSF_DLSS5_SLOT_COUNT];
   ComPtr<ID3D11Texture2D> staging_;
   ComPtr<ID3D11Fence> fenceIn_, fenceOut_;
   std::vector<uint8_t> colorBytes_;
+  std::vector<uint16_t> colorHalves_;
   std::vector<float> depth_;
   std::vector<uint16_t> motionHalves_;
 };
@@ -312,6 +347,11 @@ int wmain(int argc, wchar_t** argv) {
     else if (a == L"--bypass") o.bypass = true;
     else if (a == L"--robustness") o.robustness = true;
     else if (a == L"--style") o.style = static_cast<uint32_t>(_wtoi(next()));
+    else if (a == L"--feature") {
+      const std::wstring f = next();
+      o.features[DSF_DLSS5_FEATURE_NR] = f == L"nr" || f == L"both";
+      o.features[DSF_DLSS5_FEATURE_DLAA] = f == L"dlaa" || f == L"both";
+    }
     else {
       Say("unknown argument: %ls", a.c_str());
       return 2;
@@ -367,16 +407,27 @@ int wmain(int argc, wchar_t** argv) {
     Say("HELLO failed on the pipe");
     return 5;
   }
-  Say("helper pid %u: status %d, %s; runtime %u.%u.%u.%u", helloAck.helper_pid, helloAck.status, helloAck.message,
-      helloAck.runtime_version[0], helloAck.runtime_version[1], helloAck.runtime_version[2], helloAck.runtime_version[3]);
+  Say("helper pid %u: status %d, %s; features 0x%X; DLSS 5 runtime %u.%u.%u.%u, DLAA runtime %u.%u.%u.%u", helloAck.helper_pid,
+      helloAck.status, helloAck.message, helloAck.features, helloAck.runtime_version[0], helloAck.runtime_version[1],
+      helloAck.runtime_version[2], helloAck.runtime_version[3], helloAck.dlaa_runtime_version[0], helloAck.dlaa_runtime_version[1],
+      helloAck.dlaa_runtime_version[2], helloAck.dlaa_runtime_version[3]);
   if (helloAck.status != DSF_DLSS5_OK) return 5;
 
-  Client client(o, device.Get(), context.Get(), pipe);
-  if (!client.Configure()) return 6;
+  // One client per feature, over the one pipe.
+  std::vector<std::unique_ptr<Client>> clients;
+  for (uint32_t f = 0; f < DSF_DLSS5_FEATURE_COUNT; ++f) {
+    if (!o.features[f]) continue;
+    if ((helloAck.features & DSF_DLSS5_FEATURE_BIT(f)) == 0) {
+      Say("%s is not available", FeatureName(f));
+      return 5;
+    }
+    clients.push_back(std::make_unique<Client>(o, device.Get(), context.Get(), pipe, f));
+    if (!clients.back()->Configure()) return 6;
+  }
 
   const uint32_t w = o.width;
   const uint32_t h = o.height;
-  double totalMs = 0.0, maxMs = 0.0, gpuMsSum = 0.0;
+  double totalMs[DSF_DLSS5_FEATURE_COUNT] = {}, maxMs[DSF_DLSS5_FEATURE_COUNT] = {}, gpuMsSum[DSF_DLSS5_FEATURE_COUNT] = {};
   int failures = 0;
   for (int f = 0; f < o.frames; ++f) {
     float jx = 0.0f, jy = 0.0f;
@@ -384,49 +435,58 @@ int wmain(int argc, wchar_t** argv) {
     synthetic::Frame s;
     synthetic::Render(w, h, f, jx, jy, &s);
 
-    client.Prepare(s);
-    const auto start = std::chrono::steady_clock::now();
-    const uint64_t n = static_cast<uint64_t>(f) + 1;
-    client.Upload(n, true);
-    DsfDlss5FrameAck ack;
-    if (!client.Frame(n, f == 0 ? DSF_DLSS5_FRAME_RESET : 0, jx, jy, &ack)) return 7;
-    // Check the ACK before queueing the GPU wait on fence_out (protocol rule).
-    if (ack.status != DSF_DLSS5_OK || ack.frame != n) {
-      ++failures;
-      Say("frame %llu: status %d", static_cast<unsigned long long>(n), ack.status);
-      continue;
-    }
-    const bool last = f == o.frames - 1;
-    Rgba8Image out;
-    if (!client.ReadOutput(n, last ? &out : nullptr)) {
-      Say("Map failed");
-      return 7;
-    }
-    const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
-    totalMs += ms;
-    maxMs = std::max(maxMs, ms);
-    gpuMsSum += ack.gpu_ms;
-    if (last) {
-      Rgba8Image input{w, h, client.LastColor()};
-      std::string error;
-      SavePngRgba8(o.outDir + L"\\input_last.png", input, &error);
-      SavePngRgba8(o.outDir + L"\\output_last.png", out, &error);
-      double sum = 0.0;
-      for (size_t i = 0; i < out.pixels.size(); i += 4) {
-        int d = 0;
-        for (int k = 0; k < 3; ++k) d = std::max(d, std::abs(int(out.pixels[i + k]) - int(input.pixels[i + k])));
-        sum += d;
+    for (const auto& c : clients) {
+      Client& client = *c;
+      const uint32_t feature = client.Feature();
+      client.Prepare(s);
+      const auto start = std::chrono::steady_clock::now();
+      const uint64_t n = static_cast<uint64_t>(f) + 1;
+      client.Upload(n, true);
+      DsfDlss5FrameAck ack;
+      if (!client.Frame(n, f == 0 ? DSF_DLSS5_FRAME_RESET : 0, jx, jy, &ack)) return 7;
+      // Check the ACK before queueing the GPU wait on fence_out (protocol rule).
+      if (ack.status != DSF_DLSS5_OK || ack.frame != n || ack.feature != feature) {
+        ++failures;
+        Say("%s frame %llu: status %d, feature %u", FeatureName(feature), static_cast<unsigned long long>(n), ack.status, ack.feature);
+        continue;
       }
-      Say("last frame: mean max-channel difference input vs output %.2f/255", sum / (static_cast<double>(w) * h));
-      Say("wrote %ls\\output_last.png", o.outDir.c_str());
+      const bool last = f == o.frames - 1;
+      Rgba8Image out;
+      if (!client.ReadOutput(n, last ? &out : nullptr)) {
+        Say("Map failed");
+        return 7;
+      }
+      const double ms = std::chrono::duration<double, std::milli>(std::chrono::steady_clock::now() - start).count();
+      totalMs[feature] += ms;
+      maxMs[feature] = std::max(maxMs[feature], ms);
+      gpuMsSum[feature] += ack.gpu_ms;
+      if (last) {
+        const std::wstring suffix = client.Dlaa() ? L"_dlaa" : L"";
+        Rgba8Image input{w, h, client.LastColor()};
+        std::string error;
+        SavePngRgba8(o.outDir + L"\\input_last.png", input, &error);
+        SavePngRgba8(o.outDir + L"\\output_last" + suffix + L".png", out, &error);
+        double sum = 0.0;
+        for (size_t i = 0; i < out.pixels.size(); i += 4) {
+          int d = 0;
+          for (int k = 0; k < 3; ++k) d = std::max(d, std::abs(int(out.pixels[i + k]) - int(input.pixels[i + k])));
+          sum += d;
+        }
+        Say("%s last frame: mean max-channel difference input vs output %.2f/255", FeatureName(feature), sum / (static_cast<double>(w) * h));
+        Say("wrote %ls\\output_last%ls.png", o.outDir.c_str(), suffix.c_str());
+      }
     }
   }
-  Say("round trip (upload + helper DLSS 5 + copy back) per frame: mean %.2f ms, max %.2f ms; helper GPU time mean %.2f ms",
-      totalMs / o.frames, maxMs, gpuMsSum / o.frames);
-  Say("%d/%d frames OK", o.frames - failures, o.frames);
+  for (const auto& c : clients) {
+    const uint32_t feature = c->Feature();
+    Say("%s round trip (upload + helper + copy back) per frame: mean %.2f ms, max %.2f ms; helper GPU time mean %.2f ms",
+        FeatureName(feature), totalMs[feature] / o.frames, maxMs[feature], gpuMsSum[feature] / o.frames);
+  }
+  Say("%d/%d frames OK", o.frames * static_cast<int>(clients.size()) - failures, o.frames * static_cast<int>(clients.size()));
 
   bool checks = true;
   if (o.robustness) {
+    Client& client = *clients.front();
     synthetic::Frame s;
     synthetic::Render(w, h, 0, 0.0f, 0.0f, &s);
     client.Prepare(s);
@@ -460,14 +520,44 @@ int wmain(int argc, wchar_t** argv) {
     }
     checks &= Expect(checks, "three frames after reconfiguring");
 
-    // A header with the wrong version is answered with MSG_ERROR, then the helper exits.
+    // Protocol version 2: an unknown feature is refused in FRAME and in CONFIGURE.
+    DsfDlss5Frame unknown = {};
+    unknown.frame = 100;
+    unknown.feature = DSF_DLSS5_FEATURE_COUNT;
+    checks &= PipeSend(pipe, DSF_DLSS5_MSG_FRAME, unknown, kFrameTimeoutMs) &&
+              PipeReceive(pipe, DSF_DLSS5_MSG_FRAME_ACK, &ack, kFrameTimeoutMs) &&
+              Expect(ack.status == DSF_DLSS5_ERR_PROTOCOL && ack.feature == unknown.feature, "FRAME for an unknown feature -> ERR_PROTOCOL");
+    DsfDlss5Configure unknownConfigure = {};
+    unknownConfigure.width = w;
+    unknownConfigure.height = h;
+    unknownConfigure.feature = DSF_DLSS5_FEATURE_COUNT;
+    DsfDlss5ConfigureAck configureAck;
+    checks &= PipeSend(pipe, DSF_DLSS5_MSG_CONFIGURE, unknownConfigure, kConfigureTimeoutMs) &&
+              PipeReceive(pipe, DSF_DLSS5_MSG_CONFIGURE_ACK, &configureAck, kConfigureTimeoutMs) &&
+              Expect(configureAck.status == DSF_DLSS5_ERR_PROTOCOL, "CONFIGURE for an unknown feature -> ERR_PROTOCOL");
+    // The other feature has its own state: never configured here, so its frames are refused.
+    if (clients.size() == 1) {
+      DsfDlss5Frame other = {};
+      other.frame = 1;
+      other.feature = client.Feature() == DSF_DLSS5_FEATURE_NR ? DSF_DLSS5_FEATURE_DLAA : DSF_DLSS5_FEATURE_NR;
+      checks &= PipeSend(pipe, DSF_DLSS5_MSG_FRAME, other, kFrameTimeoutMs) &&
+                PipeReceive(pipe, DSF_DLSS5_MSG_FRAME_ACK, &ack, kFrameTimeoutMs) &&
+                Expect(ack.status == DSF_DLSS5_ERR_NOT_CONFIGURED && ack.feature == other.feature,
+                       "FRAME for the other, unconfigured feature -> ERR_NOT_CONFIGURED");
+    }
+    // ... and the configured one still runs.
+    client.Upload(4, true);
+    checks &= client.Frame(4, 0, 0, 0, &ack) && Expect(ack.status == DSF_DLSS5_OK && client.ReadOutput(4, nullptr),
+                                                       "the configured feature still runs after them");
+
+    // A version 1 header is answered with MSG_ERROR, then the helper exits.
     DsfDlss5Header bad = MakeHeader(DSF_DLSS5_MSG_FRAME, 0);
-    bad.version = 99;
+    bad.version = 1;
     DsfDlss5Header reply = {};
     DsfDlss5Error error = {};
     const bool answered = PipeWriteAll(pipe, &bad, sizeof(bad), kFrameTimeoutMs) && PipeReadHeader(pipe, &reply, kFrameTimeoutMs) &&
                           reply.type == DSF_DLSS5_MSG_ERROR && PipeReadPayload(pipe, reply, &error, kFrameTimeoutMs);
-    checks &= Expect(answered && error.status == DSF_DLSS5_ERR_PROTOCOL, "bad protocol version -> MSG_ERROR(ERR_PROTOCOL)");
+    checks &= Expect(answered && error.status == DSF_DLSS5_ERR_PROTOCOL, "protocol version 1 header -> MSG_ERROR(ERR_PROTOCOL)");
   } else {
     PipeSendEmpty(pipe, DSF_DLSS5_MSG_SHUTDOWN, kFrameTimeoutMs);
   }

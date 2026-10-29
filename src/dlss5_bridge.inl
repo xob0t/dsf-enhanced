@@ -751,6 +751,11 @@ bool D5StartHelper()
     Log("DLSS5 helper: HELLO_ACK status=%d helper_pid=%lu ngx=0x%08lX runtime %u.%u.%u.%u sha256=%s: %s", ack.status,
         static_cast<unsigned long>(ack.helper_pid), static_cast<unsigned long>(ack.ngx_result), ack.runtime_version[0],
         ack.runtime_version[1], ack.runtime_version[2], ack.runtime_version[3], ack.runtime_sha256, ack.message);
+    // Protocol 2: the helper also answers OK when only DLAA (nvngx_dlss.dll) can run.
+    if (ack.status == DSF_DLSS5_OK && (ack.features & DSF_DLSS5_FEATURE_BIT(DSF_DLSS5_FEATURE_NR)) == 0) {
+        Log("DLSS5 helper: DLSS 5 is not available (features 0x%lX)", static_cast<unsigned long>(ack.features));
+        return false;
+    }
     return ack.status == DSF_DLSS5_OK;
 }
 

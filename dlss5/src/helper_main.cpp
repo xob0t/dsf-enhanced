@@ -1,10 +1,10 @@
 // SPDX-License-Identifier: MIT
 //
-// dsf-dlss5-helper: the 64-bit process that runs DLSS 5 for the 32-bit game.
+// dsf-dlss5-helper: the 64-bit process that runs DLSS 5 and DLAA for the 32-bit game.
 //
 //   dsf-dlss5-helper.exe --game-pid <pid> [--game-process <inherited handle>]
-//                        [--runtime <dir with nvngx_dlssnr.dll>] [--log <file>] [--verbose-ngx]
-//                        [--allow-runtime-sha256 <hash>]...
+//                        [--runtime <dir with nvngx_dlssnr.dll and/or nvngx_dlss.dll>] [--log <file>]
+//                        [--verbose-ngx] [--allow-runtime-sha256 <hash>]...
 //
 // Protocol and conventions: include/dsf_dlss5_protocol.h. The runtime folder defaults to
 // the folder of this executable.
@@ -18,8 +18,10 @@
 #include "dsf_dlss5_pipe.h"
 #include "d3d12_util.h"
 #include "log.h"
+#include "ngx_d3d12.h"
 #include "ngx_trust.h"
 #include "nr_d3d12.h"
+#include "sr_d3d12.h"
 
 using namespace dsf_dlss5;
 
@@ -65,13 +67,25 @@ bool ParseArgs(int argc, wchar_t** argv, Args* a) {
   return a->gamePid != 0;
 }
 
-DXGI_FORMAT DefaultFormat(int slot) {
+const char* FeatureName(uint32_t feature) { return feature == DSF_DLSS5_FEATURE_DLAA ? "DLAA" : "DLSS 5"; }
+
+DXGI_FORMAT DefaultFormat(uint32_t feature, int slot) {
   switch (slot) {
     case DSF_DLSS5_SLOT_DEPTH: return DXGI_FORMAT_R32_FLOAT;
     case DSF_DLSS5_SLOT_MOTION: return DXGI_FORMAT_R16G16_FLOAT;
-    default: return DXGI_FORMAT_R8G8B8A8_UNORM;
+    // DLAA takes the linear HDR scene and gives it back in the same format.
+    default: return feature == DSF_DLSS5_FEATURE_DLAA ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
   }
 }
+
+// One feature's shared slots, fences and frame numbers (protocol version 2).
+struct FeatureState {
+  ComPtr<ID3D12Resource> textures[DSF_DLSS5_SLOT_COUNT];
+  ComPtr<ID3D12Fence> fenceIn, fenceOut;
+  uint32_t width = 0, height = 0, flags = 0;
+  uint64_t lastFrame = 0;
+  bool configured = false;
+};
 
 class Session {
  public:
@@ -86,28 +100,54 @@ class Session {
       return;
     }
     helloSeen_ = true;
-    std::string error;
-    if (!runtime_.Verify(args_.runtimeDir + L"\\nvngx_dlssnr.dll", args_.allowedSha256, &error)) {
-      Reply(out, DSF_DLSS5_ERR_RUNTIME, "nvngx_dlssnr.dll: " + error);
+    // Each feature needs its own DLL; either may be missing. Neither: nothing to run.
+    std::string nrError, srError;
+    const bool nrRuntime = VerifyRuntime(kDlssnrRuntime, &nrRuntime_, &nrError);
+    const bool srRuntime = VerifyRuntime(kDlssRuntime, &srRuntime_, &srError);
+    if (nrRuntime) {
+      for (int i = 0; i < 4; ++i) out->runtime_version[i] = nrRuntime_.Version()[i];
+      CopyMessage(out->runtime_sha256, sizeof(out->runtime_sha256), nrRuntime_.Sha256().c_str());
+    }
+    if (srRuntime) {
+      for (int i = 0; i < 4; ++i) out->dlaa_runtime_version[i] = srRuntime_.Version()[i];
+    }
+    if (!nrRuntime && !srRuntime) {
+      Reply(out, DSF_DLSS5_ERR_RUNTIME, "nvngx_dlssnr.dll: " + nrError + "; nvngx_dlss.dll: " + srError);
       return;
     }
-    for (int i = 0; i < 4; ++i) out->runtime_version[i] = runtime_.Version()[i];
-    CopyMessage(out->runtime_sha256, sizeof(out->runtime_sha256), runtime_.Sha256().c_str());
-    Log("runtime %ls %u.%u.%u.%u sha256 %s (%s)", runtime_.Path().c_str(), runtime_.Version()[0], runtime_.Version()[1],
-        runtime_.Version()[2], runtime_.Version()[3], runtime_.Sha256().c_str(), runtime_.Description());
 
     LUID luid = {in.adapter_luid_low, in.adapter_luid_high};
+    std::string error;
     if (!gpu_.Create(luid, &error)) {
       Reply(out, DSF_DLSS5_ERR_DEVICE, "D3D12: " + error);
       return;
     }
     Log("adapter %ls (client api %u)", gpu_.AdapterName().c_str(), in.client_api);
-    if (!nr_.Initialize(gpu_.Device(), runtime_, ExeDir(), args_.verboseNgx)) {
-      Reply(out, DSF_DLSS5_ERR_NGX, nr_.LastError());
+    if (!ngx_.Initialize(gpu_.Device(), args_.runtimeDir, ExeDir(), args_.verboseNgx)) {
+      Reply(out, DSF_DLSS5_ERR_NGX, ngx_.LastError());
+      return;
+    }
+    if (nrRuntime) {
+      available_[DSF_DLSS5_FEATURE_NR] = nr_.Initialize(ngx_, nrRuntime_);
+      if (!available_[DSF_DLSS5_FEATURE_NR]) nrError = nr_.LastError();
+    }
+    if (srRuntime) {
+      available_[DSF_DLSS5_FEATURE_DLAA] = sr_.Initialize(ngx_, srRuntime_);
+      if (!available_[DSF_DLSS5_FEATURE_DLAA]) srError = sr_.LastError();
+    }
+    std::string message;
+    for (uint32_t f = 0; f < DSF_DLSS5_FEATURE_COUNT; ++f) {
+      if (available_[f]) out->features |= DSF_DLSS5_FEATURE_BIT(f);
+      message += std::string(message.empty() ? "" : "; ") + FeatureName(f) + ": " +
+                 (available_[f] ? "ready" : f == DSF_DLSS5_FEATURE_NR ? nrError : srError);
+    }
+    if (out->features == 0) {
+      Reply(out, DSF_DLSS5_ERR_NGX, message);
       return;
     }
     ready_ = true;
-    Reply(out, DSF_DLSS5_OK, "ready");
+    Log("features 0x%X: %s", out->features, message.c_str());
+    Reply(out, DSF_DLSS5_OK, message);
   }
 
   void Configure(const DsfDlss5Configure& in, DsfDlss5ConfigureAck* out) {
@@ -117,7 +157,17 @@ class Session {
       Reply(out, DSF_DLSS5_ERR_NOT_CONFIGURED, "the helper is not ready (HELLO failed or the device was lost)");
       return;
     }
-    if (!Release()) {
+    if (in.feature >= DSF_DLSS5_FEATURE_COUNT) {
+      Reply(out, DSF_DLSS5_ERR_PROTOCOL, "unknown feature " + std::to_string(in.feature));
+      return;
+    }
+    const uint32_t feature = in.feature;
+    const bool dlaa = feature == DSF_DLSS5_FEATURE_DLAA;
+    if (!available_[feature]) {
+      Reply(out, DSF_DLSS5_ERR_RUNTIME, std::string(FeatureName(feature)) + " is not available (see HELLO_ACK)");
+      return;
+    }
+    if (!Release(feature)) {
       Reply(out, DSF_DLSS5_ERR_DEVICE, "the previous frame's GPU work did not finish");
       return;
     }
@@ -125,12 +175,13 @@ class Session {
       Reply(out, DSF_DLSS5_ERR_PROTOCOL, "bad size");
       return;
     }
-    width_ = in.width;
-    height_ = in.height;
-    flags_ = in.flags;
+    FeatureState& s = state_[feature];
+    s.width = in.width;
+    s.height = in.height;
+    s.flags = in.flags;
     ID3D12Device* device = gpu_.Device();
     const bool clientCreates = (in.flags & DSF_DLSS5_CONFIG_CLIENT_CREATES) != 0;
-    const bool useMask = (in.flags & DSF_DLSS5_CONFIG_USE_MASK) != 0;
+    const bool useMask = !dlaa && (in.flags & DSF_DLSS5_CONFIG_USE_MASK) != 0;
 
     for (int slot = 0; slot < DSF_DLSS5_SLOT_COUNT; ++slot) {
       if (slot == DSF_DLSS5_SLOT_MASK && !useMask) continue;
@@ -139,73 +190,76 @@ class Session {
         HANDLE local = nullptr;
         if (!DuplicateHandle(game_, reinterpret_cast<HANDLE>(static_cast<uintptr_t>(in.textures[slot])), GetCurrentProcess(),
                              &local, 0, FALSE, DUPLICATE_SAME_ACCESS) ||
-            FAILED(device->OpenSharedHandle(local, IID_PPV_ARGS(&textures_[slot])))) {
+            FAILED(device->OpenSharedHandle(local, IID_PPV_ARGS(&s.textures[slot])))) {
           if (local) CloseHandle(local);
-          return FailConfigure(out, DSF_DLSS5_ERR_RESOURCES, "could not open the game's texture for slot " + name);
+          return FailConfigure(feature, out, DSF_DLSS5_ERR_RESOURCES, "could not open the game's texture for slot " + name);
         }
         CloseHandle(local);
       } else {
-        const DXGI_FORMAT format = in.formats[slot] ? static_cast<DXGI_FORMAT>(in.formats[slot]) : DefaultFormat(slot);
+        const DXGI_FORMAT format = in.formats[slot] ? static_cast<DXGI_FORMAT>(in.formats[slot]) : DefaultFormat(feature, slot);
         // D3D11 opens a D3D12-created texture only when it allows render-target and
         // simultaneous access; without them OpenSharedResource1 returns E_INVALIDARG (tested
         // on driver 621.01).
         D3D12_RESOURCE_FLAGS flags = D3D12_RESOURCE_FLAG_ALLOW_RENDER_TARGET | D3D12_RESOURCE_FLAG_ALLOW_SIMULTANEOUS_ACCESS;
         if (slot == DSF_DLSS5_SLOT_OUTPUT) flags |= D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS;
-        textures_[slot] = gpu_.CreateTexture(width_, height_, format, flags, D3D12_RESOURCE_STATE_COMMON, D3D12_HEAP_FLAG_SHARED);
+        s.textures[slot] = gpu_.CreateTexture(s.width, s.height, format, flags, D3D12_RESOURCE_STATE_COMMON, D3D12_HEAP_FLAG_SHARED);
         uint64_t remote = 0;
-        if (!textures_[slot] || !ShareInto(textures_[slot].Get(), &remote)) {
-          return FailConfigure(out, DSF_DLSS5_ERR_RESOURCES, "could not create or share the texture for slot " + name);
+        if (!s.textures[slot] || !ShareInto(s.textures[slot].Get(), &remote)) {
+          return FailConfigure(feature, out, DSF_DLSS5_ERR_RESOURCES, "could not create or share the texture for slot " + name);
         }
         out->textures[slot] = remote;
       }
-      const D3D12_RESOURCE_DESC desc = textures_[slot]->GetDesc();
-      if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width != width_ || desc.Height != height_) {
-        return FailConfigure(out, DSF_DLSS5_ERR_RESOURCES, "slot " + name + " is not a 2D texture of the configured size");
+      const D3D12_RESOURCE_DESC desc = s.textures[slot]->GetDesc();
+      if (desc.Dimension != D3D12_RESOURCE_DIMENSION_TEXTURE2D || desc.Width != s.width || desc.Height != s.height) {
+        return FailConfigure(feature, out, DSF_DLSS5_ERR_RESOURCES, "slot " + name + " is not a 2D texture of the configured size");
       }
       if (slot == DSF_DLSS5_SLOT_OUTPUT && (desc.Flags & D3D12_RESOURCE_FLAG_ALLOW_UNORDERED_ACCESS) == 0) {
-        return FailConfigure(out, DSF_DLSS5_ERR_RESOURCES, "the Output texture needs unordered access (D3D11_BIND_UNORDERED_ACCESS)");
+        return FailConfigure(feature, out, DSF_DLSS5_ERR_RESOURCES,
+                             "the Output texture needs unordered access (D3D11_BIND_UNORDERED_ACCESS)");
       }
       if (slot != DSF_DLSS5_SLOT_OUTPUT && (desc.Flags & D3D12_RESOURCE_FLAG_DENY_SHADER_RESOURCE) != 0) {
-        return FailConfigure(out, DSF_DLSS5_ERR_RESOURCES, "slot " + name + " needs shader-resource access");
+        return FailConfigure(feature, out, DSF_DLSS5_ERR_RESOURCES, "slot " + name + " needs shader-resource access");
       }
       out->formats[slot] = desc.Format;
     }
-    if (!useMask) {
+    if (!dlaa && !useMask) {
       // Remix's default: a mask of ones, combined with the runtime's automatic mask.
-      textures_[DSF_DLSS5_SLOT_MASK] = gpu_.CreateTexture(width_, height_, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
-                                                          D3D12_RESOURCE_STATE_COPY_DEST);
-      if (!textures_[DSF_DLSS5_SLOT_MASK]) {
-        return FailConfigure(out, DSF_DLSS5_ERR_RESOURCES, "could not create the control mask");
+      s.textures[DSF_DLSS5_SLOT_MASK] = gpu_.CreateTexture(s.width, s.height, DXGI_FORMAT_R8G8B8A8_UNORM, D3D12_RESOURCE_FLAG_NONE,
+                                                           D3D12_RESOURCE_STATE_COPY_DEST);
+      if (!s.textures[DSF_DLSS5_SLOT_MASK]) {
+        return FailConfigure(feature, out, DSF_DLSS5_ERR_RESOURCES, "could not create the control mask");
       }
-      std::string ones(static_cast<size_t>(width_) * height_ * 4, '\xff');
+      std::string ones(static_cast<size_t>(s.width) * s.height * 4, '\xff');
       ID3D12GraphicsCommandList* list = gpu_.Begin();
-      gpu_.Upload(textures_[DSF_DLSS5_SLOT_MASK].Get(), ones.data(), 4);
-      Gpu::Transition(list, textures_[DSF_DLSS5_SLOT_MASK].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
+      gpu_.Upload(s.textures[DSF_DLSS5_SLOT_MASK].Get(), ones.data(), 4);
+      Gpu::Transition(list, s.textures[DSF_DLSS5_SLOT_MASK].Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_COMMON);
       if (!gpu_.SubmitAndWait()) {
-        return FailConfigure(out, DSF_DLSS5_ERR_DEVICE, "could not initialize the control mask");
+        return FailConfigure(feature, out, DSF_DLSS5_ERR_DEVICE, "could not initialize the control mask");
       }
       out->formats[DSF_DLSS5_SLOT_MASK] = DXGI_FORMAT_R8G8B8A8_UNORM;
     }
 
     uint64_t remoteIn = 0, remoteOut = 0;
-    const bool fences = SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fenceIn_))) &&
-                        SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&fenceOut_))) &&
-                        ShareInto(fenceIn_.Get(), &remoteIn);
+    const bool fences = SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&s.fenceIn))) &&
+                        SUCCEEDED(device->CreateFence(0, D3D12_FENCE_FLAG_SHARED, IID_PPV_ARGS(&s.fenceOut))) &&
+                        ShareInto(s.fenceIn.Get(), &remoteIn);
     out->fence_in = remoteIn;
-    if (!fences || !ShareInto(fenceOut_.Get(), &remoteOut)) {
-      return FailConfigure(out, DSF_DLSS5_ERR_RESOURCES, "could not create or share the fences");
+    if (!fences || !ShareInto(s.fenceOut.Get(), &remoteOut)) {
+      return FailConfigure(feature, out, DSF_DLSS5_ERR_RESOURCES, "could not create or share the fences");
     }
     out->fence_out = remoteOut;
 
     ID3D12GraphicsCommandList* list = gpu_.Begin();
-    if (!nr_.CreateFeature(list, width_, height_, in.preset) || !gpu_.SubmitAndWait()) {
+    const bool created = dlaa ? sr_.CreateFeature(list, s.width, s.height, in.preset) : nr_.CreateFeature(list, s.width, s.height, in.preset);
+    if (!created || !gpu_.SubmitAndWait()) {
       out->ngx_result = 0;
-      return FailConfigure(out, DSF_DLSS5_ERR_NGX, nr_.LastError());
+      return FailConfigure(feature, out, DSF_DLSS5_ERR_NGX, dlaa ? sr_.LastError() : nr_.LastError());
     }
-    configured_ = true;
-    lastFrame_ = 0;
-    Log("configured %ux%u, formats color %u output %u depth %u motion %u mask %u, %s-created textures", width_, height_,
-        out->formats[0], out->formats[1], out->formats[2], out->formats[3], out->formats[4], clientCreates ? "game" : "helper");
+    s.configured = true;
+    s.lastFrame = 0;
+    Log("%s configured %ux%u, formats color %u output %u depth %u motion %u mask %u, %s-created textures", FeatureName(feature),
+        s.width, s.height, out->formats[0], out->formats[1], out->formats[2], out->formats[3], out->formats[4],
+        clientCreates ? "game" : "helper");
     Reply(out, DSF_DLSS5_OK, "configured");
   }
 
@@ -214,35 +268,48 @@ class Session {
     out->frame = in.frame;
     out->ngx_result = 1;
     out->gpu_ms = -1.0f;
-    if (in.frame == 0 || in.frame <= lastFrame_) {
+    out->feature = in.feature;
+    if (in.feature >= DSF_DLSS5_FEATURE_COUNT) {
+      out->status = DSF_DLSS5_ERR_PROTOCOL;
+      Log("frame %llu rejected: unknown feature %u", static_cast<unsigned long long>(in.frame), in.feature);
+      return;
+    }
+    const uint32_t feature = in.feature;
+    const bool dlaa = feature == DSF_DLSS5_FEATURE_DLAA;
+    FeatureState& st = state_[feature];
+    if (in.frame == 0 || in.frame <= st.lastFrame) {
       // A fence cannot go backwards, and the inputs for an old n may be overwritten already.
       out->status = DSF_DLSS5_ERR_PROTOCOL;
-      Log("frame %llu rejected: frame numbers must start at 1 and increase (last %llu)",
-          static_cast<unsigned long long>(in.frame), static_cast<unsigned long long>(lastFrame_));
+      Log("%s frame %llu rejected: frame numbers must start at 1 and increase (last %llu)", FeatureName(feature),
+          static_cast<unsigned long long>(in.frame), static_cast<unsigned long long>(st.lastFrame));
       return;
     }
-    if (!configured_) {
+    if (!st.configured) {
       out->status = DSF_DLSS5_ERR_NOT_CONFIGURED;
-      SignalOut(in.frame);
+      SignalOut(st, in.frame);
       return;
     }
-    ID3D12Resource* color = textures_[DSF_DLSS5_SLOT_COLOR].Get();
-    ID3D12Resource* output = textures_[DSF_DLSS5_SLOT_OUTPUT].Get();
+    ID3D12Resource* color = st.textures[DSF_DLSS5_SLOT_COLOR].Get();
+    ID3D12Resource* output = st.textures[DSF_DLSS5_SLOT_OUTPUT].Get();
+    ID3D12Resource* depth = st.textures[DSF_DLSS5_SLOT_DEPTH].Get();
+    ID3D12Resource* motion = st.textures[DSF_DLSS5_SLOT_MOTION].Get();
+    ID3D12Resource* mask = st.textures[DSF_DLSS5_SLOT_MASK].Get();   // none for DLAA
     const bool bypass = (in.flags & DSF_DLSS5_FRAME_BYPASS) != 0;
     if (bypass && color->GetDesc().Format != output->GetDesc().Format) {
       out->status = DSF_DLSS5_ERR_RESOURCES;
       Log("frame %llu: BYPASS needs Color and Output in the same format", static_cast<unsigned long long>(in.frame));
       // Nothing was queued, but a game that already queued Wait(fence_out, n) must not stall.
-      SignalOut(in.frame);
-      lastFrame_ = in.frame;
+      SignalOut(st, in.frame);
+      st.lastFrame = in.frame;
       return;
     }
-    ID3D12Resource* inputs[] = {color, textures_[DSF_DLSS5_SLOT_DEPTH].Get(), textures_[DSF_DLSS5_SLOT_MOTION].Get(),
-                                textures_[DSF_DLSS5_SLOT_MASK].Get()};
+    std::vector<ID3D12Resource*> inputs = {color, depth, motion};
+    if (mask != nullptr) inputs.push_back(mask);
     const D3D12_RESOURCE_STATES kCommon = D3D12_RESOURCE_STATE_COMMON;
     const D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;
     ID3D12GraphicsCommandList* list = gpu_.Begin();
     bool evaluated = true;
+    const bool reset = (in.flags & DSF_DLSS5_FRAME_RESET) != 0 || st.lastFrame == 0;
     if (bypass) {
       Gpu::Transition(list, color, kCommon, D3D12_RESOURCE_STATE_COPY_SOURCE);
       Gpu::Transition(list, output, kCommon, D3D12_RESOURCE_STATE_COPY_DEST);
@@ -252,22 +319,30 @@ class Session {
     } else {
       for (ID3D12Resource* r : inputs) Gpu::Transition(list, r, kCommon, kRead);
       Gpu::Transition(list, output, kCommon, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
-      NrSettings s;
-      s.intensity = in.intensity;
-      s.toneStrength = in.tone_strength;
-      s.structureStrength = in.structure_strength;
-      s.skinStructureStrength = in.skin_strength;
-      s.style = in.style;
-      s.useAutoMask = (in.flags & DSF_DLSS5_FRAME_AUTO_MASK) != 0;
-      s.depthInverted = (flags_ & DSF_DLSS5_CONFIG_DEPTH_INVERTED) != 0;
-      s.reset = (in.flags & DSF_DLSS5_FRAME_RESET) != 0 || lastFrame_ == 0;
-      s.jitter[0] = in.jitter[0];
-      s.jitter[1] = in.jitter[1];
-      s.mvScale[0] = in.mv_scale[0];
-      s.mvScale[1] = in.mv_scale[1];
-      evaluated = nr_.Evaluate(list, {color, output, textures_[DSF_DLSS5_SLOT_MOTION].Get(), textures_[DSF_DLSS5_SLOT_DEPTH].Get(),
-                                      textures_[DSF_DLSS5_SLOT_MASK].Get()},
-                               s);
+      if (dlaa) {
+        SrSettings s;
+        s.reset = reset;
+        s.jitter[0] = in.jitter[0];
+        s.jitter[1] = in.jitter[1];
+        s.mvScale[0] = in.mv_scale[0];
+        s.mvScale[1] = in.mv_scale[1];
+        evaluated = sr_.Evaluate(list, {color, output, motion, depth}, s);
+      } else {
+        NrSettings s;
+        s.intensity = in.intensity;
+        s.toneStrength = in.tone_strength;
+        s.structureStrength = in.structure_strength;
+        s.skinStructureStrength = in.skin_strength;
+        s.style = in.style;
+        s.useAutoMask = (in.flags & DSF_DLSS5_FRAME_AUTO_MASK) != 0;
+        s.depthInverted = (st.flags & DSF_DLSS5_CONFIG_DEPTH_INVERTED) != 0;
+        s.reset = reset;
+        s.jitter[0] = in.jitter[0];
+        s.jitter[1] = in.jitter[1];
+        s.mvScale[0] = in.mv_scale[0];
+        s.mvScale[1] = in.mv_scale[1];
+        evaluated = nr_.Evaluate(list, {color, output, motion, depth, mask}, s);
+      }
       for (ID3D12Resource* r : inputs) Gpu::Transition(list, r, kRead, kCommon);
       Gpu::Transition(list, output, D3D12_RESOURCE_STATE_UNORDERED_ACCESS, kCommon);
     }
@@ -275,36 +350,36 @@ class Session {
     // The queue waits for the game's fence_in = n and signals fence_out = n after the work.
     // The helper serializes on its own queue: frame n+1 cannot start before n finished.
     Gpu::Sync sync;
-    sync.waitFence = fenceIn_.Get();
+    sync.waitFence = st.fenceIn.Get();
     sync.waitValue = in.frame;
-    sync.signalFence = fenceOut_.Get();
+    sync.signalFence = st.fenceOut.Get();
     sync.signalValue = in.frame;
     sync.timeoutMs = kFrameTimeoutMs;
     double gpuMs = -1.0;
     const Gpu::SubmitResult result = gpu_.Submit(sync, &gpuMs);
-    lastFrame_ = in.frame;
+    st.lastFrame = in.frame;
     if (result == Gpu::SubmitResult::kTimeout) {
       // The game's fence_in = n never reached the GPU. Release the queue ourselves so it
       // drains, and make the game reconfigure (its fences may be in an unknown state).
-      Log("frame %llu: fence_in was not signalled within %lu ms; draining and dropping the configuration",
+      Log("%s frame %llu: fence_in was not signalled within %lu ms; draining and dropping the configuration", FeatureName(feature),
           static_cast<unsigned long long>(in.frame), kFrameTimeoutMs);
-      fenceIn_->Signal(in.frame);
+      st.fenceIn->Signal(in.frame);
       if (!gpu_.WaitIdle(kDrainTimeoutMs)) {
         Log("the helper's queue did not drain; the device is unusable");
         ready_ = false;
       }
-      configured_ = false;
-      SignalOut(in.frame);
+      st.configured = false;
+      SignalOut(st, in.frame);
       out->status = DSF_DLSS5_ERR_TIMEOUT;
       return;
     }
     if (result == Gpu::SubmitResult::kFailed) {
       const HRESULT removed = gpu_.Device()->GetDeviceRemovedReason();
-      Log("frame %llu: submission failed (device removed reason 0x%08lX)", static_cast<unsigned long long>(in.frame),
-          static_cast<unsigned long>(removed));
+      Log("%s frame %llu: submission failed (device removed reason 0x%08lX)", FeatureName(feature),
+          static_cast<unsigned long long>(in.frame), static_cast<unsigned long>(removed));
       if (removed != S_OK) ready_ = false;
-      configured_ = false;
-      SignalOut(in.frame);
+      st.configured = false;
+      SignalOut(st, in.frame);
       out->status = DSF_DLSS5_ERR_DEVICE;
       return;
     }
@@ -312,34 +387,62 @@ class Session {
       // The list (barriers and the fence_out signal) still ran; only the evaluate is missing.
       out->status = DSF_DLSS5_ERR_NGX;
       out->ngx_result = 0;
-      Log("frame %llu: %s", static_cast<unsigned long long>(in.frame), nr_.LastError().c_str());
+      Log("%s frame %llu: %s", FeatureName(feature), static_cast<unsigned long long>(in.frame),
+          (dlaa ? sr_.LastError() : nr_.LastError()).c_str());
       return;
     }
     if ((in.flags & DSF_DLSS5_FRAME_GPU_TIME) != 0) out->gpu_ms = static_cast<float>(gpuMs);
-    if (in.frame == 1 || in.frame % 600 == 0) Log("frame %llu evaluated, %.2f ms", static_cast<unsigned long long>(in.frame), gpuMs);
+    if (in.frame == 1 || in.frame % 600 == 0) {
+      Log("%s frame %llu evaluated, %.2f ms", FeatureName(feature), static_cast<unsigned long long>(in.frame), gpuMs);
+    }
   }
 
-  // Waits for the GPU and drops the shared resources and the feature. False if the GPU did
-  // not finish, in which case the session is no longer usable.
-  bool Release() {
-    configured_ = false;
+  // Waits for the GPU and drops one feature's shared resources and NGX feature. False if the
+  // GPU did not finish, in which case the session is no longer usable.
+  bool Release(uint32_t feature) {
+    FeatureState& s = state_[feature];
+    s.configured = false;
     if (ready_ && !gpu_.WaitIdle(kDrainTimeoutMs)) {
       ready_ = false;
       return false;
     }
-    nr_.ReleaseFeature();
-    for (auto& t : textures_) t.Reset();
-    fenceIn_.Reset();
-    fenceOut_.Reset();
+    if (feature == DSF_DLSS5_FEATURE_DLAA) {
+      sr_.ReleaseFeature();
+    } else {
+      nr_.ReleaseFeature();
+    }
+    for (auto& t : s.textures) t.Reset();
+    s.fenceIn.Reset();
+    s.fenceOut.Reset();
     return true;
   }
 
   void Shutdown() {
-    Release();
+    for (uint32_t f = 0; f < DSF_DLSS5_FEATURE_COUNT; ++f) Release(f);
     nr_.Shutdown();
+    sr_.Shutdown();
+    ngx_.Shutdown();
   }
 
  private:
+  // A missing file is no error here (the feature is just not offered); a file that is there
+  // and fails the checks is logged.
+  bool VerifyRuntime(const RuntimeSpec& spec, VerifiedRuntime* runtime, std::string* error) {
+    const std::wstring path = args_.runtimeDir + L"\\" + spec.file;
+    if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
+      *error = "not in " + Narrow(args_.runtimeDir);
+      Log("%ls: %s", spec.file, error->c_str());
+      return false;
+    }
+    if (!runtime->Verify(path, spec, args_.allowedSha256, error)) {
+      Log("%ls refused: %s", spec.file, error->c_str());
+      return false;
+    }
+    Log("runtime %ls %u.%u.%u.%u sha256 %s (%s)", runtime->Path().c_str(), runtime->Version()[0], runtime->Version()[1],
+        runtime->Version()[2], runtime->Version()[3], runtime->Sha256().c_str(), runtime->Description());
+    return true;
+  }
+
   template <typename Ack>
   void Reply(Ack* out, int status, const std::string& message) {
     out->status = status;
@@ -348,8 +451,8 @@ class Session {
   }
 
   // Undoes a half-finished CONFIGURE: closes every handle already placed in the game
-  // process and zeroes it in the ACK, then drops the helper's own objects.
-  void FailConfigure(DsfDlss5ConfigureAck* out, int status, const std::string& message) {
+  // process and zeroes it in the ACK, then drops the feature's own objects.
+  void FailConfigure(uint32_t feature, DsfDlss5ConfigureAck* out, int status, const std::string& message) {
     auto closeRemote = [this](uint64_t* value) {
       if (*value != 0) {
         DuplicateHandle(game_, reinterpret_cast<HANDLE>(static_cast<uintptr_t>(*value)), nullptr, nullptr, 0, FALSE,
@@ -360,14 +463,14 @@ class Session {
     for (uint64_t& texture : out->textures) closeRemote(&texture);
     closeRemote(&out->fence_in);
     closeRemote(&out->fence_out);
-    Release();
+    Release(feature);
     Reply(out, status, message);
   }
 
   // Lets a game that already queued Wait(fence_out, n) continue when no GPU work will
   // signal it. Never moves the fence backwards.
-  void SignalOut(uint64_t frame) {
-    if (fenceOut_ && fenceOut_->GetCompletedValue() < frame) fenceOut_->Signal(frame);
+  static void SignalOut(FeatureState& s, uint64_t frame) {
+    if (s.fenceOut && s.fenceOut->GetCompletedValue() < frame) s.fenceOut->Signal(frame);
   }
 
   // Creates an NT handle for a shared resource or fence and moves it into the game process.
@@ -383,16 +486,15 @@ class Session {
 
   const Args& args_;
   HANDLE game_ = nullptr;
-  VerifiedRuntime runtime_;
+  VerifiedRuntime nrRuntime_, srRuntime_;
   Gpu gpu_;
+  NgxD3D12 ngx_;
   NrD3D12 nr_;
-  ComPtr<ID3D12Resource> textures_[DSF_DLSS5_SLOT_COUNT];
-  ComPtr<ID3D12Fence> fenceIn_, fenceOut_;
-  uint32_t width_ = 0, height_ = 0, flags_ = 0;
-  uint64_t lastFrame_ = 0;
+  SrD3D12 sr_;
+  FeatureState state_[DSF_DLSS5_FEATURE_COUNT];
+  bool available_[DSF_DLSS5_FEATURE_COUNT] = {};
   bool helloSeen_ = false;
   bool ready_ = false;
-  bool configured_ = false;
 };
 
 DWORD WINAPI WatchGame(void* process) {

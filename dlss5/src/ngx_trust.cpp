@@ -135,7 +135,8 @@ VerifiedRuntime::~VerifiedRuntime() {
   if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
 }
 
-bool VerifiedRuntime::Verify(const std::wstring& path, const std::vector<std::string>& extraSha256, std::string* error) {
+bool VerifiedRuntime::Verify(const std::wstring& path, const RuntimeSpec& spec, const std::vector<std::string>& extraSha256,
+                             std::string* error) {
   if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
   path_ = path;
   // Readers (NGX, the loader) may open it; nobody may change, rename or delete it.
@@ -149,16 +150,15 @@ bool VerifiedRuntime::Verify(const std::wstring& path, const std::vector<std::st
     return false;
   }
   description_.clear();
-  for (const KnownRuntime& known : kKnownRuntimes) {
-    if (sha256_ == known.sha256) description_ = known.description;
+  for (size_t i = 0; i < spec.knownCount; ++i) {
+    if (sha256_ == spec.known[i].sha256) description_ = spec.known[i].description;
   }
   for (const std::string& extra : extraSha256) {
     if (description_.empty() && sha256_ == Lower(extra)) description_ = "allowed by --allow-runtime-sha256";
   }
   if (description_.empty()) {
-    *error = "unknown runtime (sha256 " + sha256_ +
-             "). Use the nvngx_dlssnr.dll from RTX Remix 1.6.1, or allow a newer NVIDIA release with "
-             "--allow-runtime-sha256 <hash>";
+    *error = "unknown runtime (sha256 " + sha256_ + "). Use " + spec.where +
+             ", or allow a newer NVIDIA release with --allow-runtime-sha256 <hash>";
     return false;
   }
   if (!CheckSignature(file_, path, &signer_, error)) return false;
@@ -167,11 +167,11 @@ bool VerifiedRuntime::Verify(const std::wstring& path, const std::vector<std::st
     return false;
   }
   for (int i = 0; i < 4; ++i) {
-    if (version_[i] == kMinRuntimeVersion[i]) continue;
-    if (version_[i] < kMinRuntimeVersion[i]) {
+    if (version_[i] == spec.minVersion[i]) continue;
+    if (version_[i] < spec.minVersion[i]) {
       char buffer[160];
-      std::snprintf(buffer, sizeof(buffer), "version %u.%u.%u.%u is older than the first public release %u.%u.%u", version_[0],
-                    version_[1], version_[2], version_[3], kMinRuntimeVersion[0], kMinRuntimeVersion[1], kMinRuntimeVersion[2]);
+      std::snprintf(buffer, sizeof(buffer), "version %u.%u.%u.%u is older than %u.%u.%u, the first this helper accepts", version_[0],
+                    version_[1], version_[2], version_[3], spec.minVersion[0], spec.minVersion[1], spec.minVersion[2]);
       *error = buffer;
       return false;
     }

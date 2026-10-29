@@ -19,6 +19,9 @@ $files = [ordered]@{
   "include/nvsdk_ngx.h"                     = @("include\nvsdk_ngx.h", "dc38e7467cf415379c9d12ae1b6e4a494c453ed92720fb53e92aecb523e7b848")
   "include/nvsdk_ngx_defs.h"                = @("include\nvsdk_ngx_defs.h", "ea23f33497cd274860d1c25a97644fce807dcb0037c594547203343103fad03e")
   "include/nvsdk_ngx_params.h"              = @("include\nvsdk_ngx_params.h", "943bc8cc5cdae03b6303016fbad3183636f2335ae27a2d18776798c3b4efabbc")
+  # NGX_D3D12_CREATE_DLSS_EXT and NGX_D3D12_EVALUATE_DLSS_EXT for DLAA (src\sr_d3d12.cpp), included
+  # directly: nvsdk_ngx_helpers.h would also pull in the CUDA helpers.
+  "include/nvsdk_ngx_helpers_d3d.h"         = @("include\nvsdk_ngx_helpers_d3d.h", "ec75224f36ed6580baaf250fa83620405ad81a1d98c2c436654a0c9cf6a6b8ba")
   "lib/Windows_x86_64/x64/nvsdk_ngx_s.lib" = @("lib\nvsdk_ngx_s.lib", "7b9a5239c1145af5f645ab472aa066f9ea79db36ac819562312aae69d65f3765")
   "LICENSE.txt"                             = @("LICENSE.txt", "d4216e39ebef5f9b50a6712ebb37beeb5379862a67733a9999c651f21592aaf0")
 }

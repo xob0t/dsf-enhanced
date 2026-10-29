@@ -1,6 +1,8 @@
 # DSF Enhanced DLSS 5 helper
 
-An open-source runner for NVIDIA DLSS 5 ("DLSS 3D-Guided Neural Rendering", NGX feature DLSSNR) for Driver: San Francisco. NGX is 64-bit only and the game is 32-bit, so the pass runs in a separate 64-bit process, `dsf-dlss5-helper.exe`. The game side shares its frame with the helper as GPU textures and gets the result back the same way.
+An open-source runner for NVIDIA DLSS 5 ("DLSS 3D-Guided Neural Rendering", NGX feature DLSSNR) and DLAA (DLSS Super Resolution at the game's own resolution, NGX feature SuperSampling) for Driver: San Francisco. NGX is 64-bit only and the game is 32-bit, so the passes run in a separate 64-bit process, `dsf-dlss5-helper.exe`. The game side shares its frame with the helper as GPU textures and gets the result back the same way.
+
+Protocol version 2 runs both features over one pipe and one NGX initialization. Each feature has its own textures, fences and frame numbers. DLAA is in the helper and its tests only; DSF Enhanced does not send DLAA frames yet ([`research/dlaa.md`](../research/dlaa.md)).
 
 Status: phase 0. The helper, the protocol and both tests run on an RTX 5070 Ti with the signed `nvngx_dlssnr.dll` from RTX Remix 1.6.1. DSF Enhanced does not talk to the helper yet. That needs the game-side capture (pre-HUD colour, depth, motion vectors), which is separate work.
 
@@ -13,10 +15,12 @@ Design notes, the NGX interface and the test record are in [`research/dlss5-help
 | `include/dsf_dlss5_protocol.h` | The game ↔ helper protocol: messages, shared texture slots, fences, input conventions. Plain C structs that are the same on x86 and x64. |
 | `include/dsf_dlss5_pipe.h` | Message framing over the named pipe, for both sides. |
 | `src/helper_main.cpp` | `dsf-dlss5-helper.exe` (x64). |
+| `src/ngx_d3d12.*` | The one NGX initialization both features share. |
 | `src/nr_d3d12.*` | The DLSS 5 pass on D3D12 through the official NGX path. |
+| `src/sr_d3d12.*` | The DLAA pass: DLSS Super Resolution with input = output size, through the SDK's `nvsdk_ngx_helpers_d3d.h`. |
 | `src/dlssnr_defs.h` | Our own declarations of the DLSSNR feature id and parameter names. The public DLSS SDK has no header for it. |
-| `src/ngx_trust.*` | Checks that `nvngx_dlssnr.dll` has a valid NVIDIA Corporation signature and is version 310.9.16 or later. |
-| `tests/offscreen_test.cpp` | `dsf-dlss5-offscreen.exe` (x64): runs DLSS 5 on a synthetic scene or a saved image and writes PNGs. No window, no game. |
+| `src/ngx_trust.*` | Checks that `nvngx_dlssnr.dll` and `nvngx_dlss.dll` are on the SHA-256 allowlist, have a valid NVIDIA Corporation signature and are version 310.9.16 or later. |
+| `tests/offscreen_test.cpp` | `dsf-dlss5-offscreen.exe` (x64): runs DLSS 5 on a synthetic scene or a saved image and writes PNGs. With `--feature dlaa` it checks DLAA's jitter sign and scale. No window, no game. |
 | `tests/client_test.cpp` | `dsf-dlss5-client-test.exe` (x86): stands in for the game. It starts the helper and drives the full 32 → 64-bit protocol with D3D11 shared textures. |
 | `tests/gpu_wait_test.cpp` | `dsf-dlss5-gpu-wait-test.exe` (x64): checks that a wait after a timed-out submission does not return before the GPU is done. |
 | `tests/synthetic_scene.*` | A small CPU ray-traced street scene with exact depth and motion vectors. |
@@ -24,8 +28,8 @@ Design notes, the NGX interface and the test record are in [`research/dlss5-help
 ## Requirements
 
 - Windows 10/11 and the Visual Studio 2022 C++ build tools (x64 and x86) with a Windows SDK.
-- To run: an NVIDIA RTX 50-series GPU and a driver that supports DLSSNR (tested on 621.01).
-- `nvngx_dlssnr.dll`, which you supply yourself (see below).
+- To run DLSS 5: an NVIDIA RTX 50-series GPU and a driver that supports DLSSNR (tested on 621.01), and `nvngx_dlssnr.dll`, which you supply yourself (see below).
+- To run DLAA: any NVIDIA RTX GPU, and `nvngx_dlss.dll`, which you also supply yourself (see below).
 
 ## Build
 
@@ -33,7 +37,7 @@ Design notes, the NGX interface and the test record are in [`research/dlss5-help
 .\dlss5\build.ps1
 ```
 
-Every build first runs `fetch-sdk.ps1`. It checks the NGX headers and the static NGX loader (`nvsdk_ngx_s.lib`) from NVIDIA's public DLSS SDK (https://github.com/NVIDIA/DLSS, the 310.9.16 release, pinned to commit `9981c635`) against fixed SHA-256 values. It downloads any file that is missing or does not match into `dlss5/external/`, and stops if a download does not match either. Those files are NVIDIA's and are under the NVIDIA RTX SDKs license. They are gitignored, and so is everything under `dlss5/build/`.
+Every build first runs `fetch-sdk.ps1`. It checks the NGX headers (including `nvsdk_ngx_helpers_d3d.h`) and the static NGX loader (`nvsdk_ngx_s.lib`) from NVIDIA's public DLSS SDK (https://github.com/NVIDIA/DLSS, the 310.9.16 release, pinned to commit `9981c635`) against fixed SHA-256 values. It downloads any file that is missing or does not match into `dlss5/external/`, and stops if a download does not match either. Those files are NVIDIA's and are under the NVIDIA RTX SDKs license. They are gitignored, and so is everything under `dlss5/build/`.
 
 ## Getting nvngx_dlssnr.dll
 
@@ -43,6 +47,15 @@ This project does not ship NVIDIA's runtime and never will. The DLSS SDK license
 2. Extract `nvngx_dlssnr.dll` from the root of the zip into a folder of your choice, for example `out\ngx`.
 
 The file used for testing was version 310.9.16.0, 266,424,944 bytes, SHA-256 `2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f`, signed by NVIDIA Corporation. The helper and the offscreen test accept only runtimes whose SHA-256 is on the allowlist in `src/ngx_trust.h` (today only that file). The file must also carry a valid NVIDIA Corporation signature and be version 310.9.16 or later. Patched or pre-release copies therefore fail. When NVIDIA publishes a newer `nvngx_dlssnr.dll`, allow it explicitly with `--allow-runtime-sha256 <hash>`; the signature and version checks still apply. The checked file stays locked against changes until NGX shuts down, and the helper refuses to run if NGX maps any other copy. That last check happens after NGX has loaded the module, so it detects a different copy but cannot prevent loading it.
+
+## Getting nvngx_dlss.dll (DLAA)
+
+DLAA needs NVIDIA's DLSS Super Resolution runtime. It is in NVIDIA's public DLSS SDK repository, release v310.9.16 (the release the build's headers come from). Download the file on its own:
+
+- https://raw.githubusercontent.com/NVIDIA/DLSS/9981c6350dc58c0ce21f024fd65e31e851c31689/lib/Windows_x86_64/rel/nvngx_dlss.dll
+- or from https://github.com/NVIDIA/DLSS/tree/v310.9.16/lib/Windows_x86_64/rel. Use `rel`, never `dev`: NVIDIA's guide forbids shipping the development DLL.
+
+Put it in the same folder as `nvngx_dlssnr.dll` (the `--runtime` folder), or on its own there if you only want DLAA. The tested file is version 310.9.16.0, 58,956,912 bytes, SHA-256 `d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e`, signed by NVIDIA Corporation. Check it with `Get-FileHash nvngx_dlss.dll`. It goes through the same checks as `nvngx_dlssnr.dll`: the allowlist in `src/ngx_trust.h`, the signature, the version floor, the lock, and the check that NGX mapped this copy. `--allow-runtime-sha256` admits a newer release of either file.
 
 ## Run the tests
 
@@ -62,6 +75,12 @@ The file used for testing was version 310.9.16.0, 266,424,944 bytes, SHA-256 `2b
 .\dlss5\build\x86\dsf-dlss5-client-test.exe --helper dlss5\build\x64\dsf-dlss5-helper.exe --runtime out\ngx --out out\dlss5-client
 .\dlss5\build\x86\dsf-dlss5-client-test.exe ... --host-creates   # the helper creates the shared textures (the DXVK direction)
 .\dlss5\build\x86\dsf-dlss5-client-test.exe ... --robustness     # then exercise the timeout and error paths
+.\dlss5\build\x86\dsf-dlss5-client-test.exe ... --feature dlaa   # DLAA instead (nvngx_dlss.dll); --feature both runs both, frame by frame
+
+# DLAA's jitter sign and scale on the synthetic scene against an 8x8-supersampled reference (about a minute
+# of CPU ray tracing at below-normal priority): every sign and scale variant, exit code 10 if +x +y at 1x is
+# not the best. research/dlaa.md has the numbers.
+.\dlss5\build\x64\dsf-dlss5-offscreen.exe --feature dlaa --runtime out\ngx --out out\dlaa-test
 
 # Regression test for waits after a timed-out submission (D3D12 only, no NGX runtime needed)
 .\dlss5\build\x64\dsf-dlss5-gpu-wait-test.exe

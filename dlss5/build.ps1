@@ -33,7 +33,7 @@ $vcvarsall = Join-Path $installationPath "VC\Auxiliary\Build\vcvarsall.bat"
 $common = @("/nologo", "/std:c++17", "/EHsc", "/O2", "/MT", "/W3", "/DUNICODE", "/D_UNICODE", "/DNOMINMAX",
   "/DWIN32_LEAN_AND_MEAN", "/D_CRT_SECURE_NO_WARNINGS", "/I`"$root\include`"")
 $ngx = @("/I`"$sdk\include`"")
-$shared = @("src\nr_d3d12.cpp", "src\ngx_trust.cpp", "src\d3d12_util.cpp") | ForEach-Object { "`"$root\$_`"" }
+$shared = @("src\nr_d3d12.cpp", "src\sr_d3d12.cpp", "src\ngx_d3d12.cpp", "src\ngx_trust.cpp", "src\d3d12_util.cpp") | ForEach-Object { "`"$root\$_`"" }
 $ngxLibs = @("`"$sdk\lib\nvsdk_ngx_s.lib`"", "d3d12.lib", "dxgi.lib", "advapi32.lib", "user32.lib", "ole32.lib")
 
 # One cl invocation per target, its arguments in a response file so paths need no shell quoting.
