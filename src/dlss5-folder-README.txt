@@ -11,7 +11,7 @@ nvngx_dlssnr.dll comes from NVIDIA's RTX Remix 1.6.1 release:
 
   https://github.com/NVIDIAGameWorks/rtx-remix/releases/tag/remix-1.6.1
   file:    rtx-remix-for-x64-games-release-remix-1.6.1.zip
-  inside:  runtime/nvngx_dlssnr.dll (version 310.9.16.0, 266,424,944 bytes)
+  inside:  nvngx_dlssnr.dll, at the top level of the zip (version 310.9.16.0, 266,424,944 bytes)
   SHA-256: 2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f
 
 The helper refuses any other copy: it checks the SHA-256, the NVIDIA Corporation signature and

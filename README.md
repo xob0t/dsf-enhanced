@@ -62,7 +62,7 @@ The model is 64-bit and the game is 32-bit, so a small 64-bit helper (`dlss5\dsf
 1. Install DSF Enhanced from the release ZIP as above, and also copy the ZIP's `dlss5` folder into the game folder. You should then have `dlss5\dsf-dlss5-helper.exe` next to `Driver.exe`.
 2. Get `nvngx_dlssnr.dll`:
    - Download `rtx-remix-for-x64-games-release-remix-1.6.1.zip` (557 MB) from https://github.com/NVIDIAGameWorks/rtx-remix/releases/tag/remix-1.6.1.
-   - Open it and copy `runtime\nvngx_dlssnr.dll` into the game's `dlss5` folder.
+   - Open it and copy `nvngx_dlssnr.dll`, which is at the top level of the zip, into the game's `dlss5` folder.
    - It should be 266,424,944 bytes with SHA-256 `2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f`. To check, run this in PowerShell in the game folder: `Get-FileHash dlss5\nvngx_dlssnr.dll`.
 3. Get DXVK:
    - Download `dxvk-3.1.1.tar.gz` from https://github.com/doitsujin/dxvk/releases/tag/v3.1.1. Its SHA-256 is `40565b4a724aadc4433fa4e010b4b23916d9b1f1baeee64e17186db94f54e608`.
