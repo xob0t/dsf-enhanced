@@ -17,6 +17,12 @@ $commands = @(
   "cl /nologo /std:c++17 /EHsc /O2 /Fo:`"$build\\`" /Fe:`"$test`" `"$root\tests\cinematic_fit_test.cpp`"",
   "`"$test`""
 )
+# Optional: checks src/vk_min.h against the Khronos Vulkan headers (a Vulkan-Headers include folder).
+if ($env:VULKAN_HEADERS_INCLUDE) {
+  $vkCheck = Join-Path $build "vk_min_check.exe"
+  $commands += "cl /nologo /std:c++17 /EHsc /I`"$env:VULKAN_HEADERS_INCLUDE`" /Fo:`"$build\\`" /Fe:`"$vkCheck`" `"$root\tests\vk_min_check.cpp`""
+  $commands += "`"$vkCheck`""
+}
 
 if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
   $vswhere = Join-Path ${env:ProgramFiles(x86)} "Microsoft Visual Studio\Installer\vswhere.exe"

@@ -21,6 +21,7 @@
 #include "cinematic_fit.h"
 #include "dlss5_shared.h"
 #include "../dlss5/include/dsf_dlss5_pipe.h"
+#include "vk_min.h"
 
 namespace {
 

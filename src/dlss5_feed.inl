@@ -59,6 +59,7 @@ bool g_d5_internal = false;    // DSF Enhanced's own D3D9 calls: the hooks pass 
 void LoadDlss5BridgeConfig(const char* ini_path);
 void D5BridgeFrame(IDirect3DDevice9* device);
 bool D5CreateIntzDepth(IDirect3DDevice9* device, UINT w, UINT h, IDirect3DSurface9** out);
+void D5FrameTimeTick();
 bool g_d5_trace_dump = false;
 bool g_d5_export = false;
 int g_d5_trace_start_seconds = 60;
@@ -1225,6 +1226,7 @@ void D5FrameEnd(IDirect3DDevice9* device)
         }
     }
 
+    D5FrameTimeTick();
     InterlockedIncrement(&g_d5_frame_index);
     g_d5_frame_best_rt = nullptr;
     g_d5_frame_best_ds = nullptr;
