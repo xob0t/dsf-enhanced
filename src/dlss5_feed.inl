@@ -1837,16 +1837,28 @@ HRESULT STDMETHODCALLTYPE D5SetTexture(IDirect3DDevice9* device, DWORD stage, ID
     }
     if (stage < 16) {
         g_d5.bound[stage] = texture;
+    } else if (stage >= D3DVERTEXTEXTURESAMPLER0 && stage <= D3DVERTEXTEXTURESAMPLER3) {
+        g_d5.vertex_bound[stage - D3DVERTEXTEXTURESAMPLER0] = texture;
     }
     return g_d5_set_texture(device, stage, texture);
 }
 
-// The scene candidate: the busiest render target this frame that draws with a depth surface and
-// covers the back buffer (the distant-scene strips, 128x832, can draw more than the scene).
+// The scene candidate: the busiest render target this frame that draws with a depth surface, is
+// the HDR format (A16B16G16R16F) at exactly the game's render size, and is bound by the render
+// queue's scene target set. Size alone is not enough: at 3440x1440 the 3072x3072 sun shadow map
+// (A8R8G8B8, set 60) passed a "covers half the screen" test and draws about as much as the scene,
+// so the scene target flipped between the two (research/dlaa.md, "Which draws"). The scene runs
+// under set 35, and under set 30 in some frames (host-20261029-103023 frames 2954-2955,
+// host-20261029-202625 frames 3010-3011).
 const void* g_d5_counting_rt = nullptr;
 int g_d5_counting_draws = 0;
 LONG g_d5_counting_frame = -1;
 bool g_d5_counting_full = false;
+
+bool D5IsSceneTargetSet(DWORD set)
+{
+    return set == 35 || set == 30;
+}
 
 void D5NoteBusiestPass()
 {
@@ -1859,9 +1871,18 @@ void D5NoteBusiestPass()
         counting_rt = g_d5.rt0;
         counting_draws = 0;
         D3DSURFACE_DESC desc = {};
-        counting_full = g_d5.rt0 != nullptr &&
+        const bool hdr_at_render_size = g_d5.rt0 != nullptr &&
             SUCCEEDED(static_cast<IDirect3DSurface9*>(const_cast<void*>(g_d5.rt0))->GetDesc(&desc)) &&
-            desc.Width * 2 >= D5RenderWidth() && desc.Height * 2 >= D5RenderHeight();
+            desc.Format == D3DFMT_A16B16G16R16F && desc.Width == D5RenderWidth() && desc.Height == D5RenderHeight();
+        counting_full = hdr_at_render_size && D5IsSceneTargetSet(g_d5_pass_target_set);
+        static DWORD said_set = 0xFFFFFFFF;
+        if (hdr_at_render_size && !counting_full && g_d5.ds != nullptr && said_set != g_d5_pass_target_set) {
+            said_set = g_d5_pass_target_set;
+            char rt[64] = {};
+            D5Describe(g_d5.rt0, rt, sizeof(rt));
+            Log("DLSS5: %s with a depth surface under render-queue target set %lu, not taken as the scene", rt,
+                static_cast<unsigned long>(g_d5_pass_target_set));
+        }
     }
     ++counting_draws;
     if (counting_full && g_d5.ds != nullptr && counting_draws > g_d5_frame_best_draws) {
