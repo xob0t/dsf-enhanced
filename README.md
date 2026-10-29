@@ -18,9 +18,11 @@ Each release has a ZIP for each:
 - Draws traffic cars at full detail out to their draw distance, raises other gameplay LOD thresholds, and lets you extend how far away civilian traffic spawns.
 - Sharpens the real-time sun shadows: their shadow maps are 3072x3072 instead of the High preset's 1536x1536 (`[Shadows] ShadowMapSize`, about 113 MB more video memory).
 - Shrinks the distant brake and position lamp flares to small dots.
+- Draws the passengers of the car you drive in the in-car camera. The game hides everyone in your car in that view, so after a Shift into a traffic car its passengers vanish from the cockpit view but show in the chase view (`[Quality] CockpitPassengers`).
 - In the garage's vehicles screen, Up/Down switch to the previous or next maker while a maker's cars are open, so every maker's cars can be browsed without going back to the maker list.
 - Skips the legal-screen wait and dismisses the prompt about Ubisoft's servers, which no longer exist.
 - Lifts three engine limits that bigger world or car archives run into and crash on: 45,000 resources loaded at once (`[Limits] ResourceArenaExtraNodes`, 135,000 more by default, about 3 MB), 16,384 resource references waiting to be resolved (`[Limits] PendingResourceReferences`, 131,072 by default, 1.5 MB), and 15,000 submodels loaded at once (`[Limits] SubmodelTableExtraNodes`, 60,000 more by default, about 1.4 MB).
+- Raises the engine's limits of 16,384 draws per frame and 4 MB of draw data per frame, which a heavy frame (worldlod's map, a wide screen, full-detail traffic) can pass and crash on (`[Limits] DrawQueueEntries`, 65,536 by default, about 50 MB with the draw data). If a frame still has more draws, the extra ones are dropped and logged rather than crashing the game.
 
 ### Install
 
@@ -36,6 +38,7 @@ Settings live in `dsf_enhanced.ini`. The defaults turn on borderless mode, 16x a
 - `VehicleFullDetail=0` restores the game's vehicle LOD steps; `VehicleLODThresholdScale` then scales them.
 - `LODEngineThresholdScale` (terrain, pedestrians, drivers) and `MapDetailLODThresholdScale` at `1.0` restore the native LOD thresholds.
 - Clear `DRLFlareScale` and `DRLFlareBrightness` in `[Lights]` to keep the game's lamp flares.
+- `CockpitPassengers=0` hides your car's passengers in the in-car camera again, as the game does.
 - `[Shadows] ShadowMapSize=4096` sharpens shadows a little more for 268 MB of video memory; `0` keeps the preset's size.
 - `[General] Log=0` stops the plugin from writing `dsf_enhanced.log`.
 

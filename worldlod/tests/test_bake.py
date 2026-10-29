@@ -305,6 +305,7 @@ def test_unknown_class_names_stop_the_bake():
     cfg.data["simplify"]["classes"] = ["ground", "grund"]
     with pytest.raises(SystemExit, match=r"\[simplify\] classes: unknown class grund"):
         stage.class_indices(cfg, FakeWorld(), "simplify", "classes")
+    cfg.data["bake"]["min_model_size"] = {"buildings": 2.0}
     assert stage.class_indices(cfg, FakeWorld(), "bake", "min_model_size") == {"buildings": 1}
 
 
