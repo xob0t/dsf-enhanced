@@ -82,6 +82,8 @@ void LoadDlss5BridgeConfig(const char* ini_path)
     g_d5_cockpit_depth = std::max(0.0f, std::min(ReadProfileFloat("DLSS5", "CockpitDepth", 1.5f, ini_path), 10.0f));
     g_d5_frame_time_log = GetPrivateProfileIntA("DLSS5", "FrameTimeLog", 0, ini_path) != 0;
     g_d5_crash_dump = GetPrivateProfileIntA("DLSS5", "CrashDump", 0, ini_path) != 0;
+    g_d5_object_motion = GetPrivateProfileIntA("DLSS5", "ObjectMotion", 1, ini_path) != 0;
+    g_d5_object_debug = GetPrivateProfileIntA("DLSS5", "ObjectMotionDebug", 0, ini_path) != 0;
 }
 
 template <typename T>
@@ -116,6 +118,9 @@ int g_d5_window_bridge_frames = 0;
 double g_d5_window_gpu_ms = 0.0;
 int g_d5_window_gpu_frames = 0;
 const char* g_d5_transport_name = "none";
+double g_d5_window_object_gpu_ms = 0.0;   // the object pass on the GPU (timestamp queries)
+int g_d5_window_object_gpu_frames = 0;
+long long g_d5_window_object_drawn = 0;   // quads drawn (moving cars on screen)
 
 void D5FrameTimeTick()
 {
@@ -141,6 +146,20 @@ void D5FrameTimeTick()
         static_cast<double>(g_d5_frame_intervals[count - 1]), g_d5_window_bridge_frames,
         g_d5_window_bridge_frames > 0 ? g_d5_window_bridge_ms / g_d5_window_bridge_frames : 0.0,
         g_d5_window_gpu_frames > 0 ? g_d5_window_gpu_ms / g_d5_window_gpu_frames : 0.0, g_d5_transport_name);
+    if (g_d5_window_object_frames > 0) {
+        const double frames = g_d5_window_object_frames;
+        Log("DLSS5 frametime: object motion %.1f cars, %.1f moving, %.1f drawn a frame, CPU %.3f ms (tagging, matching), pass GPU %.3f ms (%d frames timed)",
+            g_d5_window_object_cars / frames, g_d5_window_object_moving / frames, g_d5_window_object_drawn / frames,
+            g_d5_window_object_cpu_ms / frames,
+            g_d5_window_object_gpu_frames > 0 ? g_d5_window_object_gpu_ms / g_d5_window_object_gpu_frames : 0.0, g_d5_window_object_gpu_frames);
+    }
+    g_d5_window_object_cpu_ms = 0.0;
+    g_d5_window_object_cars = 0;
+    g_d5_window_object_moving = 0;
+    g_d5_window_object_drawn = 0;
+    g_d5_window_object_frames = 0;
+    g_d5_window_object_gpu_ms = 0.0;
+    g_d5_window_object_gpu_frames = 0;
     g_d5_frame_interval_count = 0;
     g_d5_window_bridge_ms = 0.0;
     g_d5_window_bridge_frames = 0;
@@ -1022,6 +1041,76 @@ IDirect3DPixelShader9* g_d5_ps_depth = nullptr;
 IDirect3DPixelShader9* g_d5_ps_motion = nullptr;
 IDirect3DPixelShader9* g_d5_ps_copy = nullptr;
 IDirect3DPixelShader9* g_d5_ps_copy_swap = nullptr;   // RGBA bytes copied raw into an A8R8G8B8 texture
+IDirect3DPixelShader9* g_d5_ps_object_motion = nullptr;   // per-car motion, stencil-tested
+
+// FrameTimeLog=1: timestamp queries around the object pass, read back a couple of frames later.
+struct D5PassTimer
+{
+    IDirect3DQuery9* disjoint = nullptr;
+    IDirect3DQuery9* frequency = nullptr;
+    IDirect3DQuery9* begin = nullptr;
+    IDirect3DQuery9* end = nullptr;
+    bool pending = false;
+};
+D5PassTimer g_d5_object_timers[3];
+int g_d5_object_timer_next = 0;
+
+void D5ReleasePassTimers()
+{
+    for (D5PassTimer& timer : g_d5_object_timers) {
+        D5SafeRelease(timer.disjoint);
+        D5SafeRelease(timer.frequency);
+        D5SafeRelease(timer.begin);
+        D5SafeRelease(timer.end);
+        timer.pending = false;
+    }
+}
+
+// Collects the finished timings, then starts a free timer for this frame (nullptr: none free).
+D5PassTimer* D5StartPassTimer(IDirect3DDevice9* device)
+{
+    for (D5PassTimer& timer : g_d5_object_timers) {
+        if (!timer.pending) {
+            continue;
+        }
+        BOOL disjoint = TRUE;
+        UINT64 frequency = 0, begin = 0, end = 0;
+        if (timer.disjoint->GetData(&disjoint, sizeof(disjoint), 0) == S_OK && timer.frequency->GetData(&frequency, sizeof(frequency), 0) == S_OK &&
+            timer.begin->GetData(&begin, sizeof(begin), 0) == S_OK && timer.end->GetData(&end, sizeof(end), 0) == S_OK) {
+            timer.pending = false;
+            if (!disjoint && frequency > 0 && end >= begin) {
+                g_d5_window_object_gpu_ms += static_cast<double>(end - begin) * 1000.0 / static_cast<double>(frequency);
+                ++g_d5_window_object_gpu_frames;
+            }
+        }
+    }
+    D5PassTimer& timer = g_d5_object_timers[g_d5_object_timer_next];
+    if (timer.pending) {
+        return nullptr;
+    }
+    if (timer.begin == nullptr &&
+        (FAILED(device->CreateQuery(D3DQUERYTYPE_TIMESTAMPDISJOINT, &timer.disjoint)) ||
+         FAILED(device->CreateQuery(D3DQUERYTYPE_TIMESTAMPFREQ, &timer.frequency)) ||
+         FAILED(device->CreateQuery(D3DQUERYTYPE_TIMESTAMP, &timer.begin)) || FAILED(device->CreateQuery(D3DQUERYTYPE_TIMESTAMP, &timer.end)))) {
+        D5ReleasePassTimers();
+        return nullptr;
+    }
+    g_d5_object_timer_next = (g_d5_object_timer_next + 1) % 3;
+    timer.disjoint->Issue(D3DISSUE_BEGIN);
+    timer.begin->Issue(D3DISSUE_END);
+    return &timer;
+}
+
+void D5EndPassTimer(D5PassTimer* timer)
+{
+    if (timer == nullptr) {
+        return;
+    }
+    timer->end->Issue(D3DISSUE_END);
+    timer->disjoint->Issue(D3DISSUE_END);
+    timer->frequency->Issue(D3DISSUE_END);
+    timer->pending = true;
+}
 IDirect3DTexture9* g_d5_tex_depth = nullptr;          // R32F
 IDirect3DTexture9* g_d5_tex_motion = nullptr;         // G16R16F
 IDirect3DSurface9* g_d5_rt_depth = nullptr;
@@ -1041,6 +1130,8 @@ sampler2D tex0 : register(s0);
 float4 reproject[4] : register(c0);   // rows of VP_prev * inverse(VP_cur), built in double on the CPU
 float4 worldW : register(c4);         // row 3 of inverse(VP_cur): the world point's homogeneous w
 float4 size : register(c8);           // width, height, cockpit depth (m), 0
+float4 objectReproject[4] : register(c9);   // one car: VP_prev * W_prev * inverse(W_cur) * inverse(VP_cur), in double on the CPU
+float4 debug : register(c13);         // ObjectMotionDebug: x > 0 paints the car's pixels with motion (y, z)
 
 float4 DepthPS(float2 uv : TEXCOORD0) : COLOR0
 {
@@ -1063,6 +1154,20 @@ float4 MotionPS(float2 uv : TEXCOORD0) : COLOR0
     return float4(motion, 0, 1);
 }
 
+// One moving car's pixels (stencil-tested): through its own previous transform. tex0 is the
+// R32F depth copy. Like MotionPS, no world position in between.
+float4 ObjectMotionPS(float2 uv : TEXCOORD0) : COLOR0
+{
+    float z = tex2D(tex0, uv).r;
+    float4 ndc = float4(uv.x * 2 - 1, 1 - uv.y * 2, z, 1);
+    float4 prev = float4(dot(objectReproject[0], ndc), dot(objectReproject[1], ndc), dot(objectReproject[2], ndc), dot(objectReproject[3], ndc));
+    float2 prevUv = float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5);
+    float2 motion = (prevUv - uv) * size.xy;
+    if (prev.w <= 0) motion = 0;
+    if (debug.x > 0) motion = debug.yz;
+    return float4(motion, 0, 1);
+}
+
 float4 CopyPS(float2 uv : TEXCOORD0) : COLOR0
 {
     return tex2D(tex0, uv);
@@ -1074,9 +1179,35 @@ float4 CopySwapPS(float2 uv : TEXCOORD0) : COLOR0
 }
 )";
 
+bool g_d5_object_shader_failed = false;
+
+// ObjectMotionPS on its own: if it doesn't compile, object motion is off and the rest goes on.
+void D5CompileObjectShader(IDirect3DDevice9* device, D3DCompileFn compile)
+{
+    if (!g_d5_object_motion || g_d5_ps_object_motion != nullptr || g_d5_object_shader_failed) {
+        return;
+    }
+    g_d5_object_shader_failed = true;
+    ID3DBlob* code = nullptr;
+    ID3DBlob* errors = nullptr;
+    const HRESULT hr = compile(kD5ShaderSource, sizeof(kD5ShaderSource) - 1, "dsf_dlss5", nullptr, nullptr, "ObjectMotionPS", "ps_2_0", 0, 0,
+        &code, &errors);
+    if (FAILED(hr) || code == nullptr) {
+        Log("DLSS5 helper: ObjectMotionPS did not compile, object motion off: %s",
+            errors != nullptr ? static_cast<const char*>(errors->GetBufferPointer()) : "?");
+    } else if (FAILED(device->CreatePixelShader(static_cast<const DWORD*>(code->GetBufferPointer()), &g_d5_ps_object_motion))) {
+        Log("DLSS5 helper: CreatePixelShader(ObjectMotionPS) failed, object motion off");
+        g_d5_ps_object_motion = nullptr;
+    } else {
+        g_d5_object_shader_failed = false;
+    }
+    D5SafeRelease(errors);
+    D5SafeRelease(code);
+}
+
 bool D5CompileShaders(IDirect3DDevice9* device)
 {
-    if (g_d5_ps_copy_swap != nullptr) {
+    if (g_d5_ps_copy_swap != nullptr && (g_d5_ps_object_motion != nullptr || !g_d5_object_motion || g_d5_object_shader_failed)) {
         return true;
     }
     if (g_d5_shaders_failed) {
@@ -1091,7 +1222,7 @@ bool D5CompileShaders(IDirect3DDevice9* device)
     }
     const char* entries[4] = {"DepthPS", "MotionPS", "CopyPS", "CopySwapPS"};
     IDirect3DPixelShader9** targets[4] = {&g_d5_ps_depth, &g_d5_ps_motion, &g_d5_ps_copy, &g_d5_ps_copy_swap};
-    for (int i = 0; i < 4; ++i) {
+    for (int i = 0; i < 4 && g_d5_ps_copy_swap == nullptr; ++i) {
         ID3DBlob* code = nullptr;
         ID3DBlob* errors = nullptr;
         const HRESULT hr = compile(kD5ShaderSource, sizeof(kD5ShaderSource) - 1, "dsf_dlss5", nullptr, nullptr, entries[i], "ps_2_0", 0, 0,
@@ -1111,6 +1242,7 @@ bool D5CompileShaders(IDirect3DDevice9* device)
         }
     }
     g_d5_shaders_failed = false;
+    D5CompileObjectShader(device, compile);
     return true;
 }
 
@@ -1159,7 +1291,8 @@ bool D5EnsureD3D9(IDirect3DDevice9* device, UINT w, UINT h, D3DFORMAT color_form
     return true;
 }
 
-void D5DrawQuad(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect3DPixelShader9* shader, IDirect3DBaseTexture9* texture)
+void D5DrawQuad(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect3DPixelShader9* shader, IDirect3DBaseTexture9* texture,
+    int stencil_ref = -1, const RECT* scissor = nullptr)
 {
     device->SetRenderTarget(0, target);
     for (DWORD i = 1; i < 4; ++i) {
@@ -1189,8 +1322,24 @@ void D5DrawQuad(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect3DPi
     device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
     device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
     device->SetRenderState(D3DRS_ALPHATESTENABLE, FALSE);
-    device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
-    device->SetRenderState(D3DRS_SCISSORTESTENABLE, FALSE);
+    if (stencil_ref >= 0) {
+        // Only the pixels the scene tagged with this car (stencil bits 1-7).
+        device->SetRenderState(D3DRS_STENCILENABLE, TRUE);
+        device->SetRenderState(D3DRS_TWOSIDEDSTENCILMODE, FALSE);
+        device->SetRenderState(D3DRS_STENCILFUNC, D3DCMP_EQUAL);
+        device->SetRenderState(D3DRS_STENCILREF, static_cast<DWORD>(stencil_ref));
+        device->SetRenderState(D3DRS_STENCILMASK, 0xFE);
+        device->SetRenderState(D3DRS_STENCILWRITEMASK, 0);
+        device->SetRenderState(D3DRS_STENCILPASS, D3DSTENCILOP_KEEP);
+        device->SetRenderState(D3DRS_STENCILZFAIL, D3DSTENCILOP_KEEP);
+        device->SetRenderState(D3DRS_STENCILFAIL, D3DSTENCILOP_KEEP);
+    } else {
+        device->SetRenderState(D3DRS_STENCILENABLE, FALSE);
+    }
+    device->SetRenderState(D3DRS_SCISSORTESTENABLE, scissor != nullptr ? TRUE : FALSE);
+    if (scissor != nullptr) {
+        device->SetScissorRect(scissor);
+    }
     device->SetRenderState(D3DRS_CULLMODE, D3DCULL_NONE);
     device->SetRenderState(D3DRS_COLORWRITEENABLE, 0xF);
     device->SetRenderState(D3DRS_SRGBWRITEENABLE, FALSE);
@@ -1261,6 +1410,52 @@ void D5Multiply4x4(const double* a, const double* b, double* out)
     }
 }
 
+// The screen rectangle of a car: the box 12 m around its origin (cars, buses and trucks fit),
+// projected with this frame's VP. False: off screen or behind the camera. *clip stays null
+// when the box reaches behind the near plane (the whole screen, as for the cockpit interior).
+bool D5ObjectScissor(const double* vp, const float* world, UINT w, UINT h, RECT* rect, const RECT** clip)
+{
+    const double radius = 12.0;
+    double left = 1e30, right = -1e30, top = 1e30, bottom = -1e30;
+    int behind = 0;
+    for (int corner = 0; corner < 8; ++corner) {
+        const double p[3] = {world[3] + (corner & 1 ? radius : -radius), world[7] + (corner & 2 ? radius : -radius),
+            world[11] + (corner & 4 ? radius : -radius)};
+        const double x = vp[0] * p[0] + vp[1] * p[1] + vp[2] * p[2] + vp[3];
+        const double y = vp[4] * p[0] + vp[5] * p[1] + vp[6] * p[2] + vp[7];
+        const double cw = vp[12] * p[0] + vp[13] * p[1] + vp[14] * p[2] + vp[15];
+        if (cw <= 0.05) {
+            ++behind;
+            continue;
+        }
+        const double sx = (x / cw * 0.5 + 0.5) * w;
+        const double sy = (0.5 - y / cw * 0.5) * h;
+        left = std::min(left, sx);
+        right = std::max(right, sx);
+        top = std::min(top, sy);
+        bottom = std::max(bottom, sy);
+    }
+    *clip = nullptr;
+    if (behind == 8) {
+        return false;
+    }
+    if (behind > 0) {
+        return true;   // reaches behind the camera: no useful rectangle
+    }
+    if (right < 0.0 || bottom < 0.0 || left > w || top > h) {
+        return false;
+    }
+    rect->left = static_cast<LONG>(std::max(0.0, std::floor(left)));
+    rect->top = static_cast<LONG>(std::max(0.0, std::floor(top)));
+    rect->right = static_cast<LONG>(std::min(static_cast<double>(w), std::ceil(right)));
+    rect->bottom = static_cast<LONG>(std::min(static_cast<double>(h), std::ceil(bottom)));
+    if (rect->right <= rect->left || rect->bottom <= rect->top) {
+        return false;
+    }
+    *clip = rect;
+    return true;
+}
+
 // Depth and motion into our render targets; the device's state comes back as it was.
 bool D5RenderInputs(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect3DTexture9* depth, UINT w, UINT h)
 {
@@ -1291,8 +1486,48 @@ bool D5RenderInputs(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect
     D5DrawQuad(device, g_d5_rt_motion, g_d5_ps_motion, depth);
     if (!have_motion) {
         device->ColorFill(g_d5_rt_motion, nullptr, 0);   // no previous matrix: zero motion
+    } else if (g_d5_object_motion && (g_d5_moving_objects > 0 || g_d5_object_debug) && g_d5_scene_ds != nullptr) {
+        // Moving cars: their pixels, by stencil tag, get their own previous transform.
+        if (g_d5_trace_frame != nullptr && g_d5_trace_dump && g_d5_trace_pair_step != 0) {
+            D5DumpSurface(device, g_d5_rt_motion, "dlss5-motion-camera");   // before, for comparison
+        }
+        D5PassTimer* timer = g_d5_frame_time_log ? D5StartPassTimer(device) : nullptr;
+        device->SetDepthStencilSurface(static_cast<IDirect3DSurface9*>(const_cast<void*>(g_d5_scene_ds)));
+        int drawn = 0;
+        for (int k = 1; k <= g_d5_object_count; ++k) {
+            const D5Object& object = g_d5_objects[k];
+            if (!object.moving && !g_d5_object_debug) {
+                continue;
+            }
+            RECT scissor = {};
+            const RECT* clip = nullptr;
+            if (!D5ObjectScissor(current, object.world, w, h, &scissor, &clip)) {
+                continue;   // off screen or behind the camera
+            }
+            // VP_prev * D * inverse(VP_cur), D = W_prev * inverse(W_cur) (identity when not moving).
+            double delta[16] = {1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1, 0, 0, 0, 0, 1};
+            if (object.moving) {
+                std::memcpy(delta, object.delta, sizeof(object.delta));
+            }
+            double through[16] = {}, matrix[16] = {};
+            D5Multiply4x4(previous, delta, through);
+            D5Multiply4x4(through, inv_vp, matrix);
+            float rows[16] = {};
+            for (int i = 0; i < 16; ++i) {
+                rows[i] = static_cast<float>(matrix[i]);
+            }
+            // ObjectMotionDebug: each tagged car in a flat colour of its own (dumped as dlss5-motion)
+            const float debug[4] = {g_d5_object_debug ? 1.0f : 0.0f, static_cast<float>((k * 37) % 61 - 30), static_cast<float>((k * 23) % 61 - 30), 0.0f};
+            device->SetPixelShaderConstantF(9, rows, 4);
+            device->SetPixelShaderConstantF(13, debug, 1);
+            D5DrawQuad(device, g_d5_rt_motion, g_d5_ps_object_motion, g_d5_tex_depth, k << 1, clip);
+            ++drawn;
+        }
+        g_d5_window_object_drawn += drawn;
+        D5EndPassTimer(timer);
+        device->SetDepthStencilSurface(nullptr);
     }
-    if (g_d5_trace_frame != nullptr && g_d5_trace_dump && g_d5_trace_pair_step == 1) {
+    if (g_d5_trace_frame != nullptr && g_d5_trace_dump && g_d5_trace_pair_step != 0) {
         D5DumpSurface(device, g_d5_rt_depth, "dlss5-depth");
         D5DumpSurface(device, g_d5_rt_motion, "dlss5-motion");
     }
@@ -1698,7 +1933,11 @@ void Dlss5OnReset()
     D5SafeRelease(g_d5_ps_motion);
     D5SafeRelease(g_d5_ps_copy);
     D5SafeRelease(g_d5_ps_copy_swap);
+    D5SafeRelease(g_d5_ps_object_motion);
+    g_d5_object_shader_failed = false;
+    D5ReleasePassTimers();
     g_d5_shaders_failed = false;
+    D5ResetStencilShadows();
     // Reset releases every default-pool resource: forget the targets and textures the hooks saw,
     // so nothing calls into a freed surface before the game binds new ones.
     g_d5.rt0 = nullptr;
