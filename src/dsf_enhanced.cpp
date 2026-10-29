@@ -2,6 +2,11 @@
 #define WIN32_LEAN_AND_MEAN
 #include <windows.h>
 #include <d3d9.h>
+#include <d3d11_4.h>
+#include <d3dcommon.h>
+#include <dxgi1_2.h>
+#include <dbghelp.h>
+#include <intrin.h>
 
 #include <algorithm>
 #include <cstdarg>
@@ -11,8 +16,13 @@
 #include <cstdlib>
 #include <cstring>
 #include <cmath>
+#include <unordered_map>
+#include <vector>
 
 #include "cinematic_fit.h"
+#include "dlss5_shared.h"
+#include "../dlss5/include/dsf_dlss5_pipe.h"
+#include "vk_min.h"
 
 namespace {
 
@@ -354,6 +364,9 @@ DWORD CallerRva(void* caller);
 void HookDeviceMethods(IDirect3DDevice9* device);
 void TrackLastD3DDevice(IDirect3DDevice9* device);
 void RehookTrackedD3DDevice(const char* source);
+void LoadDlss5Config(const char* ini_path);
+void Dlss5OnReset();
+void Dlss5Shutdown();
 
 void BuildGamePath(char* out, DWORD out_size, const char* name)
 {
@@ -526,6 +539,7 @@ void LoadConfig()
     const int shadow_map_size = GetPrivateProfileIntA("Shadows", "ShadowMapSize", 0, ini_path);
     g_shadow_map_size = shadow_map_size <= 0 ? 0 : ClampInt(shadow_map_size, kShadowMapMinSize, kShadowMapMaxSize);
     LoadFlareConfig(ini_path);
+    LoadDlss5Config(ini_path);
 }
 
 bool WriteMemory(void* address, const void* data, size_t size)
@@ -2167,12 +2181,16 @@ HRESULT STDMETHODCALLTYPE ProxyReset(IDirect3DDevice9* device, D3DPRESENT_PARAME
     TrackLastD3DDevice(device);
     ApplyPresentationTweaks(presentation_parameters, GetPresentationWindow(presentation_parameters, nullptr), "Reset");
     ApplyUltrawideInstrumentation();
+    Dlss5OnReset();
     const HRESULT result = g_real_reset(device, presentation_parameters);
     if (SUCCEEDED(result)) {
         ApplySamplerQuality(device, "Reset");
     }
     return result;
 }
+
+#include "dlss5_feed.inl"
+#include "dlss5_bridge.inl"
 
 bool HookDeviceVTable(void** vtable, size_t index, void* replacement, void** original, const char* name)
 {
@@ -2214,6 +2232,9 @@ void HookDeviceMethods(IDirect3DDevice9* device)
         Log("D3D: device hooks already installed");
         return;
     }
+
+    // Before the vtable hooks below, so the detours land on the original methods.
+    InstallDlss5Hooks(device);
 
     void* original_reset = nullptr;
     if (!HookDeviceVTable(vtable, 16, reset_replacement, &original_reset, "Reset")) {
@@ -4126,6 +4147,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (thread != nullptr) {
             CloseHandle(thread);
         }
+    } else if (reason == DLL_PROCESS_DETACH) {
+        Dlss5Shutdown();
     }
     return TRUE;
 }
