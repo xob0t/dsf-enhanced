@@ -103,6 +103,14 @@ keeps the original bytes.
 
 ## How it works
 
+The game queues one draw for each piece of a model that has its own material,
+in every view the map is in, and a frame holds at most 16,384 draws. So the map
+is grouped for few draws: each cell's ground is one piece per material, and the
+building detail, trees and road text of each block of 2 x 2 cells share pieces,
+with all trees drawn from one texture. In the upper-Shift overview that is about
+8,400 draws a frame where v1.2.0 took 10,600 (the stock map about 1,200; more
+in [research/world-lod.md](research/world-lod.md), "Draws per frame").
+
 Findings on the formats and the engine are in
 [research/world-lod.md](research/world-lod.md). Mesh simplification uses
 [meshoptimizer](https://github.com/zeux/meshoptimizer) (MIT), whose simplifier

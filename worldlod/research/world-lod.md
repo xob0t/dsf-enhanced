@@ -72,6 +72,19 @@ unknown). Some GEGR buffers use `float16 x4` or `float32 x3` positions.
 `+0x14 float cell_size (512), float min_x, float min_z`. Cells are centred on
 multiples of 512 (R_360: x -1280..-768, z 768..1280).
 
+GEGR's SCND (2,992 bytes) is a quadtree over its GEBI instances
+(`dsfworld/formats/scnd.py`): `+0x00` node offset (0x30), `+0x04` offset of a
+u16 list of instance indices, `+0x08` node count (341: five levels), `+0x0C`
+instance count (778), `+0x10` 2, `+0x14` side (14,848 m), `+0x18`/`+0x1C`
+minimum x, z (-7,424). A node is `{u16 start, u16 count}` into the list.
+Level L's nodes follow the levels above (offsets 0, 1, 5, 21, 85) and cover a
+2^L x 2^L grid in Morton order, x in the even bits (checked on nodes 45, 97,
+98, 99). Stock instances sit in the leaf under their centre unless they are
+much bigger than it. `ShiftSector_BuildRenderState` walks this list (sector
+`+0x2C14`) once per GEBI instance, so a GEBI instance that isn't in it makes
+the engine read past the list: a build with 86 extra instances and no SCND
+change stopped drawing while GEGR loaded (`vm1-20261029-053658`).
+
 ### GEBI (decoded, static)
 
 Header (version 16; `GebiResourceWrapper_LoadAndDispatchAdd` 0x48C2B0 rebases
@@ -85,7 +98,7 @@ Header (version 16; `GebiResourceWrapper_LoadAndDispatchAdd` 0x48C2B0 rebases
 | +0x0E u16[9] | cumulative counts per category; instances in [+0x10, +0x16) and [+0x18, count) get render class 6 |
 | +0x1E u16 | model UID count |
 | +0x20 u32 | offset of the u64 model UID table |
-| +0x24, +0x28 u32 | two more tables (+0x24 is indexed per model in EmitDrawMetadata) |
+| +0x24, +0x28 u32 | a u16 per instance and one more, padded to 16 bytes: ranges `[t[i], t[i+1])` of 32-byte records at +0x28 that EmitDrawMetadata hands to FUN_006BBB30 (per-instance constants). GEGR's are all zero, +0x28 empty |
 
 Instance record, 20 bytes (`ShiftSector_BuildRenderState` 0x6B7490):
 
@@ -95,7 +108,7 @@ Instance record, 20 bytes (`ShiftSector_BuildRenderState` 0x6B7490):
 | +0x04 u32 | bits 0-19 x, bits 20-30 flags, bit 31 yaw-only |
 | +0x08 u16 | y |
 | +0x0A u16 | model index into the UID table |
-| +0x0C u32 | bits 0-19 z, bits 20-31 unknown (increase through the table) |
+| +0x0C u32 | bits 0-19 z, bits 20-31 the instance's index (GEGR: 0..777) |
 | +0x10 u32 | scale x/y/z = bits 22-31 / 12-21 / 2-11, each `v * 1.5 / 1023 + 0.5`; bit 1 mirrors X (0x6B9380) |
 
 Position (0x48D4C0): `x, z = (v - 0x5A000) / 64`, `y = (v - 0x3200) / 128`, in
@@ -105,6 +118,12 @@ select render classes; `& 0x66` is passed to the draw.
 
 Checked on R_360: all 927 instances fall inside the cell; the flattened cell
 draws coherent streets, kerbs, crossings and lamp posts.
+
+`ShiftSector_BuildRenderState` fills fixed arrays of the region's render
+state: 1,300 instances (matrix at float index 0x28AC, cell 0x79EC, lightmap UID
+0x8700, two render class bytes) and 2,048 model indices (0x7C76). It takes
+each instance's cell from its position (`row * 29 + col`) and the cell's
+lightmap name from it. GEGR uses 778 instances and 1,838 model UIDs.
 
 ## What the base LOD is (static)
 
@@ -264,6 +283,9 @@ shells.
 
 ## When the base is drawn (runtime, user observation)
 
+(Corrected by measurement on 2026-10-29, "Draws per frame" below: the base is
+also drawn at street level, for distant cells and in secondary viewports.)
+
 The base LOD is drawn only at the upper Shift levels, together with the detailed
 cells the game loads around the cursor. At user level 2 and below the global
 map is despawned. So the baked ground can't z-fight with gameplay; at the upper
@@ -336,3 +358,90 @@ next to what it bakes.
   continues the pool in an extension block. With it, the VM run loaded, drove
   and Shifted; the table peaked at 15,523. Peak process memory: 1,873 MB
   virtual (ground only 1,432 MB); Driver.exe is large-address-aware.
+
+## Draws per frame (2026-10-29)
+
+The frame's draw queue holds 16,384 entries in Driver.exe 1.04 (driversf-forza
+`research/spool-limits.md`, "Draw queue"; DSF Enhanced PR #12 raises it). The
+v1.2.0 map took a 16:9 frame to 11,264 entries or more; the user's 21:9 setup
+crashed on it.
+
+### Measuring (runtime, test build only)
+
+A test build of DSF Enhanced (PR #12 plus a read-only counter, not shipped)
+hooks the queue flip FUN_00BB5780: before it flips, `manager+4` is the queue of
+the frame just built. It logs each second's frame count, highest and mean
+entries, and every 3 s copies one frame's 32-byte entries, with 96 bytes of the
+object at entry `+0x0C`. For draws queued by `ShiftDrawMetadata_Enqueue`
+(0x6BA880 -> FUN_00BB5A50) that object is the submodel, its own UID at `+0x10`,
+so each draw maps to a stock GEGR submodel (the base LOD or the shared prop
+library), a worldlod one (by class), a region's, or something else (cars,
+people, sky, MegaMesh). The entry's first u64 is the sort key; its top byte
+names the pass/viewport (the key's top 7 bits come from metadata `+0x0E`,
+FUN_006C1780):
+
+| Top byte | What |
+| --- | --- |
+| 0x94 | the main view |
+| 0x14, 0x18 ... 0x38 | ten secondary viewports. At street level one of them renders each frame, in turn; the frame the world becomes ready renders all ten at once. They draw the base LOD (stock: 30-130 draws each) |
+| 0x00, 0xA0, 0xA8, 0xAA, 0xAE, 0x0C | other passes (shadow-like 0x00 draws region detail, no base) |
+
+VM runs: the harness of driversf-forza (`run-series.ps1 -Vm`), the user's
+`dsf_enhanced.ini` (LOD scale 0.25, full-detail traffic, 500 m traffic radius),
+a 1600 x 900 window; "21:9" uses the user's frustum on that window
+(`TargetAspect=2.388889`, `FOVScalar=0.023453`, the values DSF Enhanced derives
+at 3440 x 1440). Each run loads the save into the Shift overview, holds it
+60 s, zooms down, spawns a car and drives 40 s.
+
+### Why the map drew so much (static and runtime)
+
+- **A draw is a submodel.** `ShiftRenderClasses_Emit` (0x6BA9B0) queues one
+  draw per submodel of each LOD whose mask matches. The bake put each cell's
+  ground, trees, building detail and road text, split by material, into the
+  cell's stock terrain part: 14,409 submodels, about 35 per cell, where the
+  stock part has one or two. Draws follow submodels, not triangles: PR #8's
+  settings (+11% triangles, 14,424 submodels) drew the same.
+- **The base region is visible in every viewport.** For the base descriptor
+  (`+0x10` set) `ShiftSector_EmitDrawMetadata` forces LOD mask 2 and visible
+  (decompiled: `local_78 = 2; local_99 = 1`), whatever the distance LOD
+  (FUN_006A5010, keyed by the instance's LOD category) says; only the
+  viewport's frustum culls. So a LOD mask can't keep baked parts out of a pass,
+  and submodel flag 0x100 (skipped in the pass 0xF3FFF0 by
+  `ShiftRenderClasses_Emit`) changed nothing in the secondary viewports (VM
+  test, 2026-10-29).
+- **At street level** the main view draws baked parts of cells 768 m and more
+  from the car (none around it), and the secondary viewport of the frame draws
+  100-700 more.
+- The 29 x 29 grid that the crash stack walked (FUN_007686F0, from the
+  per-viewport pass FUN_0075D300) draws models named "1".."841" (FUN_007689C0
+  hashes `"%d"`), which are in MegaMesh.sp, not in the world archive: stock
+  content, not worldlod's.
+
+### What changed
+
+- **Block parts.** Buildings, trees and props (`[bake] block_classes`) of
+  each 2 x 2 block of cells (`block_cells`) are baked in the frame of the
+  block's centre and merged by material into one new MODL part, placed by a
+  new GEGR instance there (a copy of a terrain instance, flags 1) and listed in
+  SCND's quadtree (above). int16 positions at 1/64 m reach 512 m from the
+  centre, so 2 x 2 is the most; a placement that overhangs the block's edge
+  stays in its cell's part. Ground stays per cell: its parts keep the cells'
+  lightmap binding (PR #10 binds the instance's one cell) and the gap fill.
+  Block parts lack trailer bit 4, so no cell lightmap is bound to them. Ground
+  in blocks too (`block_classes` with "ground") gives 10,767 submodels without
+  the atlas, but every ground placement on a block's outer edge falls back
+  (1,024 m don't fit 65,535 steps of 1/64 m) and it breaks PR #10's lighting.
+- **Leaf-card atlas.** The 32 leaf-card textures (DXT1; 31 at 512, one at 256)
+  go into one 4096 x 2048 DXT1 atlas, copied block by block from each texture's
+  own mips (8 levels, down to one block per tile, so no tile bleeds into
+  another's colours); the cards' UVs are clamped and moved into their tile.
+  The clones differ only by alpha-test reference then: 4 materials instead of
+  32 (`[bake] leaf_card_atlas`). 5.6 MB more in GEGR.
+- With `block_cells = 1` and `leaf_card_atlas = false` the build is the v1.2.0
+  archive byte for byte.
+
+| Build | Submodels | Archive | GEGR streamer budget |
+| --- | ---: | ---: | ---: |
+| v1.2.0 | 14,409 | 775 MB | 332 MB |
+| blocks | 12,177 | 775 MB | 332 MB |
+| blocks + atlas (default) | 11,183 | 780 MB | 337 MB |
