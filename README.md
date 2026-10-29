@@ -16,6 +16,7 @@ Each release has a ZIP for each:
 - Adds borderless windowed mode and an option to turn off VSync.
 - Forces anisotropic and trilinear texture filtering. It also has mip and LOD-bias settings.
 - Draws traffic cars at full detail out to their draw distance, raises other gameplay LOD thresholds, and lets you extend how far away civilian traffic spawns.
+- Sharpens the real-time sun shadows: their shadow maps are 3072x3072 instead of the High preset's 1536x1536 (`[Shadows] ShadowMapSize`, about 113 MB more video memory).
 - Shrinks the distant brake and position lamp flares to small dots.
 - Draws the passengers of the car you drive in the in-car camera. The game hides everyone in your car in that view, so after a Shift into a traffic car its passengers vanish from the cockpit view but show in the chase view (`[Quality] CockpitPassengers`).
 - In the garage's vehicles screen, Up/Down switch to the previous or next maker while a maker's cars are open, so every maker's cars can be browsed without going back to the maker list.
@@ -38,6 +39,7 @@ Settings live in `dsf_enhanced.ini`. The defaults turn on borderless mode, 16x a
 - `LODEngineThresholdScale` (terrain, pedestrians, drivers) and `MapDetailLODThresholdScale` at `1.0` restore the native LOD thresholds.
 - Clear `DRLFlareScale` and `DRLFlareBrightness` in `[Lights]` to keep the game's lamp flares.
 - `CockpitPassengers=0` hides your car's passengers in the in-car camera again, as the game does.
+- `[Shadows] ShadowMapSize=4096` sharpens shadows a little more for 268 MB of video memory; `0` keeps the preset's size.
 - `[General] Log=0` stops the plugin from writing `dsf_enhanced.log`.
 
 To uninstall, delete the three files. If the game already has a `winmm.dll`, from another ASI loader for example, back it up before installing. Nothing here touches `Driver.exe` or `gameconfig.txt`.

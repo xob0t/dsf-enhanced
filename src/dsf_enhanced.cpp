@@ -65,6 +65,19 @@ constexpr DWORD kLegalScreenBeginLoadingCallRva = 0x00399C92;   // call 0x4A20C0
 constexpr DWORD kLoadingScreenBeginRva = 0x000A20C0;
 constexpr DWORD kPendingResourceReferenceClearRva = 0x000A2153; // mov dword [0x188A6B8],0
 constexpr DWORD kPendingResourceReferenceCountRva = 0x0148A6B8; // resource manager 0x1732BF0 + 0x157AC8
+
+// Shadow map size. The graphics settings block at 0xFD2580 holds it at +4, set per preset by
+// 0xBAB370, 0xBAB2B0 and 0xBAB1F0: 768 (Low), 1024 (Medium), 1536 (High). Each frame the shadow
+// setup 0x6ACD80 copies the block and stores +4 as the width and height of the shadow object
+// ([this+0x1470] +0x640, +0x644). Everything sized by the map reads those two fields: the render
+// pass of each split (2 on High, +0x648; an A8R8G8B8 target and a D24S8 depth surface each, with
+// a viewport of the same size), the blur passes (the size, or half of it), and the (width,
+// height) shader constant uploaded at 0x6A97F7, which the shadow filter takes its texel size
+// from. Lua Shadows.SetShadowMapSize (0x646570) writes the same two fields, but the setup
+// overwrites them the next frame.
+constexpr DWORD kShadowMapSizeLoadRva = 0x002ACDC6;  // mov eax,[esp+0x154]: the block's +4
+constexpr int kShadowMapMinSize = 256;
+constexpr int kShadowMapMaxSize = 4096;  // 2 splits x 8 bytes a texel: 268 MB of video memory
 // Resource manager 0x1732BF0: ResourceHashPool_Acquire (0xBAED90) takes a 24-byte node from the
 // free list at +0x127AC0, else bumps +0x127AC4 through 45,000 nodes stored at +0x20000..+0x127AC0,
 // with no end check. The 45,001st resident resource overwrites the free-list head and the bump
@@ -289,6 +302,7 @@ void* g_arena_bump_continue = nullptr;
 DWORD g_arena_extension_logged_nodes = 0;
 int g_pending_reference_capacity = 131072;
 int g_submodel_table_extra_nodes = 60000;
+int g_shadow_map_size = 0;
 std::uint8_t* g_submodel_extension_begin = nullptr;
 std::uint8_t* g_submodel_extension_end = nullptr;
 void* g_submodel_pool_alloc = nullptr;
@@ -509,6 +523,8 @@ void LoadConfig()
     g_draw_queue_entries = ClampInt(GetPrivateProfileIntA("Limits", "DrawQueueEntries", 65536, ini_path), 0, 262144);
     g_draw_queue_test_entries =
         ClampInt(GetPrivateProfileIntA("Limits", "DrawQueueTestEntries", 0, ini_path), 0, kDrawQueueStockEntries);
+    const int shadow_map_size = GetPrivateProfileIntA("Shadows", "ShadowMapSize", 0, ini_path);
+    g_shadow_map_size = shadow_map_size <= 0 ? 0 : ClampInt(shadow_map_size, kShadowMapMinSize, kShadowMapMaxSize);
     LoadFlareConfig(ini_path);
 }
 
@@ -2230,6 +2246,56 @@ void HookDeviceMethods(IDirect3DDevice9* device)
     }
 }
 
+// Replaces the per-frame load of the preset's shadow map size with a constant, clamped to the
+// device's texture limit. Applied once the device exists; the shadow setup only runs after that.
+void ApplyShadowMapSizePatch(IDirect3DDevice9* device)
+{
+    if (g_shadow_map_size <= 0 || device == nullptr) {
+        return;
+    }
+
+    const ModuleRange range = GetExeRange();
+    if (!IsRvaInRange(range, kShadowMapSizeLoadRva, 13)) {
+        Log("Shadows: shadow map size load is outside the loaded image; not patched");
+        return;
+    }
+
+    int size = g_shadow_map_size;
+    D3DCAPS9 caps = {};
+    if (SUCCEEDED(device->GetDeviceCaps(&caps))) {
+        const int max_size = static_cast<int>(std::min(caps.MaxTextureWidth, caps.MaxTextureHeight));
+        if (max_size > 0 && size > max_size) {
+            Log("Shadows: ShadowMapSize=%d is above the device's %d texel limit; using %d", size, max_size, max_size);
+            size = max_size;
+        }
+    }
+
+    // mov eax,[esp+0x154]; mov [ecx+0x640],eax  ->  mov eax,size; nop2
+    constexpr std::uint8_t expected[] = { 0x8B, 0x84, 0x24, 0x54, 0x01, 0x00, 0x00, 0x89, 0x81, 0x40, 0x06, 0x00, 0x00 };
+    std::uint8_t patch[7] = { 0xB8, 0, 0, 0, 0, 0x66, 0x90 };
+    std::memcpy(&patch[1], &size, sizeof(size));
+
+    auto* site = range.base + kShadowMapSizeLoadRva;
+    const bool stock = std::memcmp(site, expected, sizeof(expected)) == 0;
+    const bool patched = site[0] == 0xB8 && site[5] == 0x66 && site[6] == 0x90 &&
+        std::memcmp(site + 7, expected + 7, sizeof(expected) - 7) == 0;
+    if (!stock && !patched) {
+        Log(
+            "Shadows: unexpected bytes at RVA 0x%08lX (%02X %02X %02X %02X); shadow map size not patched",
+            static_cast<unsigned long>(kShadowMapSizeLoadRva), site[0], site[1], site[2], site[3]
+        );
+        return;
+    }
+    if (!WriteMemory(site, patch, sizeof(patch))) {
+        Log("Shadows: failed to patch RVA 0x%08lX; shadow map size not patched", static_cast<unsigned long>(kShadowMapSizeLoadRva));
+        return;
+    }
+    Log(
+        "Shadows: shadow map size %dx%d for every preset (stock 768/1024/1536), load at RVA 0x%08lX",
+        size, size, static_cast<unsigned long>(kShadowMapSizeLoadRva)
+    );
+}
+
 class Direct3D9Proxy final : public IDirect3D9
 {
 public:
@@ -2294,6 +2360,7 @@ public:
         if (SUCCEEDED(result) && ppReturnedDeviceInterface != nullptr) {
             TrackLastD3DDevice(*ppReturnedDeviceInterface);
             HookDeviceMethods(*ppReturnedDeviceInterface);
+            ApplyShadowMapSizePatch(*ppReturnedDeviceInterface);
         } else {
             Log("CreateDevice: failed hr=0x%08lX", static_cast<unsigned long>(result));
         }
@@ -4001,7 +4068,7 @@ void ApplyPatches()
     ApplyGlobalFovScalarPatch(exe, "Init");
     ApplyTrafficRadiusPatch(exe);
     Log(
-        "Config: MapDetailLODThresholdScale=%.3f VehicleLODThresholdScale=%.3f VehicleFullDetail=%d VehicleDrawDistance=%.0f TrafficSpawnRadius=%.0f TrafficDiagnostics=%d DRLFlares=%d/%d/%d CockpitPassengers=%d",
+        "Config: MapDetailLODThresholdScale=%.3f VehicleLODThresholdScale=%.3f VehicleFullDetail=%d VehicleDrawDistance=%.0f TrafficSpawnRadius=%.0f TrafficDiagnostics=%d DRLFlares=%d/%d/%d CockpitPassengers=%d ShadowMapSize=%d",
         static_cast<double>(g_map_detail_lod_threshold_scale),
         static_cast<double>(g_vehicle_lod_threshold_scale),
         g_vehicle_full_detail ? 1 : 0,
@@ -4011,7 +4078,8 @@ void ApplyPatches()
         g_drl_flare_curves[0].enabled ? 1 : 0,
         g_drl_flare_curves[1].enabled ? 1 : 0,
         g_drl_flare_curves[2].enabled ? 1 : 0,
-        g_cockpit_passengers ? 1 : 0
+        g_cockpit_passengers ? 1 : 0,
+        g_shadow_map_size
     );
 }
 
