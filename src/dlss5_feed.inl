@@ -91,6 +91,10 @@ void DlaaNoteConstants(UINT start, UINT count);
 void DlaaNotePass(const void* surface, DWORD target_set);
 void DlaaSkipDraw(IDirect3DDevice9* device);
 void DlaaOnReset();
+// Hotkeys (toggles.inl)
+extern bool g_d5_nr_on;
+extern bool g_dlaa_on;
+void TogglesFrameEnd(IDirect3DDevice9* device);
 // The game's render resolution: the back buffer size it asked for (BorderlessWindowed makes the
 // swap chain the monitor's size), else the back buffer's.
 UINT D5RenderWidth()
@@ -1348,7 +1352,7 @@ void D5BeforeDraw(IDirect3DDevice9* device, UINT prims, UINT vertices)
             D5Publish(device, DSFE5_POINT_PRE_HUD);
             // Input=0: downstream of the scene end, so with DLAA on DLSS 5 sees its anti-aliased
             // scene (through the game's post chain).
-            if (g_d5_nr && g_d5_input == 0) {
+            if (g_d5_nr && g_d5_nr_on && g_d5_input == 0) {
                 D5BridgeFrame(device, D5_RUN_NR_PRE_HUD);
                 if (g_d5_trace_frame != nullptr && g_d5_trace_dump && g_d5_trace_pair_step != 0) {
                     D5DumpSurface(device, g_d5.rt0, "pre-hud-dlss5");
@@ -1548,15 +1552,16 @@ void D5LeavePass(IDirect3DDevice9* device)
         // DLAA on the HDR scene target, here, after the scene's opaque and blended draws (glass,
         // skid marks, full-size particles) and before the first post pass reads it. Its output
         // goes back into the scene target, so everything after (DLSS 5 and the post chain) sees it.
+        // Turned off by its hotkey, DLAA is skipped and the frame goes on as without it.
         if (g_dlaa_enable) {
-            const bool dlaa_ran = D5BridgeFrame(device, D5_RUN_DLAA);
+            const bool dlaa_ran = g_dlaa_on && D5BridgeFrame(device, D5_RUN_DLAA);
             DlaaNoteSceneEnd(device, dlaa_ran);
             if (t != nullptr && g_d5_trace_dump && g_d5_trace_pair_step != 0) {
                 D5DumpSurface(device, g_d5_scene_rt, "scene-end-dlaa");
             }
         }
         // Input=1: DLSS 5 on the HDR scene target, on DLAA's output when DLAA is on.
-        if (g_d5_nr && g_d5_input == 1) {
+        if (g_d5_nr && g_d5_nr_on && g_d5_input == 1) {
             D5BridgeFrame(device, D5_RUN_NR_HDR);
             if (t != nullptr && g_d5_trace_dump && g_d5_trace_pair_step == 1) {
                 D5DumpSurface(device, g_d5_scene_rt, "scene-end-dlss5");
@@ -1746,6 +1751,7 @@ void D5FrameEnd(IDirect3DDevice9* device)
     }
 
     D5FrameTimeTick();
+    TogglesFrameEnd(device);   // after the HUD; before DLAA decides the next frame's jitter
     DlaaFrameEnd(device);
     InterlockedIncrement(&g_d5_frame_index);
     g_d5_frame_best_rt = nullptr;

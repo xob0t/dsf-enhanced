@@ -2,7 +2,8 @@
 // turns it on:
 //  - Enable: DLAA (DLSS Super Resolution at the render size) through the helper, at the scene
 //    end (dlss5_bridge.inl), with the three parts below. DisableMLAA and DisableSwapChainMSAA
-//    follow it unless set.
+//    follow it unless set. Its hotkey (toggles.inl) turns it off and on at run time: off, the scene
+//    end skips DLAA, and the gate below stops the jitter and lets MLAA run as on a failed frame.
 //  - Jitter: moves the scene pass by a sub-pixel Halton (2,3) offset each frame, through vertex
 //    shaders patched at creation (vs_jitter_patch.h). The constant J (c255) holds the clip-space
 //    offset and is zero outside the scene pass, so shadows, the minimap, post and the HUD stay put,
@@ -61,6 +62,7 @@ int g_dlaa_second_pass_draws = 0;
 int g_dlaa_split_hold = 0;
 
 bool D5DlaaProducing(UINT w, UINT h);
+extern bool g_dlaa_on;   // toggles.inl: off by its hotkey
 
 // A [DLAA] switch that Enable sets unless the ini says otherwise: -1 when missing, empty or "auto".
 int DlaaReadSwitch(const char* key, const char* ini_path)
@@ -325,12 +327,12 @@ void DlaaDecideNextFrame()
         g_dlaa_split_frame = true;
     }
     g_dlaa_split_hold = g_dlaa_split_frame ? kDlaaSplitHoldFrames : std::max(0, g_dlaa_split_hold - 1);
-    const bool jitter = g_dlaa_split_hold == 0 && D5DlaaProducing(D5RenderWidth(), D5RenderHeight());
+    const bool jitter = g_dlaa_on && g_dlaa_split_hold == 0 && D5DlaaProducing(D5RenderWidth(), D5RenderHeight());
     static int changes = 0;
     if (jitter != g_dlaa_jitter_frame && changes < 20) {
         ++changes;
         Log("DLAA: jitter %s from frame %ld%s", jitter ? "on" : "off", static_cast<long>(g_d5_frame_index + 1),
-            jitter ? "" : g_dlaa_split_hold > 0 ? " (split screen)" : " (DLAA had no output this frame)");
+            jitter ? "" : !g_dlaa_on ? " (DLAA turned off)" : g_dlaa_split_hold > 0 ? " (split screen)" : " (DLAA had no output this frame)");
     }
     g_dlaa_jitter_frame = jitter;
     g_dlaa_output_frame = false;
