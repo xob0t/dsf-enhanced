@@ -20,7 +20,8 @@ horizontal plane, so the cards lie flat facing up, and draws them with a clone
 of an ordinary alpha-tested material (a palm's) holding the tree's texture.
 Float16 positions lose precision away from the cell centre (0.25 m beyond 256 m),
 which only foliage uses. Copies are grouped by material, flag and vertex layout, welded, and
-split into submodels of at most 65,535 vertices (16-bit indices).
+split into submodels of at most 65,535 vertices (16-bit indices). Before that, building
+detail is kept off the base's building shells (dsfworld.walls).
 """
 
 from __future__ import annotations
@@ -31,6 +32,7 @@ from dataclasses import dataclass, field
 
 import numpy as np
 
+from dsfworld import walls
 from dsfworld.formats import gebi, modl
 from dsfworld.formats.archive import SubModel
 from dsfworld.formats.modl import COLOUR, FLOAT16, FLOAT32, INT16, NORMAL, POSITION, POSITION_SCALE, UBYTE4, UV0, UV1
@@ -163,6 +165,9 @@ class BakeOptions:
     min_size: dict[int, float] = field(default_factory=dict)  # class -> smallest placed model kept, metres
     leaf_cards: str = "keep"  # "keep", "flat" (expand with cards) or "drop"
     cards: CardTemplate | None = None
+    wall_classes: frozenset[int] = frozenset()  # classes kept off the shells (dsfworld.walls)
+    wall_offset: float = 0.0  # metres; 0: not pushed off
+    drop_duplicates: bool = False  # leave out faces of wall_classes that repeat a shell or baked face
 
 
 @dataclass(frozen=True)
@@ -253,6 +258,7 @@ def face_up(tri: np.ndarray, q: np.ndarray, up: np.ndarray) -> np.ndarray:
 class Result:
     groups: list[Group]
     skipped: Counter = field(default_factory=Counter)  # reason -> submodel placements
+    walls: Counter = field(default_factory=Counter)  # what keeping detail off the shells did
 
 
 def unsupported(elements: tuple) -> str | None:
@@ -334,15 +340,16 @@ def bake_region(
     keep: set[int],
     *,
     options: BakeOptions | None = None,
+    shells: walls.Shells | None = None,
 ) -> Result:
     """Copy the submodels of the classes in keep placed by instances into the frame of target (a 4x4
     matrix), grouped by material, flag and vertex layout, with options' offset, exclusions, size limits
-    and leaf-card handling."""
+    and leaf-card handling, and options' wall classes kept off shells."""
     options = options or BakeOptions()
-    pieces: dict[tuple, list] = {}
+    placed: list[tuple[tuple, int, int, Vertices]] = []  # (group key, instance, material, vertices)
     decls: dict[tuple, bytes] = {}
     skipped: Counter = Counter()
-    for inst in instances:
+    for k, inst in enumerate(instances):
         part = lib.parts.get(inst.model_uid)
         lod = part.finest_lod() if part else None
         if lod is None:
@@ -368,8 +375,44 @@ def bake_region(
                 skipped["outside the target frame"] += 1
                 continue
             decls[v.layout] = v.decl
-            pieces.setdefault((sub.material, key_flag, v.layout, retarget), []).append((v.rows, v.triangles))
-    return Result([weld(key, p, decls[key[2]]) for key, p in pieces.items()], skipped)
+            placed.append(((sub.material, key_flag, v.layout, retarget), k, sub.material, v))
+    stats: Counter = Counter()
+    adjusted = bool(options.wall_classes) and (options.wall_offset > 0 or options.drop_duplicates)
+    if adjusted:
+        keep_off_walls(world, placed, target, shells, options=options, stats=stats)
+    pieces: dict[tuple, list] = {}
+    for key, _, _, v in placed:
+        pieces.setdefault(key, [])
+        if len(v.triangles) or not adjusted:
+            pieces[key].append((v.rows, v.triangles))
+    stats["submodels emptied"] += sum(not p for p in pieces.values())
+    groups = [weld(key, p, decls[key[2]]) for key, p in pieces.items() if p]
+    return Result(groups, skipped, stats)
+
+
+def keep_off_walls(world: World, placed: list, target: np.ndarray, shells, *, options: BakeOptions, stats: Counter):
+    """Move the placed models with faces of options' wall classes off the shells and drop duplicate faces
+    (dsfworld.walls), in place. A model's other pieces (not leaf cards) move with it."""
+    a, t = target[:3, :3], target[3, :3]
+    walled = {k for _, k, m, _ in placed if world.class_index(m) in options.wall_classes}
+    which, pieces = [], []
+    for i, (_, k, m, v) in enumerate(placed):
+        slot = position_slot(v.elements)
+        if k in walled and slot[0] == POSITION:
+            p = read_positions(v.rows, slot) @ a + t
+            pieces.append(walls.Piece(k, m, p, v.triangles, world.class_index(m) in options.wall_classes))
+            which.append(i)
+    result = walls.plan(pieces, shells, options.wall_offset, dedupe=options.drop_duplicates)
+    stats.update(result.stats)
+    to_target = np.linalg.inv(a)
+    for i, move, keep in zip(which, result.moves, result.keep, strict=True):
+        v = placed[i][3]
+        slot = position_slot(v.elements)
+        if move.any() and not write_positions(v.rows, slot, read_positions(v.rows, slot) + move @ to_target):
+            stats["pushed outside the target frame"] += 1
+        if not keep.all():
+            used, remap = np.unique(v.triangles[keep], return_inverse=True)
+            v.rows, v.triangles = v.rows[used], remap.reshape(-1, 3)
 
 
 def _wanted(world: World, material: int, keep: set[int], options: BakeOptions, placed_size: float) -> bool:

@@ -87,6 +87,20 @@ fill_drop = 2.0
 # Baked classes that count as covering the stock terrain (seen from above) for
 # that fill. Trees don't: the ground under them still needs filling.
 fill_cover = ["ground"]
+# Building detail (storefronts, facade panels, signs, roof plates) lies on the
+# base's building shells, within centimetres in front or behind; from upper Shift
+# the two z-fight. A placed model of wall_classes with faces that face the same
+# way as a shell face, overlap it and lie within wall_offset metres of it is
+# pushed out along that face's normal by wall_offset, plus as far as its deepest
+# such face lay behind (at most 2 x wall_offset); a model that wraps a building
+# is pushed off each wall per vertex. 0 leaves the detail where it is.
+wall_offset = 0.3
+# The classes kept off the shells; the shells are the base's own submodels of
+# these classes.
+wall_classes = ["buildings"]
+# Leave out faces of wall_classes that repeat a shell face, or another baked
+# face of the same material (corners within 2 cm, same facing).
+drop_duplicates = true
 
 [simplify]
 # Classes simplified (leaf cards and other small open meshes don't simplify well).

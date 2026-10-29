@@ -1,6 +1,8 @@
 """bake: copy each detailed region's chosen classes into the stock base part at its cell.
 
 Writes <work_dir>/bake/<region>.pkl (the baked groups) and bake/summary.tsv.
+Building detail is kept off the base's building shells ([bake] wall_offset,
+drop_duplicates; dsfworld.walls); the summary counts what that moved and left out.
 A region is rebuilt when its file is missing or its cache key changed: VERSION,
 the [game], [classes], [bake] and [simplify] settings, and the source archive's
 name and size. Regions whose cell has no stock part to replace are listed and
@@ -12,19 +14,21 @@ from __future__ import annotations
 import pickle
 from collections import Counter
 from dataclasses import dataclass
+from functools import cached_property
 from pathlib import Path
 
 import numpy as np
 
-from dsfworld import bake, config, simplify, ui
+from dsfworld import bake, config, simplify, ui, walls
 from dsfworld.config import Config
+from dsfworld.formats import modl
 from dsfworld.formats.modl import POSITION, UV0, Lod
 from dsfworld.gegr import CellBake
 from dsfworld.world import World
 
 SECTIONS = ("game", "classes", "bake", "simplify")
 # Part of the cache key: raise when the bake or simplification output changes for the same settings.
-VERSION = 9
+VERSION = 10
 
 
 def output_dir(cfg: Config) -> Path:
@@ -100,12 +104,17 @@ def settings(cfg: Config, world: World) -> Settings:
     if b["leaf_cards"] not in ("flat", "keep", "drop"):
         raise SystemExit('[bake] leaf_cards must be "flat", "keep" or "drop"')
     min_size = class_indices(cfg, world, "bake", "min_model_size")
+    if b["wall_offset"] < 0:
+        raise SystemExit("[bake] wall_offset must be 0 or more")
     options = bake.BakeOptions(
         height_offset=b["height_offset"],
         exclude=tuple(b["exclude"]),
         min_size={i: b["min_model_size"][c] for c, i in min_size.items()},
         leaf_cards=b["leaf_cards"],
         cards=card_template(world, b["leaf_card_material"]) if b["leaf_cards"] == "flat" else None,
+        wall_classes=frozenset(class_indices(cfg, world, "bake", "wall_classes").values()),
+        wall_offset=b["wall_offset"],
+        drop_duplicates=b["drop_duplicates"],
     )
     return Settings(
         keep=frozenset(class_indices(cfg, world, "bake", "classes").values()),
@@ -121,15 +130,46 @@ def settings(cfg: Config, world: World) -> Settings:
     )
 
 
+def shell_corners(world: World, classes: frozenset[int]) -> np.ndarray:
+    """(M, 3, 3) world-space triangles of the base LOD's submodels of classes: the building shells."""
+    lib, out = world.library, []
+    for inst in world.base_instances():
+        part = lib.parts.get(inst.model_uid)
+        lod = part.finest_lod() if part else None
+        for su in lod.submodels if lod else []:
+            sub = lib.submodels.get(su)
+            if sub is None or sub.vb not in lib.vbs or world.class_index(sub.material) not in classes:
+                continue
+            p, t = modl.submodel_geometry(lib, sub)
+            if np.linalg.det(inst.matrix[:3, :3]) < 0:
+                t = t[:, ::-1]
+            out.append((p @ inst.matrix[:3, :3] + inst.matrix[3, :3])[t])
+    return np.concatenate(out) if out else np.zeros((0, 3, 3))
+
+
+def shells(world: World, settings: Settings) -> walls.Shells | None:
+    """The shells to keep wall classes off, or None when nothing is kept off them."""
+    o = settings.options
+    if not (o.wall_classes & settings.keep) or (o.wall_offset <= 0 and not o.drop_duplicates):
+        return None
+    return walls.Shells.of(shell_corners(world, o.wall_classes), o.wall_offset)
+
+
 def bake_cell(
-    world: World, name: str, target: np.ndarray, *, stock_terrain: list[tuple[int, int]], settings: Settings
+    world: World,
+    name: str,
+    target: np.ndarray,
+    *,
+    stock_terrain: list[tuple[int, int]],
+    settings: Settings,
+    shells: walls.Shells | None = None,
 ) -> tuple[bake.Result, bool]:
-    """One region baked into the frame of target, simplified by class, with the stock terrain it leaves
-    uncovered kept as fill. Also whether the bake covers the stock terrain at all: if not, the cell keeps
-    its stock terrain submodels as they are."""
+    """One region baked into the frame of target, its wall classes kept off shells, simplified by class,
+    with the stock terrain it leaves uncovered kept as fill. Also whether the bake covers the stock terrain
+    at all: if not, the cell keeps its stock terrain submodels as they are."""
     s = settings
     lib, g = world.region(name)
-    result = bake.bake_region(world, lib, g.instances, target, s.keep, options=s.options)
+    result = bake.bake_region(world, lib, g.instances, target, s.keep, options=s.options, shells=shells)
     to_simplify = [x for x in result.groups if world.class_index(x.material) in s.simplified]
     rest = [x for x in result.groups if world.class_index(x.material) not in s.simplified]
     to_simplify = simplify.cell(to_simplify, s.error, s.normal_weight, s.colour_weight, lock_border=s.lock_border)
@@ -166,6 +206,11 @@ class _Run:
     digest: str
     force: bool
 
+    @cached_property
+    def shells(self) -> walls.Shells | None:
+        """Built on first use, so a run that bakes nothing doesn't index them."""
+        return shells(self.world, self.settings)
+
 
 def _bake_one(run: _Run, name: str) -> tuple[CellBake, dict] | None:
     """One region's CellBake and its cache entry (baked now or loaded), or None if its cell has no stock part."""
@@ -182,12 +227,15 @@ def _bake_one(run: _Run, name: str) -> tuple[CellBake, dict] | None:
     if cached is None:
         flags = dict(zip(lod.submodels, lod.flags, strict=True))
         terrain = [(s, flags[s]) for s in lod.submodels if s in replaced]
-        result, covered = bake_cell(world, name, matrix, stock_terrain=terrain, settings=run.settings)
+        result, covered = bake_cell(
+            world, name, matrix, stock_terrain=terrain, settings=run.settings, shells=run.shells
+        )
         cached = {
             "digest": run.digest,
             "part": part_uid,
             "groups": result.groups,
             "skipped": result.skipped,
+            "walls": result.walls,
             "covered": covered,
         }
         _save(path, cached)
@@ -213,6 +261,7 @@ def run(cfg: Config, world: World, *, force: bool = False) -> list[CellBake]:
     names = world.region_names(cfg.section("regions")["select"])
     cells, rows, no_target = [], [], []
     skipped: Counter = Counter()
+    moved: Counter = Counter()
     with ui.progress() as bar:
         task = bar.add_task("Baking regions", total=len(names))
         for name in names:
@@ -225,14 +274,15 @@ def run(cfg: Config, world: World, *, force: bool = False) -> list[CellBake]:
             cell, cached = done
             cells.append(cell)
             skipped.update(cached["skipped"])
+            moved.update(cached["walls"])
             tris = sum(len(g.triangles) for g in cell.groups)
             verts = sum(len(g.vertices) for g in cell.groups)
             rows.append([name, len(cell.groups), verts, tris, sum(cached["skipped"].values())])
-    _report(out, rows, no_target, skipped)
+    _report(out, rows, no_target, skipped, moved)
     return cells
 
 
-def _report(out: Path, rows: list[list], no_target: list[str], skipped: Counter) -> None:
+def _report(out: Path, rows: list[list], no_target: list[str], skipped: Counter, moved: Counter) -> None:
     with (out / "summary.tsv").open("w", encoding="utf-8") as f:
         f.write("region\tgroups\tvertices\ttriangles\tskipped_placements\n")
         f.writelines("\t".join(map(str, r)) + "\n" for r in rows)
@@ -241,4 +291,6 @@ def _report(out: Path, rows: list[list], no_target: list[str], skipped: Counter)
         ui.note(f"{len(no_target)} regions are open sea or the map edge: nothing to replace there")
     if skipped:
         ui.note("Left out: " + ", ".join(f"{v} placements ({k})" for k, v in skipped.most_common()))
+    if +moved:
+        ui.note("Kept off the building shells: " + ", ".join(f"{k} {v:,}" for k, v in sorted((+moved).items())))
     ui.note(f"Per region: {out / 'summary.tsv'}")

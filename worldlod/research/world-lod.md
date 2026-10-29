@@ -1,6 +1,6 @@
 # World LOD: replacing the upper-Shift base mesh
 
-Updated: 2026-10-28
+Updated: 2026-10-29
 
 Goal: upper Shift levels (user levels 3/4, internal 4/5) draw the city's low
 "base" LOD, which looks poor, mainly the ground and the textures. The plan is to
@@ -339,3 +339,112 @@ next to what it bakes.
   continues the pool in an extension block. With it, the VM run loaded, drove
   and Shifted; the table peaked at 15,523. Peak process memory: 1,873 MB
   virtual (ground only 1,432 MB); Driver.exe is large-address-aware.
+
+## Building detail z-fighting with the shells (2026-10-29)
+
+The user saw some distant buildings flicker in upper Shift with the full map,
+and not with `--no-buildings`. `worldlod overlaps` counts what could fight:
+pairs of faces that face the same way (normals within 5 degrees), overlap seen
+along the second face's normal by more than 1 cm, and have every corner within
+a band of the second face's plane.
+
+- **Detail against the shells (static).** The detailed regions' storefronts,
+  facade panels, signs and roof plates lie on walls close to the base's
+  building shells but not on them: of the 5.21M building detail faces baked
+  (250 cells), 13,186 pairs with a shell face lie within 2 cm, 31,490 within
+  5 cm, 53,508 within 10 cm and 165,501 within 30 cm. In R_360, of the pairs
+  within 10 cm, the median face is 2 mm in front of the shell, 5-95% from 7 cm
+  behind to 8 cm in front. Copies of shell faces: 2. Hundreds of metres away
+  the depth buffer can't separate such surfaces. The worst cells (R_267,
+  R_564, R_300, R_361, R_333) have 680-960 pairs within 5 cm.
+- **Detail against detail.** 106,017 pairs within 2 cm, about nine in ten of
+  them inside one placed model and mostly in one atlas material
+  (`alley_01_cream_groundfloor`: layered panels and trims). Repeats of a face
+  in the same material: 773 pairs. Repeats across regions (a model placed by
+  two neighbouring cells): 43 triangles in the whole city.
+- **Depth bias.** 35 materials (28 buildings, 7 terrain) are
+  `detail_zbias_*` / `decal_zbias_*` variants: fences, fire-escape rails,
+  roof stains, some storefront and window panels, kerbs and road paint. Their
+  MARPs equal the plain variant's; only the GPU programs differ, and those of
+  all six techniques (the far 0xF59DDF6D included) read a shader constant
+  `g_zbias` that no material sets (GPPM lists it like `s_CamPos`, so the
+  engine supplies it). No MACO sets the `rs_zbias` render state, a name
+  Driver.exe knows. The bake draws building detail with its own MACOs (only
+  leaf cards are cloned, from `trees/palm_02`), so it keeps whatever bias the
+  engine applies; whether the engine sets `g_zbias` for base draws is not
+  traced.
+
+**Fix** (`dsfworld/walls.py`; `[bake] wall_offset = 0.3`, `wall_classes`,
+`drop_duplicates`). In each region, before welding, a placed model of
+`wall_classes` whose faces lie within `wall_offset` of a shell face (in front or
+behind, same facing, overlapping) is pushed out along that face's normal, by
+`wall_offset` plus how far its deepest such face lay behind. One translation
+moves the whole model when one fits every wall it touches (least squares over
+the walls' normals, clustered within 30 degrees). A face that the translation
+puts near another shell face (a second wall in front of the first, an opposite
+wall, or a wall it slides along into overlap) asks to clear that one too, for up
+to four more tries, if it lay no more than `wall_offset` behind it, so no push
+exceeds 2 x `wall_offset`. A model that no translation fits (it wraps a
+building: faces on opposite walls) moves per vertex: vertices welded by position
+(1 mm), each pushed off the walls of its faces, with the same retries; vertices
+that share a position move alike, so no crack opens. The model's pieces of other
+classes move with it. Before the push, faces of `wall_classes` that repeat a
+shell face or an earlier baked face of the same material (corners within 2 cm, matched one to
+one in winding order; candidates share a cell of 4 cm for their centroid in one
+of eight staggered grids) are left out, and a submodel left empty is dropped.
+The shells are the base LOD's own submodels of `wall_classes` (465k
+triangles), indexed once per run. With `wall_offset = 0` and
+`drop_duplicates = false` the build is the previous default byte for byte.
+
+| | before | after |
+| --- | ---: | ---: |
+| shell pairs within 2 cm | 13,186 | 49 |
+| within 5 cm | 31,490 | 269 |
+| within 10 cm | 53,508 | 700 |
+| within 30 cm | 165,501 | 10,150 |
+| copies of shell faces | 2 | 0 |
+| baked pairs within 2 cm (mostly inside one model) | 106,017 | 107,031 |
+| baked repeats (same material) | 773 | 42 |
+| triangles | 8,491,887 | 8,490,921 |
+| submodels | 14,424 | 14,424 |
+| archive | 795,455,488 B | 795,435,008 B |
+| geometry | 260 MB in 125 groups | 260 MB in 125 groups |
+| GEGR streamer budget | 352 MB | 352 MB |
+| build at idle priority | 1:53 | 3:28 |
+
+10,969 models moved as a whole, 3,086 per vertex (38 vertices found no
+translation); 964 repeated faces and 2 copies of shell faces left out, no
+submodel emptied. The 30 cm band keeps faces that end just short of 0.3 m
+(pushes are accepted at 90%, and int16 positions round to 1/64 m). Of the 269
+pairs left within 5 cm, 157 are in R_570: faces 0.31 m behind a shell that a
+push of their model brings onto it. Pairs inside one model (layered trims of
+one atlas) stay as the game has them.
+
+**Choosing `wall_offset`.** Shell pairs left in the ten worst cells (R_267,
+R_564, R_300, R_361, R_333, R_570, R_239, R_591, R_360, R_332):
+
+| `wall_offset` | within 2 cm | within 5 cm | within 10 cm |
+| --- | ---: | ---: | ---: |
+| 0 (before) | 3,332 | 6,529 | 9,602 |
+| 0.2 m | 4 | 66 | 367 |
+| 0.3 m | 27 | 164 | 208 |
+| 0.5 m | 9 | 9 | 19 |
+
+0.2 m leaves more within 10 cm; 0.3 and 0.5 m are alike but for R_570 (157 of
+0.3 m's 164 pairs within 5 cm), whose 0.31 m recess only the larger band
+reaches. 0.3 m is the default: half the displacement of 0.5 m at the closest
+upper-Shift level, for the same result elsewhere.
+
+**VM check** (runtime, 2026-10-29; `run-series.ps1 -Vm`, 1600 x 900, the
+save's Shift overview held for 25 shots 3 s apart: `vm1-20261029-103205` before,
+`vm1-20261029-122946` after). Both builds load and hold the overview; the
+buildings, their detail and the trees look the same
+(`img/zfight-vm-overview.jpg`). At that height a building is a few pixels, and
+from one shot to the next the overview's animated haze and glare change the
+picture far more than any wall could
+(`img/zfight-vm-downtown.jpg`, two consecutive shots of downtown at 2x): pixels
+whose high-pass value jumps in at least a third of the pairs are 0.05% of the
+city before and 0.09% after, both haze. So the VM shows no flicker either way
+and can't confirm the fix; the lower upper-Shift level, where the user saw it,
+wasn't reached (a zoom tap at 2-3 frames a second is lost, or the probe's car
+takes the game out of the overview).
