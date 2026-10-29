@@ -1,6 +1,6 @@
 # World LOD: replacing the upper-Shift base mesh
 
-Updated: 2026-10-28
+Updated: 2026-10-29
 
 Goal: upper Shift levels (user levels 3/4, internal 4/5) draw the city's low
 "base" LOD, which looks poor, mainly the ground and the textures. The plan is to
@@ -445,3 +445,68 @@ at 3440 x 1440). Each run loads the save into the Shift overview, holds it
 | v1.2.0 | 14,409 | 775 MB | 332 MB |
 | blocks | 12,177 | 775 MB | 332 MB |
 | blocks + atlas (default) | 11,183 | 780 MB | 337 MB |
+
+### Measured (VM, entries in a frame's queue)
+
+The highest frame of each second, from the counter's log; "peak" is the
+highest of the run, which for every worldlod build is the frame where the
+world becomes ready and all ten secondary viewports render the whole map at
+once (the 11,264 driversf-forza logged). "Overview" is the value the Shift
+overview settles at once GEGR has streamed in (the save's camera; the same
+in every run). Street and driving are the highest frames after zooming down
+and while driving; there traffic and people dominate and vary from run to
+run, so worldlod's own draws are given too.
+
+| 16:9 | stock | v1.2.0 | PR #8 settings | blocks | blocks + atlas |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| peak (world ready) | 6,338-6,624 | 11,725-12,034 | 12,035 | 10,936 | 10,073 |
+| overview | 1,226 | 10,570 | 10,583 | 8,920 | 8,360 |
+| worldlod's draws in that overview | - | 9,500 | 9,520 | | 7,298 |
+| street, highest | 3,353-3,619 | 5,721 | | | (1) |
+| driving, highest | 3,700-4,927 | 7,269 | | | (1) |
+
+(1) Not measured at 16:9: two runs stayed in the overview (below); the 21:9
+runs cover street and driving.
+
+| 21:9 frustum | stock | v1.2.0 | blocks + atlas |
+| --- | ---: | ---: | ---: |
+| peak (world ready) | 3,929 | 11,683 | 10,031 |
+| overview after 60 s | 1,011 | 8,961 | 7,076 |
+| street, highest (worldlod's own) | 4,334 | 6,461 (579) | 5,561 (355) |
+| driving, highest (worldlod's own) | 3,786 | 4,282 (442) | 5,854 (455) |
+
+The peak frame of the default build still holds 8,274 worldlod draws, 5,465
+of them ground: ground per cell is now the biggest share. Runs:
+`vm1-20261029-052155`, `vm2-20261029-064316`, `vm2-20261029-065945` (stock);
+`vm2-20261029-052211`, `vm2-20261029-065124`, `vm1-20261029-075847` (v1.2.0);
+`vm2-20261029-052829` (PR #8); `vm1-20261029-054628` (blocks);
+`vm1-20261029-065831`, `vm2-20261029-074542`, `vm2-20261029-080200` (blocks +
+atlas).
+
+**Memory.** With GEGR loaded the engine's submodel table holds 12,280 entries
+(v1.2.0: 15,506; the stock pool has 15,000 nodes, "Submodel table limit"
+above). Peak private memory in the 21:9 runs: 1,702 MB against 1,692 MB.
+
+**Street level.** The main view draws baked parts only of cells 396 m and more
+from the car, and no block part at all (any pass, any distance), while block
+parts draw at every upper-Shift level of the descent, in step with the cell
+parts (about 0.23 block draws per cell draw). So from the street the distant
+cells show their baked ground but not their baked buildings and trees, as in
+the stock game; v1.2.0 drew those too. Not traced why; block instances sit in
+coarser SCND nodes than the cells' (the deepest node that holds their 1 km
+box), which the street-level walk may not visit.
+
+**Visual check.** Offline, `worldlod render` of 1 km around R_360 draws the
+same 171,712 triangles for v1.2.0 and the default build; blurred by 4 px, 0.6%
+of the pixels differ by more than 30 (the preview point-samples, so unblurred
+images differ in speckle). In game, the settled overview of the two builds
+(`img/draws-overview-v120-vs-blocks.jpg`, crop
+`img/draws-overview-crop-v120-vs-blocks.jpg`) shows the same buildings, trees
+and roads; haze and glare differ between the runs. The offline render pair is
+`img/draws-render-v120-vs-blocks.jpg`.
+
+**Test harness notes.** The VM's desktop is 1600 x 900, so 21:9 is the user's
+frustum on a 16:9 window. With a fully loaded worldlod overview the VM renders
+2-3 frames a second and the harness's 120 ms key taps get lost: those runs
+stayed in the overview (which is how the settled overview values were read).
+A scratch copy of the harness with 900 ms taps zoomed and drove.
