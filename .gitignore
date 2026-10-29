@@ -14,3 +14,8 @@ __pycache__/
 .pytest_cache/
 .ruff_cache/
 worldlod/native/build/
+
+# DLSS 5 helper: build output, the fetched NVIDIA SDK, and local scratch (NGX runtime, test runs).
+dlss5/build/
+dlss5/external/
+/out/

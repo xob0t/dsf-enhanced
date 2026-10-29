@@ -96,6 +96,8 @@ The workflow then runs worldlod's tests and lint and `build.ps1` on that tag, an
 
 - `src/` has the plugin source and the default `dsf_enhanced.ini`.
 - `tests/` has the cinematic fit test. `build.ps1` runs it and stops if it fails.
+- `dlss5/` has the experimental DLSS 5 helper: a 64-bit process that runs NVIDIA's DLSS 5 pass for the 32-bit game, and its offscreen tests. It has its own build script and README and is not part of the release package yet.
+- `research/` has design notes.
 - `third_party/winmm.dll` is the bundled [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader), MIT-licensed.
 - `worldlod/` is the map pipeline (Python, `src/dsfworld/`), its release launcher (`release/`), the vendored meshoptimizer simplifier (`native/`, MIT) and its research notes.
 
