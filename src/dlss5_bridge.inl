@@ -51,6 +51,7 @@ float g_d5_structure_strength = 0.7f;
 float g_d5_skin_strength = 0.5f;
 float g_d5_cockpit_depth = 1.5f;
 bool g_d5_frame_time_log = false;
+bool g_d5_crash_dump = false;
 
 constexpr DWORD kD5HelloTimeoutMs = 20000;      // the helper loads and checks the runtime, starts NGX
 constexpr DWORD kD5ConfigureTimeoutMs = 20000;  // creates the feature
@@ -80,6 +81,7 @@ void LoadDlss5BridgeConfig(const char* ini_path)
     g_d5_skin_strength = std::max(0.0f, std::min(ReadProfileFloat("DLSS5", "SkinStrength", 0.5f, ini_path), 1.0f));
     g_d5_cockpit_depth = std::max(0.0f, std::min(ReadProfileFloat("DLSS5", "CockpitDepth", 1.5f, ini_path), 10.0f));
     g_d5_frame_time_log = GetPrivateProfileIntA("DLSS5", "FrameTimeLog", 0, ini_path) != 0;
+    g_d5_crash_dump = GetPrivateProfileIntA("DLSS5", "CrashDump", 0, ini_path) != 0;
 }
 
 template <typename T>
@@ -152,8 +154,6 @@ void D5FrameTimeTick()
 // alive; the map only remembers which texture a surface belongs to.
 
 constexpr D3DFORMAT kD5FormatIntz = static_cast<D3DFORMAT>(MAKEFOURCC('I', 'N', 'T', 'Z'));
-SRWLOCK g_d5_intz_lock = SRWLOCK_INIT;
-std::unordered_map<const void*, IDirect3DTexture9*> g_d5_intz;
 
 bool D5CreateIntzDepth(IDirect3DDevice9* device, UINT w, UINT h, IDirect3DSurface9** out)
 {
@@ -168,19 +168,26 @@ bool D5CreateIntzDepth(IDirect3DDevice9* device, UINT w, UINT h, IDirect3DSurfac
         return false;
     }
     texture->Release();   // the surface holds the texture
-    AcquireSRWLockExclusive(&g_d5_intz_lock);
-    g_d5_intz[surface] = texture;
-    ReleaseSRWLockExclusive(&g_d5_intz_lock);
     *out = surface;
     return true;
 }
 
-IDirect3DTexture9* D5IntzTextureOf(const void* surface)
+// The INTZ texture a depth surface belongs to (a reference the caller releases), or null.
+IDirect3DTexture9* D5IntzTextureOf(const void* surface_object)
 {
-    AcquireSRWLockShared(&g_d5_intz_lock);
-    auto it = g_d5_intz.find(surface);
-    IDirect3DTexture9* texture = it != g_d5_intz.end() ? it->second : nullptr;
-    ReleaseSRWLockShared(&g_d5_intz_lock);
+    if (surface_object == nullptr) {
+        return nullptr;
+    }
+    auto* surface = static_cast<IDirect3DSurface9*>(const_cast<void*>(surface_object));
+    IDirect3DTexture9* texture = nullptr;
+    if (FAILED(surface->GetContainer(IID_IDirect3DTexture9, reinterpret_cast<void**>(&texture))) || texture == nullptr) {
+        return nullptr;
+    }
+    D3DSURFACE_DESC desc = {};
+    if (FAILED(texture->GetLevelDesc(0, &desc)) || desc.Format != kD5FormatIntz) {
+        texture->Release();
+        return nullptr;
+    }
     return texture;
 }
 
@@ -216,6 +223,8 @@ double g_d5_bridge_gpu_ms_sum = 0.0;
 DXGI_FORMAT g_d5_slot_formats[DSF_DLSS5_SLOT_COUNT] = {DXGI_FORMAT_B8G8R8A8_UNORM, DXGI_FORMAT_R8G8B8A8_UNORM, DXGI_FORMAT_R32_FLOAT,
     DXGI_FORMAT_R16G16_FLOAT, DXGI_FORMAT_UNKNOWN};
 
+void D5RemoveExceptionHandler();
+
 void D5BridgeFail(const char* what)
 {
     Log("DLSS5 helper: %s; DLSS 5 off for this session (the game's own image is shown)", what);
@@ -223,6 +232,7 @@ void D5BridgeFail(const char* what)
     if (g_d5_worker_event != nullptr) {
         SetEvent(g_d5_worker_event);   // the worker sends SHUTDOWN and ends
     }
+    D5RemoveExceptionHandler();
 }
 
 // A frame failed but the connection still works: CONFIGURE again, a few times at most.
@@ -458,7 +468,7 @@ bool D5VkInit(IDirect3DDevice9* device)
 }
 
 // Waits for every submission of ours, so imported images can be released. Bounded.
-void D5VkWaitIdle()
+bool D5VkWaitIdle()
 {
     vkm::VkFence fences[2 * kD5VkRing] = {};
     for (int kind = 0; kind < 2; ++kind) {
@@ -469,7 +479,9 @@ void D5VkWaitIdle()
     if (g_d5_vk_device != nullptr && fences[0] != 0 &&
         g_vk.WaitForFences(g_d5_vk_device, 2 * kD5VkRing, fences, 1, 2000ull * 1000 * 1000) != vkm::VK_SUCCESS) {
         Log("DLSS5 helper: our Vulkan copies did not finish within 2 s");
+        return false;
     }
+    return true;
 }
 
 void D5VkReleaseImports()
@@ -477,8 +489,18 @@ void D5VkReleaseImports()
     if (g_d5_vk_device == nullptr) {
         return;
     }
-    D5VkWaitIdle();
+    // Still in use by the GPU: leak them rather than free memory a pending copy touches.
+    const bool idle = D5VkWaitIdle();
+    if (!idle) {
+        Log("DLSS5 helper: the previous shared textures and fences stay allocated (GPU still busy)");
+    }
     for (int slot = 0; slot < DSF_DLSS5_SLOT_COUNT; ++slot) {
+        if (!idle) {
+            g_d5_vk_slot_image[slot] = 0;
+            g_d5_vk_slot_memory[slot] = 0;
+            g_d5_vk_slot_touched[slot] = false;
+            continue;
+        }
         if (g_d5_vk_slot_image[slot] != 0) {
             g_vk.DestroyImage(g_d5_vk_device, g_d5_vk_slot_image[slot], nullptr);
         }
@@ -489,10 +511,10 @@ void D5VkReleaseImports()
         g_d5_vk_slot_memory[slot] = 0;
         g_d5_vk_slot_touched[slot] = false;
     }
-    if (g_d5_vk_fence_in != 0) {
+    if (g_d5_vk_fence_in != 0 && idle) {
         g_vk.DestroySemaphore(g_d5_vk_device, g_d5_vk_fence_in, nullptr);
     }
-    if (g_d5_vk_fence_out != 0) {
+    if (g_d5_vk_fence_out != 0 && idle) {
         g_vk.DestroySemaphore(g_d5_vk_device, g_d5_vk_fence_out, nullptr);
     }
     g_d5_vk_fence_in = 0;
@@ -647,7 +669,9 @@ bool D5StartHelper()
     wchar_t pipe_name[128] = {};
     swprintf_s(pipe_name, DSF_DLSS5_PIPE_FMT, GetCurrentProcessId());
     for (int attempt = 0; attempt < 300 && g_d5_pipe == INVALID_HANDLE_VALUE; ++attempt) {
-        g_d5_pipe = CreateFileW(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING, FILE_FLAG_OVERLAPPED, nullptr);
+        // Identification level only: the server may identify us but not act as us.
+        g_d5_pipe = CreateFileW(pipe_name, GENERIC_READ | GENERIC_WRITE, 0, nullptr, OPEN_EXISTING,
+            FILE_FLAG_OVERLAPPED | SECURITY_SQOS_PRESENT | SECURITY_IDENTIFICATION, nullptr);
         if (g_d5_pipe == INVALID_HANDLE_VALUE) {
             if (WaitForSingleObject(pi.hProcess, 0) == WAIT_OBJECT_0) {
                 DWORD code = 0;
@@ -660,6 +684,14 @@ bool D5StartHelper()
     }
     if (g_d5_pipe == INVALID_HANDLE_VALUE) {
         Log("DLSS5 helper: could not connect to the pipe");
+        return false;
+    }
+    // The pipe must belong to the helper we started, not to a process that took the name first.
+    ULONG server_pid = 0;
+    if (!GetNamedPipeServerProcessId(g_d5_pipe, &server_pid) || server_pid != pi.dwProcessId) {
+        Log("DLSS5 helper: the pipe's server is pid %lu, not the helper (pid %lu); not using it", server_pid, pi.dwProcessId);
+        CloseHandle(g_d5_pipe);
+        g_d5_pipe = INVALID_HANDLE_VALUE;
         return false;
     }
 
@@ -706,7 +738,14 @@ bool D5FindNvidiaAdapter(IDXGIAdapter1** out)
     return adapter != nullptr;
 }
 
-bool D5Configure(UINT w, UINT h)
+enum D5ConfigureResult
+{
+    D5_CONFIGURE_OK,
+    D5_CONFIGURE_FAILED,      // the stream is still in step: CONFIGURE again
+    D5_CONFIGURE_PIPE_LOST,   // timeout or broken pipe: the stream is in an unknown state
+};
+
+D5ConfigureResult D5Configure(UINT w, UINT h)
 {
     if (g_d5_transport == D5_TRANSPORT_VULKAN) {
         D5VkReleaseImports();
@@ -728,7 +767,12 @@ bool D5Configure(UINT w, UINT h)
             g_d5_slot_tex[slot] = D5CreateSharedTexture(w, h, g_d5_slot_formats[slot], bind, &handles[slot]);
             if (g_d5_slot_tex[slot] == nullptr) {
                 Log("DLSS5 helper: shared texture %d (%ux%u format %d) failed", slot, w, h, static_cast<int>(g_d5_slot_formats[slot]));
-                return false;
+                for (std::uint64_t handle : handles) {
+                    if (handle != 0) {
+                        CloseHandle(reinterpret_cast<HANDLE>(static_cast<std::uintptr_t>(handle)));
+                    }
+                }
+                return D5_CONFIGURE_FAILED;
             }
             configure.textures[slot] = handles[slot];
         }
@@ -745,7 +789,7 @@ bool D5Configure(UINT w, UINT h)
     if (!sent) {
         error.message[sizeof(error.message) - 1] = '\0';
         Log("DLSS5 helper: CONFIGURE failed on the pipe (error %lu, helper status %d: %s)", GetLastError(), error.status, error.message);
-        return false;
+        return D5_CONFIGURE_PIPE_LOST;
     }
     ack.message[sizeof(ack.message) - 1] = '\0';
     Log("DLSS5 helper: CONFIGURE %ux%u -> status=%d ngx=0x%08lX formats %u/%u/%u/%u: %s", w, h, ack.status,
@@ -784,12 +828,12 @@ bool D5Configure(UINT w, UINT h)
         CloseHandle(fence_out);
     }
     if (!ok) {
-        return false;
+        return D5_CONFIGURE_FAILED;
     }
     g_d5_bridge_width = w;
     g_d5_bridge_height = h;
     g_d5_frame_number = 0;   // n starts at 1 after every CONFIGURE
-    return true;
+    return D5_CONFIGURE_OK;
 }
 
 DWORD WINAPI D5BridgeWorker(LPVOID)
@@ -817,8 +861,12 @@ DWORD WINAPI D5BridgeWorker(LPVOID)
         if (state != D5_BRIDGE_CONFIGURING) {
             continue;
         }
-        if (D5Configure(g_d5_want_width, g_d5_want_height)) {
+        const D5ConfigureResult result = D5Configure(g_d5_want_width, g_d5_want_height);
+        if (result == D5_CONFIGURE_OK) {
             InterlockedExchange(&g_d5_bridge_state, D5_BRIDGE_RUNNING);
+        } else if (result == D5_CONFIGURE_PIPE_LOST) {
+            D5BridgeFail("CONFIGURE got no answer");
+            break;
         } else if (++g_d5_configure_attempts >= kD5MaxConfigureAttempts) {
             D5BridgeFail("CONFIGURE failed");
             break;
@@ -832,102 +880,118 @@ DWORD WINAPI D5BridgeWorker(LPVOID)
     return 0;
 }
 
-// While the helper path is on, exceptions are logged (code, module and offset, the C++ type for
-// C++ throws, the DLSS 5 step the render thread was in), and the first one that is not routine
-// is written to dsf_dlss5_crash_<pid>.dmp beside Driver.exe. Logging only: every exception then
-// goes on to the game's own handlers as before.
-volatile LONG g_d5_veh_count = 0;
+// CrashDump=1 (with Helper=1): the first hardware fault of the session (access violation,
+// illegal instruction, in-page error and the like) is logged with its module, offset and the
+// bridge step, and written to dsf_dlss5_crash_<pid>.dmp beside Driver.exe. The handler sits
+// first in the chain, because DriverNGHook's own handler ends the process. It does no heap or
+// loader work itself: it hands the exception to a thread started beforehand and waits for it.
+// Stack overflows, C++ exceptions and debugger notifications are left alone. A fault that a
+// handler further down would have caught can still be dumped; that is why it is opt-in.
+// Logging only: every exception then goes on to the game's own handlers.
 volatile LONG g_d5_veh_dumped = 0;
 volatile LONG g_d5_step = 0;   // where D5BridgeFrame is (0: outside it)
+PVOID g_d5_veh = nullptr;
+HANDLE g_d5_dump_request = nullptr;
+HANDLE g_d5_dump_done = nullptr;
+EXCEPTION_POINTERS* g_d5_dump_pointers = nullptr;
+DWORD g_d5_dump_thread_id = 0;
+LONG g_d5_dump_step = 0;
 
 using MiniDumpWriteDumpFn = BOOL (WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
     PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
+MiniDumpWriteDumpFn g_d5_minidump_write = nullptr;
 
-const char* D5CxxTypeName(const EXCEPTION_RECORD* record)
+DWORD WINAPI D5DumpThread(LPVOID)
 {
-    // MSVC x86 throw info: ThrowInfo -> CatchableTypeArray -> CatchableType -> TypeDescriptor.
-    if (record->NumberParameters < 3) {
-        return "?";
-    }
-    const auto* throw_info = reinterpret_cast<const DWORD*>(record->ExceptionInformation[2]);
-    if (!IsReadableMemory(throw_info, 16)) {
-        return "?";
-    }
-    const auto* types = reinterpret_cast<const DWORD*>(throw_info[3]);
-    if (!IsReadableMemory(types, 8) || types[0] < 1) {
-        return "?";
-    }
-    const auto* catchable = reinterpret_cast<const DWORD*>(types[1]);
-    if (!IsReadableMemory(catchable, 8)) {
-        return "?";
-    }
-    const auto* descriptor = reinterpret_cast<const char*>(catchable[1]);
-    return IsReadableMemory(descriptor, 16) ? descriptor + 8 : "?";
-}
-
-void D5WriteCrashDump(EXCEPTION_POINTERS* info)
-{
-    HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
-    auto write = dbghelp != nullptr ? reinterpret_cast<MiniDumpWriteDumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
-    if (write == nullptr) {
-        return;
+    WaitForSingleObject(g_d5_dump_request, INFINITE);
+    const EXCEPTION_RECORD* record = g_d5_dump_pointers->ExceptionRecord;
+    char where[160] = {};
+    D5ModuleName(record->ExceptionAddress, where, sizeof(where));
+    if (record->ExceptionCode == EXCEPTION_ACCESS_VIOLATION && record->NumberParameters >= 2) {
+        Log("DLSS5: exception 0x%08lX (access violation, %s 0x%08lX) at %s thread %lu step %ld", record->ExceptionCode,
+            record->ExceptionInformation[0] == 0 ? "read" : record->ExceptionInformation[0] == 1 ? "write" : "execute",
+            static_cast<unsigned long>(record->ExceptionInformation[1]), where, g_d5_dump_thread_id, g_d5_dump_step);
+    } else {
+        Log("DLSS5: exception 0x%08lX at %s thread %lu step %ld", record->ExceptionCode, where, g_d5_dump_thread_id, g_d5_dump_step);
     }
     char name[64] = {};
     std::snprintf(name, sizeof(name), "dsf_dlss5_crash_%lu.dmp", GetCurrentProcessId());
     char path[MAX_PATH] = {};
     BuildGamePath(path, MAX_PATH, name);
     const HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
-    if (file == INVALID_HANDLE_VALUE) {
-        return;
+    if (file != INVALID_HANDLE_VALUE) {
+        MINIDUMP_EXCEPTION_INFORMATION exception = {g_d5_dump_thread_id, g_d5_dump_pointers, FALSE};
+        const BOOL ok = g_d5_minidump_write(GetCurrentProcess(), GetCurrentProcessId(), file,
+            static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo | MiniDumpWithDataSegs), &exception,
+            nullptr, nullptr);
+        CloseHandle(file);
+        Log("DLSS5: %s %s", ok ? "wrote" : "could not write", path);
     }
-    MINIDUMP_EXCEPTION_INFORMATION exception = {GetCurrentThreadId(), info, FALSE};
-    const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), file,
-        static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo | MiniDumpWithDataSegs), &exception,
-        nullptr, nullptr);
-    CloseHandle(file);
-    Log("DLSS5: %s %s", ok ? "wrote" : "could not write", path);
+    SetEvent(g_d5_dump_done);
+    return 0;
 }
 
-LONG CALLBACK D5LogException(EXCEPTION_POINTERS* info)
+LONG CALLBACK D5OnFault(EXCEPTION_POINTERS* info)
 {
     if (info == nullptr || info->ExceptionRecord == nullptr) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    const EXCEPTION_RECORD* record = info->ExceptionRecord;
-    const DWORD code = record->ExceptionCode;
-    // Thread names and debug output are routine.
-    if (code == 0x406D1388 || code == 0x40010006 || code == 0x4001000A || InterlockedIncrement(&g_d5_veh_count) > 32) {
+    switch (info->ExceptionRecord->ExceptionCode) {
+    case EXCEPTION_ACCESS_VIOLATION:
+    case EXCEPTION_ILLEGAL_INSTRUCTION:
+    case EXCEPTION_PRIV_INSTRUCTION:
+    case EXCEPTION_IN_PAGE_ERROR:
+    case EXCEPTION_INT_DIVIDE_BY_ZERO:
+    case EXCEPTION_ARRAY_BOUNDS_EXCEEDED:
+        break;
+    default:
+        return EXCEPTION_CONTINUE_SEARCH;   // stack overflow, C++, debugger and the rest
+    }
+    if (InterlockedCompareExchange(&g_d5_veh_dumped, 1, 0) != 0) {
         return EXCEPTION_CONTINUE_SEARCH;
     }
-    char where[160] = {};
-    D5ModuleName(record->ExceptionAddress, where, sizeof(where));
-    if (code == EXCEPTION_ACCESS_VIOLATION) {
-        Log("DLSS5: exception 0x%08lX (access violation, %s 0x%08lX) at %s thread %lu step %ld", code,
-            record->ExceptionInformation[0] == 0 ? "read" : record->ExceptionInformation[0] == 1 ? "write" : "execute",
-            static_cast<unsigned long>(record->ExceptionInformation[1]), where, GetCurrentThreadId(), g_d5_step);
-    } else if (code == 0xE06D7363) {
-        Log("DLSS5: exception 0x%08lX (C++ %s) at %s thread %lu step %ld", code, D5CxxTypeName(record), where, GetCurrentThreadId(),
-            g_d5_step);
-    } else {
-        Log("DLSS5: exception 0x%08lX flags 0x%lX at %s thread %lu step %ld", code, record->ExceptionFlags, where, GetCurrentThreadId(),
-            g_d5_step);
-    }
-    if (code != 0xE06D7363 && InterlockedCompareExchange(&g_d5_veh_dumped, 1, 0) == 0) {
-        D5WriteCrashDump(info);
-    }
+    g_d5_dump_pointers = info;
+    g_d5_dump_thread_id = GetCurrentThreadId();
+    g_d5_dump_step = g_d5_step;
+    SetEvent(g_d5_dump_request);
+    WaitForSingleObject(g_d5_dump_done, 15000);
     return EXCEPTION_CONTINUE_SEARCH;
+}
+
+void D5InstallExceptionHandler()
+{
+    if (!g_d5_crash_dump || g_d5_veh != nullptr) {
+        return;
+    }
+    HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+    g_d5_minidump_write = dbghelp != nullptr ? reinterpret_cast<MiniDumpWriteDumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    g_d5_dump_request = CreateEventA(nullptr, FALSE, FALSE, nullptr);
+    g_d5_dump_done = CreateEventA(nullptr, TRUE, FALSE, nullptr);
+    const HANDLE thread = g_d5_minidump_write != nullptr && g_d5_dump_request != nullptr && g_d5_dump_done != nullptr ?
+        CreateThread(nullptr, 0, D5DumpThread, nullptr, 0, nullptr) : nullptr;
+    if (thread == nullptr) {
+        Log("DLSS5: CrashDump=1 but dbghelp or the dump thread is not available");
+        return;
+    }
+    CloseHandle(thread);
+    g_d5_veh = AddVectoredExceptionHandler(1, D5OnFault);
+    Log("DLSS5: crash dumps on (first hardware fault -> dsf_dlss5_crash_<pid>.dmp)");
+}
+
+void D5RemoveExceptionHandler()
+{
+    PVOID handler = InterlockedExchangePointer(&g_d5_veh, nullptr);
+    if (handler != nullptr) {
+        RemoveVectoredExceptionHandler(handler);
+    }
 }
 
 void D5BridgeStart(IDirect3DDevice9* device)
 {
-    static bool veh = false;
-    if (!veh) {
-        veh = true;
-        AddVectoredExceptionHandler(1, D5LogException);   // first: DriverNGHook handles fatal ones itself
-    }
     if (!g_d5_helper || InterlockedCompareExchange(&g_d5_bridge_state, D5_BRIDGE_STARTING, D5_BRIDGE_OFF) != D5_BRIDGE_OFF) {
         return;
     }
+    D5InstallExceptionHandler();
     g_d5_transport = D5_TRANSPORT_CPU;
     if (g_d5_helper_transport != D5_TRANSPORT_CPU) {
         if (D5VkInit(device)) {
@@ -969,6 +1033,7 @@ IDirect3DTexture9* g_d5_composite = nullptr;          // the helper's output, A8
 IDirect3DStateBlock9* g_d5_state = nullptr;
 UINT g_d5_d9_width = 0;
 UINT g_d5_d9_height = 0;
+D3DFORMAT g_d5_d9_color_format = D3DFMT_UNKNOWN;
 bool g_d5_shaders_failed = false;
 
 const char kD5ShaderSource[] = R"(
@@ -1063,9 +1128,9 @@ void D5ReleaseD3D9()
     g_d5_d9_height = 0;
 }
 
-bool D5EnsureD3D9(IDirect3DDevice9* device, UINT w, UINT h)
+bool D5EnsureD3D9(IDirect3DDevice9* device, UINT w, UINT h, D3DFORMAT color_format)
 {
-    if (g_d5_d9_width == w && g_d5_d9_height == h && g_d5_composite != nullptr) {
+    if (g_d5_d9_width == w && g_d5_d9_height == h && g_d5_d9_color_format == color_format && g_d5_composite != nullptr) {
         return true;
     }
     D5ReleaseD3D9();
@@ -1077,7 +1142,8 @@ bool D5EnsureD3D9(IDirect3DDevice9* device, UINT w, UINT h)
         SUCCEEDED(device->CreateTexture(w, h, 1, cpu ? D3DUSAGE_DYNAMIC : 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_d5_composite, nullptr)) &&
         SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &g_d5_state));
     if (ok && cpu) {
-        ok = SUCCEEDED(device->CreateOffscreenPlainSurface(w, h, D3DFMT_A8R8G8B8, D3DPOOL_SYSTEMMEM, &g_d5_sys_color, nullptr)) &&
+        // GetRenderTargetData needs the target's own format (A8R8G8B8 or X8R8G8B8, both BGRA bytes).
+        ok = SUCCEEDED(device->CreateOffscreenPlainSurface(w, h, color_format, D3DPOOL_SYSTEMMEM, &g_d5_sys_color, nullptr)) &&
             SUCCEEDED(device->CreateOffscreenPlainSurface(w, h, D3DFMT_R32F, D3DPOOL_SYSTEMMEM, &g_d5_sys_depth, nullptr)) &&
             SUCCEEDED(device->CreateOffscreenPlainSurface(w, h, D3DFMT_G16R16F, D3DPOOL_SYSTEMMEM, &g_d5_sys_motion, nullptr));
     }
@@ -1088,6 +1154,7 @@ bool D5EnsureD3D9(IDirect3DDevice9* device, UINT w, UINT h)
     }
     g_d5_d9_width = w;
     g_d5_d9_height = h;
+    g_d5_d9_color_format = color_format;
     return true;
 }
 
@@ -1230,7 +1297,10 @@ DsfDlss5Frame D5MakeFrame(std::uint64_t n)
 {
     DsfDlss5Frame frame = {};
     frame.frame = n;
-    frame.flags = DSF_DLSS5_FRAME_AUTO_MASK | DSF_DLSS5_FRAME_GPU_TIME | (n == 1 ? DSF_DLSS5_FRAME_RESET : 0) |
+    // RESET on the first frame after CONFIGURE and whenever last frame's VP is not the frame just
+    // before (menus, pauses, loading): the helper's history would be from another view.
+    const bool reset = n == 1 || !g_d5_vp_previous_valid;
+    frame.flags = DSF_DLSS5_FRAME_AUTO_MASK | DSF_DLSS5_FRAME_GPU_TIME | (reset ? DSF_DLSS5_FRAME_RESET : 0) |
         (g_d5_helper_bypass ? DSF_DLSS5_FRAME_BYPASS : 0);
     frame.style = static_cast<std::uint32_t>(g_d5_style);
     frame.mv_scale[0] = 1.0f;
@@ -1561,8 +1631,9 @@ void D5BridgeFrame(IDirect3DDevice9* device)
         return;
     }
     g_d5_internal = true;
-    if (!D5CompileShaders(device) || !D5EnsureD3D9(device, desc.Width, desc.Height)) {
+    if (!D5CompileShaders(device) || !D5EnsureD3D9(device, desc.Width, desc.Height, desc.Format)) {
         g_d5_internal = false;
+        depth->Release();
         D5BridgeFail("D3D9 shaders or resources failed");
         return;
     }
@@ -1570,6 +1641,7 @@ void D5BridgeFrame(IDirect3DDevice9* device)
     const double start = D5NowMs();
     g_d5_step = 1;
     const bool have_motion = D5RenderInputs(device, target, depth, desc.Width, desc.Height);
+    depth->Release();
     g_d5_step = 2;
     float gpu_ms = -1.0f;
     const bool composited = g_d5_transport == D5_TRANSPORT_VULKAN ? D5VkFrame(device, target, desc.Width, desc.Height, &gpu_ms) :
@@ -1606,7 +1678,25 @@ void Dlss5OnReset()
     D5SafeRelease(g_d5_ps_copy);
     D5SafeRelease(g_d5_ps_copy_swap);
     g_d5_shaders_failed = false;
-    AcquireSRWLockExclusive(&g_d5_intz_lock);
-    g_d5_intz.clear();
-    ReleaseSRWLockExclusive(&g_d5_intz_lock);
+    // Reset releases every default-pool resource: forget the targets and textures the hooks saw,
+    // so nothing calls into a freed surface before the game binds new ones.
+    g_d5.rt0 = nullptr;
+    g_d5.ds = nullptr;
+    for (auto*& texture : g_d5.bound) {
+        texture = nullptr;
+    }
+    g_d5_scene_rt = nullptr;
+    g_d5_scene_ds = nullptr;
+    g_d5_frame_best_rt = nullptr;
+    g_d5_frame_best_ds = nullptr;
+    g_d5_frame_best_draws = 0;
+    g_d5_counting_rt = nullptr;
+    g_d5_counting_frame = -1;
+    g_d5_counting_full = false;
+}
+
+// DLL_PROCESS_DETACH.
+void Dlss5Shutdown()
+{
+    D5RemoveExceptionHandler();
 }

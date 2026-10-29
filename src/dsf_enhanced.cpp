@@ -366,6 +366,7 @@ void TrackLastD3DDevice(IDirect3DDevice9* device);
 void RehookTrackedD3DDevice(const char* source);
 void LoadDlss5Config(const char* ini_path);
 void Dlss5OnReset();
+void Dlss5Shutdown();
 
 void BuildGamePath(char* out, DWORD out_size, const char* name)
 {
@@ -4146,6 +4147,8 @@ BOOL APIENTRY DllMain(HMODULE module, DWORD reason, LPVOID)
         if (thread != nullptr) {
             CloseHandle(thread);
         }
+    } else if (reason == DLL_PROCESS_DETACH) {
+        Dlss5Shutdown();
     }
     return TRUE;
 }

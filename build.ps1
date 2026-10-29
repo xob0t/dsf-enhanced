@@ -30,6 +30,8 @@ if (-not (Get-Command cl.exe -ErrorAction SilentlyContinue)) {
     throw "Could not find cl.exe in PATH and vswhere.exe is missing."
   }
 
+  # vcvars32.bat calls vswhere itself and needs it on PATH.
+  $env:PATH = (Split-Path -Parent $vswhere) + ";" + $env:PATH
   $installationPath = & $vswhere -latest -products * -requires Microsoft.VisualStudio.Component.VC.Tools.x86.x64 -property installationPath
   if (-not $installationPath) {
     throw "Could not find a Visual Studio installation with x86 C++ tools."

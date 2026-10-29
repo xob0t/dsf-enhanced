@@ -55,7 +55,7 @@ D5SetConstantFFn g_d5_set_vs_constant_f = nullptr;
 
 bool g_d5_trace = false;
 bool g_d5_helper = false;      // [DLSS5] Helper: run DLSS 5 through dsf-dlss5-helper (dlss5_bridge.inl)
-bool g_d5_internal = false;    // DSF Enhanced's own D3D9 calls: the hooks pass them straight through
+thread_local bool g_d5_internal = false;   // DSF Enhanced's own D3D9 calls on this thread: the hooks pass them through
 void LoadDlss5BridgeConfig(const char* ini_path);
 void D5BridgeFrame(IDirect3DDevice9* device);
 bool D5CreateIntzDepth(IDirect3DDevice9* device, UINT w, UINT h, IDirect3DSurface9** out);
@@ -655,6 +655,13 @@ void D5OpenSharedMemory()
         Log("DLSS5: CreateFileMapping(%s) failed error=%lu", name, GetLastError());
         return;
     }
+    if (GetLastError() == ERROR_ALREADY_EXISTS) {
+        // Someone else made this name first: never publish into a mapping we did not create.
+        Log("DLSS5: shared memory %s already exists; not exported", name);
+        CloseHandle(g_d5_mapping);
+        g_d5_mapping = nullptr;
+        return;
+    }
     g_d5_shared = static_cast<Dsfe5Shared*>(MapViewOfFile(g_d5_mapping, FILE_MAP_ALL_ACCESS, 0, 0, sizeof(Dsfe5Shared)));
     if (g_d5_shared == nullptr) {
         Log("DLSS5: MapViewOfFile failed error=%lu", GetLastError());
@@ -696,17 +703,17 @@ void D5Publish(IDirect3DDevice9* device, Dsfe5Point point)
         InterlockedIncrement(reinterpret_cast<volatile LONG*>(&g_d5_shared->sequence));
     }
 
-    D5Callback callbacks[8] = {};
-    AcquireSRWLockShared(&g_d5_callback_lock);
-    std::memcpy(callbacks, g_d5_callbacks, sizeof(callbacks));
-    ReleaseSRWLockShared(&g_d5_callback_lock);
+    // Callbacks run under the shared lock: DSFE_UnregisterPreHudCallback takes it exclusively,
+    // so once it returns no call is running. A callback must not register or unregister.
     auto* color = static_cast<IDirect3DSurface9*>(const_cast<void*>(point == DSFE5_POINT_PRE_HUD ? g_d5.rt0 : g_d5_scene_rt));
     auto* depth = static_cast<IDirect3DSurface9*>(const_cast<void*>(g_d5_scene_ds));
-    for (const D5Callback& callback : callbacks) {
+    AcquireSRWLockShared(&g_d5_callback_lock);
+    for (const D5Callback& callback : g_d5_callbacks) {
         if (callback.fn != nullptr) {
             callback.fn(callback.user, device, color, depth, &info);
         }
     }
+    ReleaseSRWLockShared(&g_d5_callback_lock);
 }
 
 // The scene's view-projection. The game uploads no per-frame matrix: each scene draw sets
@@ -807,7 +814,7 @@ int D5AddViewProjMatrix(const float* vp)
     }
     if (g_d5_vp_bucket_count < static_cast<int>(sizeof(g_d5_vp_buckets) / sizeof(g_d5_vp_buckets[0]))) {
         D5VpBucket& bucket = g_d5_vp_buckets[g_d5_vp_bucket_count];
-        std::memcpy(bucket.vp, vp, sizeof(vp));
+        std::memcpy(bucket.vp, vp, sizeof(bucket.vp));
         bucket.count = 1;
         return g_d5_vp_bucket_count++;
     }
@@ -1050,7 +1057,9 @@ void D5FinishViewProj()
             best = i;
         }
     }
-    g_d5_vp_previous_valid = g_d5_vp_valid;
+    // Last frame's VP is a valid history only if it is from the frame just before this one;
+    // after menus, pauses or loading it can be many frames old (the helper then gets a RESET).
+    g_d5_vp_previous_valid = g_d5_vp_valid && g_d5_vp_frame == g_d5_frame_index - 1;
     if (g_d5_vp_valid) {
         std::memcpy(g_d5_vp_previous, g_d5_vp_current, sizeof(g_d5_vp_previous));
     }
@@ -1440,10 +1449,10 @@ void D5FrameEnd(IDirect3DDevice9* device)
     g_d5_frame_best_ds = nullptr;
     g_d5_frame_best_draws = 0;
     g_d5_scene_draws_this_frame = 0;
-    g_d5_scene_done = false;
     if (g_d5_scene_done && !g_d5_pre_hud_fired && g_d5_shared != nullptr) {
         g_d5_shared->pre_hud_missed += 1;
     }
+    g_d5_scene_done = false;
     g_d5_pre_hud_fired = false;
     g_d5_post_pass_index = 0;
     g_d5_pass_draws = 0;
@@ -1650,12 +1659,17 @@ HRESULT STDMETHODCALLTYPE D5SetTexture(IDirect3DDevice9* device, DWORD stage, ID
 
 // The scene candidate: the busiest render target this frame that draws with a depth surface and
 // covers the back buffer (the distant-scene strips, 128x832, can draw more than the scene).
+const void* g_d5_counting_rt = nullptr;
+int g_d5_counting_draws = 0;
+LONG g_d5_counting_frame = -1;
+bool g_d5_counting_full = false;
+
 void D5NoteBusiestPass()
 {
-    static const void* counting_rt = nullptr;
-    static int counting_draws = 0;
-    static LONG counting_frame = -1;
-    static bool counting_full = false;
+    const void*& counting_rt = g_d5_counting_rt;
+    int& counting_draws = g_d5_counting_draws;
+    LONG& counting_frame = g_d5_counting_frame;
+    bool& counting_full = g_d5_counting_full;
     if (counting_frame != g_d5_frame_index || counting_rt != g_d5.rt0) {
         counting_frame = g_d5_frame_index;
         counting_rt = g_d5.rt0;
