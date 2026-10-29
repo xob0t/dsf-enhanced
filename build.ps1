@@ -1,3 +1,9 @@
+param(
+  # Leave out the DLSS 5 helper (it needs the x64 toolchain and downloads NVIDIA's DLSS SDK
+  # headers and static loader, pinned by SHA-256, from github.com/NVIDIA/DLSS).
+  [switch]$SkipDlss5
+)
+
 $ErrorActionPreference = "Stop"
 
 $root = $PSScriptRoot
@@ -55,10 +61,26 @@ Copy-Item -LiteralPath (Join-Path $root "src\dsf_enhanced.ini") -Destination $di
 Copy-Item -LiteralPath (Join-Path $root "third_party\winmm.dll") -Destination $dist
 Copy-Item -LiteralPath (Join-Path $root "README.md") -Destination $dist
 Copy-Item -LiteralPath (Join-Path $root "LICENSE") -Destination $dist
+$packageEntries = @("winmm.dll", "dsf_enhanced.asi", "dsf_enhanced.ini", "README.md", "LICENSE")
 
-$packageFiles = @("winmm.dll", "dsf_enhanced.asi", "dsf_enhanced.ini", "README.md", "LICENSE") |
-  ForEach-Object { Join-Path $dist $_ }
-Compress-Archive -LiteralPath $packageFiles -DestinationPath (Join-Path $dist "DSF-Enhanced.zip")
+# DLSS 5 (experimental): dist\dlss5 holds the helper, NVIDIA's license for the static NGX loader
+# linked into it (fetched with the SDK, never committed) and a readme. No NVIDIA DLL and no DXVK.
+if (-not $SkipDlss5) {
+  & (Join-Path $root "dlss5\build.ps1")
+  $dlss5Dist = Join-Path $dist "dlss5"
+  New-Item -ItemType Directory -Path $dlss5Dist | Out-Null
+  Copy-Item -LiteralPath (Join-Path $root "dlss5\build\x64\dsf-dlss5-helper.exe") -Destination $dlss5Dist
+  Copy-Item -LiteralPath (Join-Path $root "dlss5\external\dlss-sdk\LICENSE.txt") -Destination (Join-Path $dlss5Dist "NVIDIA-RTX-SDKs-LICENSE.txt")
+  Copy-Item -LiteralPath (Join-Path $root "src\dlss5-folder-README.txt") -Destination (Join-Path $dlss5Dist "README.txt")
+  $packageEntries += "dlss5"
+}
+
+# tar writes standard "/" paths, which every unzip tool reads (Compress-Archive on PowerShell 5.1
+# writes "\").
+& "$env:SystemRoot\System32\tar.exe" -a -c -f (Join-Path $dist "DSF-Enhanced.zip") -C $dist @packageEntries
+if ($LASTEXITCODE -ne 0) {
+  throw "Packing DSF-Enhanced.zip failed with exit code $LASTEXITCODE"
+}
 
 # worldlod: install.cmd, the pipeline and this build of the plugin (worldlod\release\package.ps1)
 & (Join-Path $root "worldlod\release\package.ps1") -Dist $dist

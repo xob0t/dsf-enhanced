@@ -67,6 +67,18 @@ void D5EndSceneTagging(IDirect3DDevice9* device);
 void D5FinishObjects();
 void D5ResetObjectsFrame();
 extern bool g_d5_object_motion;
+// The game's render resolution: the back buffer size it asked for (BorderlessWindowed makes the
+// swap chain the monitor's size), else the back buffer's.
+UINT D5RenderWidth()
+{
+    return g_game_render_width != 0 && g_game_render_height != 0 ? g_game_render_width : g_backbuffer_width;
+}
+
+UINT D5RenderHeight()
+{
+    return g_game_render_width != 0 && g_game_render_height != 0 ? g_game_render_height : g_backbuffer_height;
+}
+
 bool g_d5_trace_dump = false;
 bool g_d5_trace_scan = false;      // TraceScan: look for the VP in game memory (stalls that frame for seconds)
 bool g_d5_trace_shaders = false;   // TraceShaders: write each vertex shader's disassembly to TraceDumpDir
@@ -717,8 +729,8 @@ void D5Publish(IDirect3DDevice9* device, Dsfe5Point point)
         info.width = scene.width;
         info.height = scene.height;
     }
-    info.render_width = g_backbuffer_width;
-    info.render_height = g_backbuffer_height;
+    info.render_width = D5RenderWidth();
+    info.render_height = D5RenderHeight();
 
     if (g_d5_shared != nullptr) {
         // Seqlock: odd while writing.
@@ -947,8 +959,8 @@ bool D5Project(const float* vp, const float* p, float* px)
     if (clip[3] <= 0.01f) {
         return false;
     }
-    px[0] = (clip[0] / clip[3] * 0.5f + 0.5f) * static_cast<float>(g_backbuffer_width);
-    px[1] = (0.5f - clip[1] / clip[3] * 0.5f) * static_cast<float>(g_backbuffer_height);
+    px[0] = (clip[0] / clip[3] * 0.5f + 0.5f) * static_cast<float>(D5RenderWidth());
+    px[1] = (0.5f - clip[1] / clip[3] * 0.5f) * static_cast<float>(D5RenderHeight());
     return true;
 }
 
@@ -1044,8 +1056,8 @@ void D5AnalyseObjectMotion()
                 float px_true[2] = {};
                 float px_camera[2] = {};
                 object->on_screen = D5Project(g_d5_vp_current, now_p, px_now) && px_now[0] >= 0.0f &&
-                    px_now[0] < static_cast<float>(g_backbuffer_width) && px_now[1] >= 0.0f &&
-                    px_now[1] < static_cast<float>(g_backbuffer_height);
+                    px_now[0] < static_cast<float>(D5RenderWidth()) && px_now[1] >= 0.0f &&
+                    px_now[1] < static_cast<float>(D5RenderHeight());
                 if (D5Project(g_d5_object_vp_prev, object->prev_t, px_true) && D5Project(g_d5_object_vp_prev, now_p, px_camera)) {
                     object->error_px = std::sqrt((px_true[0] - px_camera[0]) * (px_true[0] - px_camera[0]) +
                         (px_true[1] - px_camera[1]) * (px_true[1] - px_camera[1]));
@@ -1375,7 +1387,7 @@ void D5AfterDraw(IDirect3DDevice9* device)
         r.width = desc.Width;
         r.height = desc.Height;
     }
-    if (r.width != g_backbuffer_width || r.height != g_backbuffer_height) {
+    if (r.width != D5RenderWidth() || r.height != D5RenderHeight()) {
         return;
     }
     const int d = pass->draws;
@@ -1687,7 +1699,7 @@ HRESULT STDMETHODCALLTYPE D5CreateRenderTarget(IDirect3DDevice9* device, UINT w,
 HRESULT STDMETHODCALLTYPE D5CreateDepthStencil(IDirect3DDevice9* device, UINT w, UINT h, D3DFORMAT format, D3DMULTISAMPLE_TYPE ms,
     DWORD quality, BOOL discard, IDirect3DSurface9** out, HANDLE* shared)
 {
-    if (g_d5_helper && out != nullptr && ms == D3DMULTISAMPLE_NONE && w == g_backbuffer_width && h == g_backbuffer_height &&
+    if (g_d5_helper && out != nullptr && ms == D3DMULTISAMPLE_NONE && w == D5RenderWidth() && h == D5RenderHeight() &&
         (format == D3DFMT_D24S8 || format == D3DFMT_D24X8) && D5CreateIntzDepth(device, w, h, out)) {
         D5Register(*out, 'D', w, h, format, static_cast<DWORD>(ms), D5Va(_ReturnAddress()));
         Log("DLSS5: depth surface %ux%u created as INTZ (readable scene depth)", w, h);
@@ -1849,7 +1861,7 @@ void D5NoteBusiestPass()
         D3DSURFACE_DESC desc = {};
         counting_full = g_d5.rt0 != nullptr &&
             SUCCEEDED(static_cast<IDirect3DSurface9*>(const_cast<void*>(g_d5.rt0))->GetDesc(&desc)) &&
-            desc.Width * 2 >= g_backbuffer_width && desc.Height * 2 >= g_backbuffer_height;
+            desc.Width * 2 >= D5RenderWidth() && desc.Height * 2 >= D5RenderHeight();
     }
     ++counting_draws;
     if (counting_full && g_d5.ds != nullptr && counting_draws > g_d5_frame_best_draws) {
