@@ -10,6 +10,7 @@
 #include "nvsdk_ngx.h"
 #include "dlssnr_defs.h"
 #include "log.h"
+#include "ngx_trust.h"
 
 namespace dsf_dlss5 {
 
@@ -56,8 +57,10 @@ bool NrD3D12::Fail(const char* what, unsigned int result) {
   return false;
 }
 
-bool NrD3D12::Initialize(ID3D12Device* device, const std::wstring& runtimeDir, const std::wstring& dataDir, bool verboseLog) {
+bool NrD3D12::Initialize(ID3D12Device* device, const VerifiedRuntime& runtime, const std::wstring& dataDir, bool verboseLog) {
   device_ = device;
+  runtime_ = &runtime;
+  const std::wstring runtimeDir = runtime.Directory();
   const wchar_t* paths[] = {runtimeDir.c_str()};
   NVSDK_NGX_FeatureCommonInfo info = {};
   info.PathListInfo.Path = paths;
@@ -109,6 +112,15 @@ bool NrD3D12::CreateFeature(ID3D12GraphicsCommandList* list, uint32_t width, uin
   if (NVSDK_NGX_FAILED(result)) {
     feature_ = nullptr;
     return Fail("NVSDK_NGX_D3D12_CreateFeature(DLSSNR)", result);
+  }
+  // NGX could pick another copy (its model cache, the driver store); only the file we
+  // verified is acceptable.
+  const std::wstring loaded = LoadedRuntimePath();
+  if (!runtime_->IsSameFile(loaded)) {
+    ReleaseFeature();
+    error_ = "NGX loaded " + Narrow(loaded) + ", not the verified " + Narrow(runtime_->Path());
+    Log("%s", error_.c_str());
+    return false;
   }
   width_ = width;
   height_ = height;

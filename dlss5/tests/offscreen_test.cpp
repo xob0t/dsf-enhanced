@@ -8,6 +8,7 @@
 //       [--frames N] [--width W --height H] [--style 0..2] [--intensity f] [--tone f]
 //       [--structure f] [--input-format f16|u8] [--no-jitter] [--save-every] [--verbose-ngx]
 //       [--static-camera] [--jitter-scale f] [--stability] [--zero-mv] [--flat-depth]
+//       [--allow-runtime-sha256 <hash>]
 //
 // --static-camera keeps the synthetic camera still (only the jitter moves), --jitter-scale
 // multiplies the jitter reported to NGX (-1 tests the opposite sign convention), and
@@ -56,6 +57,7 @@ struct Options {
   bool stability = false;
   bool zeroMotion = false;
   bool flatDepth = false;
+  std::vector<std::string> allowedSha256;
   NrSettings nr;
 };
 
@@ -84,6 +86,7 @@ bool ParseArgs(int argc, wchar_t** argv, Options* o) {
     else if (a == L"--stability") o->stability = true;
     else if (a == L"--zero-mv") o->zeroMotion = true;
     else if (a == L"--flat-depth") o->flatDepth = true;
+    else if (a == L"--allow-runtime-sha256") o->allowedSha256.push_back(Narrow(next()));
     else {
       std::fwprintf(stderr, L"unknown argument: %ls\n", a.c_str());
       return false;
@@ -154,16 +157,17 @@ int wmain(int argc, wchar_t** argv) {
   CreateDirectoryW(o.outDir.c_str(), nullptr);
   OpenLogFile((o.outDir + L"\\offscreen_test.log").c_str());
 
-  // 1. The runtime the user supplied must be NVIDIA-signed and a public release.
-  RuntimeFileInfo runtime;
+  // 1. The runtime the user supplied must be a known (or explicitly allowed) NVIDIA-signed
+  // public release. It stays locked until NGX has shut down.
+  VerifiedRuntime runtime;
   std::string error;
-  if (!VerifyNgxRuntime(o.runtimeDir + L"\\nvngx_dlssnr.dll", &runtime, &error)) {
+  if (!runtime.Verify(o.runtimeDir + L"\\nvngx_dlssnr.dll", o.allowedSha256, &error)) {
     Log("runtime check failed: %s", error.c_str());
     return 3;
   }
-  Log("runtime %ls: version %u.%u.%u.%u, signer \"%ls\", %llu bytes, sha256 %s", runtime.path.c_str(), runtime.version[0],
-      runtime.version[1], runtime.version[2], runtime.version[3], runtime.signer.c_str(),
-      static_cast<unsigned long long>(runtime.size), runtime.sha256.c_str());
+  Log("runtime %ls: version %u.%u.%u.%u, signer \"%ls\", %llu bytes, sha256 %s (%s)", runtime.Path().c_str(),
+      runtime.Version()[0], runtime.Version()[1], runtime.Version()[2], runtime.Version()[3], runtime.Signer().c_str(),
+      static_cast<unsigned long long>(runtime.Size()), runtime.Sha256().c_str(), runtime.Description());
 
   // 2. Inputs: a still image, or the synthetic scene.
   uint32_t width = o.width;
@@ -216,7 +220,7 @@ int wmain(int argc, wchar_t** argv) {
   }
   Log("adapter: %ls", gpu.AdapterName().c_str());
   NrD3D12 nr;
-  if (!nr.Initialize(gpu.Device(), o.runtimeDir, o.outDir, o.verboseNgx)) return 6;
+  if (!nr.Initialize(gpu.Device(), runtime, o.outDir, o.verboseNgx)) return 6;
 
   const DXGI_FORMAT colorFormat = o.f16Input ? DXGI_FORMAT_R16G16B16A16_FLOAT : DXGI_FORMAT_R8G8B8A8_UNORM;
   const D3D12_RESOURCE_STATES kRead = D3D12_RESOURCE_STATE_NON_PIXEL_SHADER_RESOURCE;

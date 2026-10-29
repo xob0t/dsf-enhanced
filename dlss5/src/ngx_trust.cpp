@@ -2,14 +2,13 @@
 
 #include "ngx_trust.h"
 
-#include <windows.h>
 #include <bcrypt.h>
 #include <softpub.h>
 #include <wincrypt.h>
 #include <wintrust.h>
 
+#include <cctype>
 #include <cstdio>
-#include <vector>
 
 #pragma comment(lib, "wintrust.lib")
 #pragma comment(lib, "crypt32.lib")
@@ -28,10 +27,11 @@ std::string Narrow(const std::wstring& text) {
 
 namespace {
 
-bool CheckSignature(const std::wstring& path, std::wstring* signer, std::string* error) {
-  WINTRUST_FILE_INFO file = {};
-  file.cbStruct = sizeof(file);
-  file.pcwszFilePath = path.c_str();
+bool CheckSignature(HANDLE file, const std::wstring& path, std::wstring* signer, std::string* error) {
+  WINTRUST_FILE_INFO fileInfo = {};
+  fileInfo.cbStruct = sizeof(fileInfo);
+  fileInfo.pcwszFilePath = path.c_str();
+  fileInfo.hFile = file;  // verify the open handle, not whatever the path names later
 
   GUID action = WINTRUST_ACTION_GENERIC_VERIFY_V2;
   WINTRUST_DATA data = {};
@@ -39,7 +39,7 @@ bool CheckSignature(const std::wstring& path, std::wstring* signer, std::string*
   data.dwUIChoice = WTD_UI_NONE;
   data.fdwRevocationChecks = WTD_REVOKE_NONE;
   data.dwUnionChoice = WTD_CHOICE_FILE;
-  data.pFile = &file;
+  data.pFile = &fileInfo;
   data.dwStateAction = WTD_STATEACTION_VERIFY;
   data.dwProvFlags = WTD_CACHE_ONLY_URL_RETRIEVAL;
 
@@ -73,6 +73,8 @@ bool CheckSignature(const std::wstring& path, std::wstring* signer, std::string*
   return ok;
 }
 
+// The file is locked against writes, so reading the version through the path sees the
+// same bytes as the handle.
 bool ReadVersion(const std::wstring& path, uint16_t version[4]) {
   DWORD handle = 0;
   const DWORD size = GetFileVersionInfoSizeW(path.c_str(), &handle);
@@ -89,9 +91,9 @@ bool ReadVersion(const std::wstring& path, uint16_t version[4]) {
   return true;
 }
 
-bool HashFile(const std::wstring& path, std::string* hex, uint64_t* size) {
-  HANDLE file = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_FLAG_SEQUENTIAL_SCAN, nullptr);
-  if (file == INVALID_HANDLE_VALUE) return false;
+bool HashFile(HANDLE file, std::string* hex, uint64_t* size) {
+  LARGE_INTEGER zero = {};
+  if (!SetFilePointerEx(file, zero, nullptr, FILE_BEGIN)) return false;
   BCRYPT_ALG_HANDLE alg = nullptr;
   BCRYPT_HASH_HANDLE hash = nullptr;
   bool ok = BCryptOpenAlgorithmProvider(&alg, BCRYPT_SHA256_ALGORITHM, nullptr, 0) == 0 &&
@@ -107,7 +109,6 @@ bool HashFile(const std::wstring& path, std::string* hex, uint64_t* size) {
   ok = ok && BCryptFinishHash(hash, digest, sizeof(digest), 0) == 0;
   if (hash) BCryptDestroyHash(hash);
   if (alg) BCryptCloseAlgorithmProvider(alg, 0);
-  CloseHandle(file);
   if (ok) {
     static const char kDigits[] = "0123456789abcdef";
     hex->clear();
@@ -119,37 +120,77 @@ bool HashFile(const std::wstring& path, std::string* hex, uint64_t* size) {
   return ok;
 }
 
+bool FileId(HANDLE file, BY_HANDLE_FILE_INFORMATION* info) {
+  return GetFileInformationByHandle(file, info) != FALSE;
+}
+
+std::string Lower(std::string text) {
+  for (char& c : text) c = static_cast<char>(std::tolower(static_cast<unsigned char>(c)));
+  return text;
+}
+
 }  // namespace
 
-bool VerifyNgxRuntime(const std::wstring& path, RuntimeFileInfo* info, std::string* error) {
-  info->path = path;
-  if (GetFileAttributesW(path.c_str()) == INVALID_FILE_ATTRIBUTES) {
-    *error = "not found: " + Narrow(path);
+VerifiedRuntime::~VerifiedRuntime() {
+  if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+}
+
+bool VerifiedRuntime::Verify(const std::wstring& path, const std::vector<std::string>& extraSha256, std::string* error) {
+  if (file_ != INVALID_HANDLE_VALUE) CloseHandle(file_);
+  path_ = path;
+  // Readers (NGX, the loader) may open it; nobody may change, rename or delete it.
+  file_ = CreateFileW(path.c_str(), GENERIC_READ, FILE_SHARE_READ, nullptr, OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (file_ == INVALID_HANDLE_VALUE) {
+    *error = "cannot open " + Narrow(path) + " (error " + std::to_string(GetLastError()) + ")";
     return false;
   }
-  if (!CheckSignature(path, &info->signer, error)) return false;
-  if (!ReadVersion(path, info->version)) {
+  if (!HashFile(file_, &sha256_, &size_)) {
+    *error = "could not hash the file";
+    return false;
+  }
+  description_.clear();
+  for (const KnownRuntime& known : kKnownRuntimes) {
+    if (sha256_ == known.sha256) description_ = known.description;
+  }
+  for (const std::string& extra : extraSha256) {
+    if (description_.empty() && sha256_ == Lower(extra)) description_ = "allowed by --allow-runtime-sha256";
+  }
+  if (description_.empty()) {
+    *error = "unknown runtime (sha256 " + sha256_ +
+             "). Use the nvngx_dlssnr.dll from RTX Remix 1.6.1, or allow a newer NVIDIA release with "
+             "--allow-runtime-sha256 <hash>";
+    return false;
+  }
+  if (!CheckSignature(file_, path, &signer_, error)) return false;
+  if (!ReadVersion(path, version_)) {
     *error = "no version resource";
     return false;
   }
   for (int i = 0; i < 4; ++i) {
-    if (info->version[i] != kMinRuntimeVersion[i]) {
-      if (info->version[i] < kMinRuntimeVersion[i]) {
-        char buffer[160];
-        std::snprintf(buffer, sizeof(buffer), "version %u.%u.%u.%u is older than the first public release %u.%u.%u",
-                      info->version[0], info->version[1], info->version[2], info->version[3],
-                      kMinRuntimeVersion[0], kMinRuntimeVersion[1], kMinRuntimeVersion[2]);
-        *error = buffer;
-        return false;
-      }
-      break;
+    if (version_[i] == kMinRuntimeVersion[i]) continue;
+    if (version_[i] < kMinRuntimeVersion[i]) {
+      char buffer[160];
+      std::snprintf(buffer, sizeof(buffer), "version %u.%u.%u.%u is older than the first public release %u.%u.%u", version_[0],
+                    version_[1], version_[2], version_[3], kMinRuntimeVersion[0], kMinRuntimeVersion[1], kMinRuntimeVersion[2]);
+      *error = buffer;
+      return false;
     }
-  }
-  if (!HashFile(path, &info->sha256, &info->size)) {
-    *error = "could not hash the file";
-    return false;
+    break;
   }
   return true;
+}
+
+bool VerifiedRuntime::IsSameFile(const std::wstring& path) const {
+  if (file_ == INVALID_HANDLE_VALUE) return false;
+  HANDLE other = CreateFileW(path.c_str(), FILE_READ_ATTRIBUTES, FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE, nullptr,
+                             OPEN_EXISTING, FILE_ATTRIBUTE_NORMAL, nullptr);
+  if (other == INVALID_HANDLE_VALUE) return false;
+  BY_HANDLE_FILE_INFORMATION mine = {};
+  BY_HANDLE_FILE_INFORMATION theirs = {};
+  const bool same = FileId(file_, &mine) && FileId(other, &theirs) && mine.dwVolumeSerialNumber == theirs.dwVolumeSerialNumber &&
+                    mine.nFileIndexHigh == theirs.nFileIndexHigh && mine.nFileIndexLow == theirs.nFileIndexLow;
+  CloseHandle(other);
+  return same;
 }
 
 }  // namespace dsf_dlss5

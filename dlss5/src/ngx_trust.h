@@ -1,31 +1,66 @@
 // SPDX-License-Identifier: MIT
 //
-// Checks on the user-supplied nvngx_dlssnr.dll before NGX is allowed near it: a valid
-// Authenticode signature whose signer is NVIDIA Corporation, and a file version at or
-// above the first public release (310.9.16, shipped in RTX Remix 1.6.1). Patched builds
-// fail the signature check and pre-release builds fail the version check.
+// Checks on the user-supplied nvngx_dlssnr.dll before NGX is allowed near it:
+//  - the file is opened once, with write and delete sharing denied, and stays open for the
+//    lifetime of the VerifiedRuntime, so the checked bytes are the bytes NGX loads;
+//  - its SHA-256 is a known public release (kKnownRuntimes) or one the user allowed
+//    explicitly (--allow-runtime-sha256);
+//  - it has a valid Authenticode signature from NVIDIA Corporation and is at least the
+//    first public version.
+// After NGX creates the feature, IsSameFile confirms the module NGX mapped is this file.
 
 #pragma once
 
+#include <windows.h>
+
 #include <cstdint>
 #include <string>
+#include <vector>
 
 namespace dsf_dlss5 {
 
-struct RuntimeFileInfo {
-  std::wstring path;
-  std::wstring signer;     // signer certificate subject, e.g. "NVIDIA Corporation"
-  uint16_t version[4] = {};  // FileVersion, major..build
-  std::string sha256;      // lowercase hex
-  uint64_t size = 0;
+struct KnownRuntime {
+  const char* sha256;
+  const char* description;
+};
+
+// Public releases of nvngx_dlssnr.dll this project has tested.
+constexpr KnownRuntime kKnownRuntimes[] = {
+    {"2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f", "310.9.16.0 from RTX Remix 1.6.1"},
 };
 
 // The first version NVIDIA published openly (RTX Remix 1.6.1, October 2026).
 constexpr uint16_t kMinRuntimeVersion[4] = {310, 9, 16, 0};
 
-// Fills info and returns true when the file exists, has a valid NVIDIA signature and is
-// at least kMinRuntimeVersion. On failure error says which check failed.
-bool VerifyNgxRuntime(const std::wstring& path, RuntimeFileInfo* info, std::string* error);
+class VerifiedRuntime {
+ public:
+  VerifiedRuntime() = default;
+  ~VerifiedRuntime();
+  VerifiedRuntime(const VerifiedRuntime&) = delete;
+  VerifiedRuntime& operator=(const VerifiedRuntime&) = delete;
+
+  // extraSha256 lists additional allowed hashes (lowercase hex) for newer runtimes.
+  bool Verify(const std::wstring& path, const std::vector<std::string>& extraSha256, std::string* error);
+  // True when path names the same file (volume and file id) as the verified one.
+  bool IsSameFile(const std::wstring& path) const;
+
+  const std::wstring& Path() const { return path_; }
+  std::wstring Directory() const { return path_.substr(0, path_.find_last_of(L"\\/")); }
+  const std::wstring& Signer() const { return signer_; }
+  const uint16_t* Version() const { return version_; }
+  const std::string& Sha256() const { return sha256_; }
+  const char* Description() const { return description_.c_str(); }
+  uint64_t Size() const { return size_; }
+
+ private:
+  HANDLE file_ = INVALID_HANDLE_VALUE;
+  std::wstring path_;
+  std::wstring signer_;
+  uint16_t version_[4] = {};
+  std::string sha256_;
+  std::string description_;
+  uint64_t size_ = 0;
+};
 
 std::string Narrow(const std::wstring& text);
 

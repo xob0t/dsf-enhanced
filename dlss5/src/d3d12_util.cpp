@@ -94,25 +94,22 @@ ID3D12GraphicsCommandList* Gpu::Begin() {
   return list_.Get();
 }
 
-bool Gpu::SubmitAndWait(double* gpuMs, ID3D12Fence* waitFence, uint64_t waitValue, ID3D12Fence* signalFence,
-                        uint64_t signalValue) {
+Gpu::SubmitResult Gpu::Submit(const Sync& sync, double* gpuMs) {
+  if (gpuMs != nullptr) *gpuMs = -1.0;
   if (timestamps_) {
     list_->EndQuery(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 1);
     list_->ResolveQueryData(timestamps_.Get(), D3D12_QUERY_TYPE_TIMESTAMP, 0, 2, timestampReadback_.Get(), 0);
   }
-  if (FAILED(list_->Close())) return false;
-  if (waitFence != nullptr) queue_->Wait(waitFence, waitValue);
+  if (FAILED(list_->Close())) return SubmitResult::kFailed;
+  if (sync.waitFence != nullptr) queue_->Wait(sync.waitFence, sync.waitValue);
   ID3D12CommandList* lists[] = {list_.Get()};
   queue_->ExecuteCommandLists(1, lists);
-  if (signalFence != nullptr) queue_->Signal(signalFence, signalValue);
+  if (sync.signalFence != nullptr) queue_->Signal(sync.signalFence, sync.signalValue);
   queue_->Signal(fence_.Get(), ++fenceValue_);
-  if (fence_->GetCompletedValue() < fenceValue_) {
-    fence_->SetEventOnCompletion(fenceValue_, fenceEvent_);
-    WaitForSingleObject(fenceEvent_, INFINITE);
+  if (!WaitIdle(sync.timeoutMs)) {
+    return device_->GetDeviceRemovedReason() == S_OK ? SubmitResult::kTimeout : SubmitResult::kFailed;
   }
-  staging_.clear();
   if (gpuMs != nullptr) {
-    *gpuMs = -1.0;
     uint64_t frequency = 0;
     uint64_t* ticks = nullptr;
     D3D12_RANGE range = {0, 2 * sizeof(uint64_t)};
@@ -123,6 +120,15 @@ bool Gpu::SubmitAndWait(double* gpuMs, ID3D12Fence* waitFence, uint64_t waitValu
       timestampReadback_->Unmap(0, &none);
     }
   }
+  return device_->GetDeviceRemovedReason() == S_OK ? SubmitResult::kOk : SubmitResult::kFailed;
+}
+
+bool Gpu::WaitIdle(DWORD timeoutMs) {
+  if (fence_->GetCompletedValue() < fenceValue_) {
+    fence_->SetEventOnCompletion(fenceValue_, fenceEvent_);
+    if (WaitForSingleObject(fenceEvent_, timeoutMs) != WAIT_OBJECT_0) return false;
+  }
+  staging_.clear();
   return device_->GetDeviceRemovedReason() == S_OK;
 }
 

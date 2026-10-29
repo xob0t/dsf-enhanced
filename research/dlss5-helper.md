@@ -16,7 +16,7 @@ Date: 2026-10-29. Hardware for every test below: RTX 5070 Ti, driver 621.01, Win
 | --- | --- | --- |
 | dxvk-remix, commit `0ba9973f` (2026-10-28): `src/dxvk/rtx_render/rtx_ngx_wrapper.{h,cpp}`, `rtx_dlss_neural_rendering.{h,cpp}`, `rtx_resources.cpp`, `rtx_context.cpp`, `rtx_camera.cpp`, `shaders/rtx/...` | zlib (DXVK) / MIT (NVIDIA files) | The reference integration: parameters, values, formats, conventions, pipeline position. Read, not copied. |
 | dxvk-remix `packman-external.xml` → package `rtx-remix-ngx_sdk_dlnr@2` (public CloudFront) | NVIDIA RTX SDKs license, headers marked `LicenseRef-NvidiaProprietary` | Contains `nvsdk_ngx_defs_dlssnr.h` and `nvsdk_ngx_helpers_dlssnr_vk.h`. Read only to cross-check names and types. Nothing from it is in this repository. |
-| NVIDIA DLSS SDK v310.9.16 (github.com/NVIDIA/DLSS) | NVIDIA RTX SDKs license | `nvsdk_ngx.h`, `nvsdk_ngx_defs.h`, `nvsdk_ngx_params.h`, `nvsdk_ngx_s.lib`, downloaded at build time by `dlss5/fetch-sdk.ps1` and gitignored. |
+| NVIDIA DLSS SDK 310.9.16 (github.com/NVIDIA/DLSS, commit `9981c635`) | NVIDIA RTX SDKs license | `nvsdk_ngx.h`, `nvsdk_ngx_defs.h`, `nvsdk_ngx_params.h`, `nvsdk_ngx_s.lib`, `LICENSE.txt`, downloaded at build time by `dlss5/fetch-sdk.ps1` from that pinned commit, each checked against a SHA-256, and gitignored. |
 | RTX Remix 1.6.1 release zip | NVIDIA | Source of the signed `nvngx_dlssnr.dll`. Kept in a scratch folder, never committed. |
 | DLSS5-Feeder, commit `16cb1946` | MIT | Studied its protocol and host. |
 | DLSS5-ReShade-AIO (kibblerz), commit `09301f55` | Apache-2.0 (LICENSE, NOTICE confirmed) | Studied. |
@@ -97,6 +97,8 @@ All runs used `dsf-dlss5-offscreen` and `dsf-dlss5-client-test` in this branch, 
 | Motion vectors zeroed (moving camera) | Output changes (max 9/255, mean 0.42/255), so MVs are used. |
 | Depth replaced by a constant 0.5 | Bit-identical output on this scene. Depth had no measurable effect here. Remix still passes it and so do we. Whether the model uses it on other content (characters, for example) is open. |
 | D3D11 opening a D3D12-created shared texture | `E_INVALIDARG` unless the D3D12 texture has `ALLOW_RENDER_TARGET \| ALLOW_SIMULTANEOUS_ACCESS`. With both flags it opens, NGX accepts it, and the output is bit-identical. |
+| Failure paths (`dsf-dlss5-client-test --robustness`) | A repeated frame number and frame 0 get `ERR_PROTOCOL`. A FRAME whose `fence_in` is never signalled gets `ERR_TIMEOUT` after about 2.0 s, with `fence_out` already at that frame. The next FRAME gets `ERR_NOT_CONFIGURED` and `fence_out` still advances. A new CONFIGURE then works again. A header with the wrong version gets `MSG_ERROR(ERR_PROTOCOL)` before the helper exits. |
+| Runtime checks | A file with an unknown SHA-256 is refused. An NVIDIA-signed but different DLL (the driver's `nvngx_dlssd.dll` renamed) is refused by the hash allowlist. With its hash allowed it is still refused by the version floor (310.9.0 < 310.9.16). The verified file stays open with write and delete sharing denied until NGX shuts down, and after CreateFeature the helper checks that the module NGX mapped is that same file (volume and file id). |
 
 ## Architecture decision
 
@@ -113,7 +115,10 @@ Options considered:
 
 - DSF Enhanced starts `dsf-dlss5-helper.exe --game-pid <pid> --game-process <inherited handle>` (the inherited process handle avoids needing `OpenProcess` rights). It then connects to `\\.\pipe\dsf-dlss5.<pid>` and sends HELLO with the adapter LUID.
 - CONFIGURE with the size and formats. A D3D11 game side (dgVoodoo2) may create the textures itself with `SHARED | SHARED_NTHANDLE` and send its handle values. Otherwise the helper creates them and returns NT handles duplicated into the game. That is the path for DXVK, which imports them with `VK_EXTERNAL_MEMORY_HANDLE_TYPE_D3D12_RESOURCE_BIT`. Fences always come from the helper: D3D11 `OpenSharedFence`, or a Vulkan timeline semaphore imported as `D3D12_FENCE`.
-- Per frame n: write the inputs, GPU-signal `fence_in = n`, send FRAME (flags, model, strengths, jitter, MV scale), GPU-wait `fence_out = n`, then composite Output back before the HUD draws.
+- Per frame n: write the inputs, GPU-signal `fence_in = n` and **flush it to the GPU**, send FRAME (flags, model, strengths, jitter, MV scale), read FRAME_ACK and **check its status before** queueing the GPU wait on `fence_out = n`, then composite Output back before the HUD draws.
+- Frame numbers restart at 1 after every CONFIGURE and must increase (gaps are fine). 0 or a non-increasing value is refused with `ERR_PROTOCOL`, because the fences, and the Vulkan timeline semaphores on the DXVK side, cannot go backwards.
+- Every slot is single-buffered. The helper reads the inputs and writes Output until `fence_out = n`. So the inputs for n+1 may only be written, and Output for n only read, after `fence_out >= n`. A frame-lagged game copies its next inputs into the shared slots after that wait.
+- Failures: the helper waits about 2 s for `fence_in`. If the signal never comes, it signals `fence_in` itself so its queue drains, answers `ERR_TIMEOUT`, and needs a new CONFIGURE. On every error path where the fence still exists, the helper moves `fence_out` to n from the CPU, so a GPU wait the game already queued cannot hang. The game should also give up on a missing ACK after a few seconds: `dsf_dlss5_pipe.h` reads and writes with a timeout on an overlapped pipe handle. A malformed message gets `MSG_ERROR` and ends the connection. Only the game's process id may connect to the pipe.
 
 Inputs DSF Enhanced has to produce:
 
@@ -131,9 +136,9 @@ Under DXVK, the D3D9 interop interface (`ID3D9VkInteropDevice`: Vulkan handles o
 
 ## Licensing notes
 
-- Everything committed is MIT. That includes `dlss5/src/dlssnr_defs.h`, which states interface facts: feature id 18 and the parameter names that the runtime itself contains as strings, and that the MIT RenoDX source and the zlib Remix source also show. No NVIDIA header text is included. The names were cross-checked against the proprietary `nvsdk_ngx_defs_dlssnr.h` from Remix's public packman package, which was read but not copied.
-- The build downloads the NVIDIA DLSS SDK headers and `nvsdk_ngx_s.lib` at build time (RTX SDKs license) into a gitignored folder. A built helper contains NVIDIA's static loader in object form, which section 1(c)/2 of that license allows inside an application with material additional functionality. Any binary release must carry that notice.
-- No NVIDIA DLL is committed, packaged or downloaded by our scripts. Users fetch `nvngx_dlssnr.dll` from the RTX Remix release themselves (steps in `dlss5/README.md`). The helper only accepts NVIDIA-signed builds ≥ 310.9.16.
+- Everything committed is MIT. That includes `dlss5/src/dlssnr_defs.h`, which states interface facts: feature id 18; the parameter names, which the runtime itself contains as strings and which the MIT RenoDX source also uses (Remix's MIT-licensed NVIDIA files show the identifiers but not the strings); and the numbers behind the preset and mask-blend names. No open source states those numbers, so they were taken as bare values from the proprietary `nvsdk_ngx_defs_dlssnr.h` in Remix's public packman package. The preset numbering matches the public SDK's DLSS presets. No NVIDIA header text is included.
+- The build downloads the NVIDIA DLSS SDK headers and `nvsdk_ngx_s.lib` at build time (RTX SDKs license) into a gitignored folder, from a pinned commit with a SHA-256 check per file. A built helper contains NVIDIA's static loader in object form, which section 1(c)/2 of that license allows inside an application with material additional functionality. Any binary release must carry that notice.
+- No NVIDIA DLL is committed, packaged or downloaded by our scripts. Users fetch `nvngx_dlssnr.dll` from the RTX Remix release themselves (steps in `dlss5/README.md`). The helper only accepts a runtime whose SHA-256 is on its allowlist (today only the Remix 1.6.1 file), or one the user allowed with `--allow-runtime-sha256`. Either way the file must also be NVIDIA-signed and at least 310.9.16.
 - Unlike AIO and RenoDX's add-on, we do not load the feature DLL directly or alter what NVIDIA's checks see. The driver's NGX core loads and verifies it.
 - The NVIDIA RTX SDKs license supplement asks for notification before a *commercial* release. This project is not commercial.
 
@@ -146,5 +151,6 @@ None. The offscreen tests ran on the host GPU with no window and no game. No in-
 - Game side (the DSF Enhanced owner): pre-HUD capture point, depth access, MV generation from the renderer's matrices, and the DXVK interop path. Then the first in-game run on the host through the driversf-forza harness (`-OnHost`), with the helper and runtime placed via `-Override`.
 - Whether depth matters on other content, the effect of the ControlMask channels, and the optional UI/Backbuffer inputs, measured on real game captures. Add `--depth`/`--mv` PFM dumps from the game side to the offscreen test.
 - Performance at 1080p/1440p/4K and with the frame-lagged composite.
-- Run the helper's `ReleaseFeature`/`Shutdown` paths under a resolution-change stress test. Add a timeout on the helper's fence wait so a game that stops signalling cannot hang the helper. Today the helper only exits when the game process dies.
+- Run the helper's `ReleaseFeature`/`Shutdown` paths under a resolution-change stress test.
+- If NVIDIA starts shipping DLSSNR through NGX's own update channel (the `C:\ProgramData\NVIDIA\NGX\models` cache), NGX may prefer that copy. The helper will then refuse to run, because the mapped module is not the verified file. Supporting that case would mean verifying the cached file the same way.
 - The D3D11 NGX path (exported, untested) would let a 64-bit D3D11 helper skip D3D12. Not needed now.

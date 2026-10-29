@@ -17,6 +17,9 @@
 //      the DLSSNR feature are (re)created.
 //   5. FRAME / FRAME_ACK once per frame.
 //   6. SHUTDOWN, a broken pipe, or the game process exiting ends the helper.
+//   A message the helper cannot parse (bad magic, version, type or size) is answered with
+//   DSF_DLSS5_MSG_ERROR and ends the connection. Only the game process may connect: the
+//   helper checks the pipe client's process id against --game-pid.
 //
 // Shared resources
 //   Five 2D textures (DSF_DLSS5_SLOT_*) and two fences. Either side may create the
@@ -32,14 +35,36 @@
 //   them as timeline semaphores (VK_EXTERNAL_SEMAPHORE_HANDLE_TYPE_D3D12_FENCE_BIT).
 //   The game owns the handles it receives and closes them on reconfigure or shutdown.
 //
-// Per frame n (n starts at 1 and increases by one per FRAME)
-//   game:   write Color, Depth, MotionVectors (and ControlMask if used) for frame n,
-//           GPU-signal fence_in = n, send FRAME{n}.
+// Per frame n
+//   n is the fence value for the frame. It starts at 1 after every CONFIGURE (the fences
+//   are new) and must increase with each FRAME; the helper rejects 0 or a value that is
+//   not greater than the last one with DSF_DLSS5_ERR_PROTOCOL, because a fence (and a
+//   Vulkan timeline semaphore) can never go backwards. Skipping values is allowed.
+//
+//   game:   write Color, Depth, Motion (and Mask if used) for frame n, GPU-signal
+//           fence_in = n, and FLUSH that signal to the GPU (D3D11 Flush, vkQueueSubmit)
+//           before sending FRAME{n}. Otherwise the helper waits for a signal that is
+//           still sitting in the game's command buffer.
 //   helper: GPU-wait fence_in >= n, run DLSS 5 into Output, GPU-signal fence_out = n,
-//           send FRAME_ACK{n} (after the GPU finished when DSF_DLSS5_FRAME_ACK_AFTER_GPU).
-//   game:   GPU-wait fence_out >= n before reading Output.
-//   Output is single-buffered: the game must not send FRAME{n+1} before its reads of
-//   Output for frame n are ordered before its fence_in = n+1 signal.
+//           and send FRAME_ACK{n} once its GPU work for n has finished. The ACK therefore
+//           means fence_out >= n has been reached.
+//   game:   read FRAME_ACK and check its status BEFORE queueing a GPU wait on fence_out.
+//           On every error the helper still moves fence_out to n (from the CPU if no GPU
+//           work will), as long as the fences exist: they live from a successful
+//           CONFIGURE until the next CONFIGURE. A rejected frame number (ERR_PROTOCOL)
+//           is not signalled. After ERR_TIMEOUT, ERR_NOT_CONFIGURED or ERR_DEVICE the
+//           game drops the frame and sends CONFIGURE again.
+//
+//   Timeout: if fence_in = n does not arrive within about 2 s, the helper signals
+//   fence_in = n itself so its queue drains, answers DSF_DLSS5_ERR_TIMEOUT and becomes
+//   unconfigured until the next CONFIGURE. The game should likewise give up on a missing
+//   ACK after a few seconds (see dsf_dlss5_pipe.h for reads with a timeout).
+//
+//   Every slot is single-buffered. The helper reads the inputs and writes Output until
+//   fence_out = n, so the game must not write the inputs for n+1, or read Output for n,
+//   before fence_out >= n. In practice: the writes for n+1 are queued after the GPU wait
+//   on fence_out >= n. A frame-lagged game that wants to render n+1 while the helper
+//   works on n must copy its inputs into the shared slots only after that wait.
 //
 // Input conventions (research/dlss5-helper.md has the sources)
 //   Color   display-encoded (sRGB) SDR in [0,1], taken before the HUD is drawn.
@@ -72,6 +97,7 @@ enum DsfDlss5MessageType {
   DSF_DLSS5_MSG_FRAME = 5,
   DSF_DLSS5_MSG_FRAME_ACK = 6,
   DSF_DLSS5_MSG_SHUTDOWN = 7,
+  DSF_DLSS5_MSG_ERROR = 8,  // helper -> game, DsfDlss5Error, then the helper disconnects
 };
 
 enum DsfDlss5Slot {
@@ -91,12 +117,13 @@ enum DsfDlss5ClientApi {
 
 enum DsfDlss5Status {
   DSF_DLSS5_OK = 0,
-  DSF_DLSS5_ERR_PROTOCOL = 1,      // bad magic, version or size
+  DSF_DLSS5_ERR_PROTOCOL = 1,      // bad magic, version, size or message order; bad frame number
   DSF_DLSS5_ERR_RUNTIME = 2,       // nvngx_dlssnr.dll missing, unsigned or too old
   DSF_DLSS5_ERR_DEVICE = 3,        // no D3D12 device on the requested adapter
   DSF_DLSS5_ERR_NGX = 4,           // NGX init, feature support, create or evaluate failed
   DSF_DLSS5_ERR_RESOURCES = 5,     // shared texture or fence creation/open failed
   DSF_DLSS5_ERR_NOT_CONFIGURED = 6,
+  DSF_DLSS5_ERR_TIMEOUT = 7,       // fence_in = n never arrived; send CONFIGURE again
 };
 
 // CONFIGURE flags
@@ -107,7 +134,7 @@ enum DsfDlss5Status {
 // FRAME flags
 #define DSF_DLSS5_FRAME_RESET 0x1u          // camera cut, discard history
 #define DSF_DLSS5_FRAME_AUTO_MASK 0x2u      // let the runtime's character mask combine (Remix default)
-#define DSF_DLSS5_FRAME_ACK_AFTER_GPU 0x4u  // FRAME_ACK only after the GPU finished frame n
+#define DSF_DLSS5_FRAME_GPU_TIME 0x4u       // report the evaluate's GPU time in FRAME_ACK::gpu_ms
 #define DSF_DLSS5_FRAME_BYPASS 0x8u         // copy Color to Output without DLSS 5 (A/B)
 
 typedef struct DsfDlss5Header {
@@ -167,11 +194,16 @@ typedef struct DsfDlss5Frame {
   float skin_strength;       // 0..1, Remix default 0.5 (only with AUTO_MASK)
 } DsfDlss5Frame;
 
+typedef struct DsfDlss5Error {
+  int32_t status;
+  char message[124];
+} DsfDlss5Error;
+
 typedef struct DsfDlss5FrameAck {
   uint64_t frame;
   int32_t status;
   uint32_t ngx_result;
-  float gpu_ms;  // GPU time of the evaluate when ACK_AFTER_GPU, else -1
+  float gpu_ms;  // GPU time of the evaluate with DSF_DLSS5_FRAME_GPU_TIME, else -1
   uint32_t reserved;
 } DsfDlss5FrameAck;
 
@@ -183,4 +215,5 @@ static_assert(sizeof(DsfDlss5Configure) == 80, "protocol layout");
 static_assert(sizeof(DsfDlss5ConfigureAck) == 344, "protocol layout");
 static_assert(sizeof(DsfDlss5Frame) == 48, "protocol layout");
 static_assert(sizeof(DsfDlss5FrameAck) == 24, "protocol layout");
+static_assert(sizeof(DsfDlss5Error) == 128, "protocol layout");
 #endif

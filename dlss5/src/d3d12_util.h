@@ -27,13 +27,26 @@ class Gpu {
   LUID AdapterLuid() const { return luid_; }
   const std::wstring& AdapterName() const { return adapterName_; }
 
-  // Resets the shared allocator and list and returns the list ready for recording.
+  // Resets the shared allocator and list and returns the list ready for recording. The
+  // previous submission must have completed (Submit returned kOk, or WaitIdle succeeded).
   ID3D12GraphicsCommandList* Begin();
-  // Closes, executes and waits for the list returned by Begin. The queue first waits for
-  // waitFence >= waitValue and signals signalFence = signalValue after the list, when given.
-  // gpuMs receives the GPU time of the list when timestamps are available, otherwise -1.
-  bool SubmitAndWait(double* gpuMs = nullptr, ID3D12Fence* waitFence = nullptr, uint64_t waitValue = 0,
-                     ID3D12Fence* signalFence = nullptr, uint64_t signalValue = 0);
+
+  struct Sync {
+    ID3D12Fence* waitFence = nullptr;    // the queue waits for waitFence >= waitValue first
+    uint64_t waitValue = 0;
+    ID3D12Fence* signalFence = nullptr;  // and signals signalFence = signalValue after the list
+    uint64_t signalValue = 0;
+    DWORD timeoutMs = INFINITE;          // CPU wait for the list to finish
+  };
+  enum class SubmitResult { kOk, kTimeout, kFailed };
+  // Closes and executes the list returned by Begin, then waits up to sync.timeoutMs for it.
+  // kTimeout leaves the work queued: call WaitIdle before the next Begin. kFailed means
+  // the list could not be closed (nothing was executed) or the device was removed. gpuMs
+  // receives the GPU time of the list on kOk when timestamps are available, otherwise -1.
+  SubmitResult Submit(const Sync& sync, double* gpuMs = nullptr);
+  bool SubmitAndWait(double* gpuMs = nullptr) { return Submit(Sync{}, gpuMs) == SubmitResult::kOk; }
+  // Waits for everything submitted so far. False on timeout or device removal.
+  bool WaitIdle(DWORD timeoutMs);
 
   ComPtr<ID3D12Resource> CreateTexture(uint32_t width, uint32_t height, DXGI_FORMAT format,
                                        D3D12_RESOURCE_FLAGS flags, D3D12_RESOURCE_STATES state,

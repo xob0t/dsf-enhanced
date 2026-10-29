@@ -2,17 +2,21 @@
 //
 // Minimal declarations for NVIDIA's DLSS 3D-Guided Neural Rendering feature ("DLSS 5",
 // NGX feature DLSSNR). NVIDIA's public DLSS SDK (310.9.16) does not ship a header for it.
-// These are written for this project from public, openly licensed sources:
+// These are written for this project. What they rest on:
 //
-//  - dxvk-remix (zlib), src/dxvk/rtx_render/rtx_ngx_wrapper.cpp and
-//    rtx_dlss_neural_rendering.cpp: which parameters exist, their meaning and the values
-//    Remix passes (Preset B at create; Reset, DepthInverted=0, Enabled=1, Intensity,
-//    LocalToneStrength, LocalStructureStrength, Style, UseAutoMask, MaskBlendMode,
-//    SkinStructureStrength, MVecScale, the five subrects, and Jitter.Offset.X/Y).
+//  - dxvk-remix, src/dxvk/rtx_render/rtx_ngx_wrapper.cpp and rtx_dlss_neural_rendering.cpp
+//    (NVIDIA's MIT-licensed files in the zlib-licensed DXVK fork): which parameters exist,
+//    their meaning, and the values Remix passes by name (preset B at create; Reset,
+//    DepthInverted=0, Enabled=1, Intensity, LocalToneStrength, LocalStructureStrength,
+//    Style, UseAutoMask, MaskBlendMode Min/None, SkinStructureStrength, MVecScale, the five
+//    subrects, and Jitter.Offset.X/Y).
 //  - The NGX feature id: the public SDK's NVSDK_NGX_Feature_Reserved18 (= 18).
-//  - The parameter name strings, which are the keys the signed runtime nvngx_dlssnr.dll
-//    reads. They are the same strings the open-source RenoDX dlss5 add-on (MIT) sets, and
-//    they appear verbatim in the runtime's string table.
+//  - The parameter name strings: the keys the signed runtime nvngx_dlssnr.dll reads, which
+//    appear verbatim in its string table and which the MIT RenoDX dlss5 add-on also sets.
+//  - The numbers behind the Preset and MaskBlendMode names, which no open source states:
+//    taken as bare values from NVIDIA's nvsdk_ngx_defs_dlssnr.h in the public packman
+//    package rtx-remix-ngx_sdk_dlnr@2 that dxvk-remix builds against. The preset numbering
+//    (Default 0, then A, B, ... from 1) is the same as the public SDK's DLSS presets.
 //
 // research/dlss5-helper.md has the full provenance notes. No NVIDIA header text is
 // reproduced here.

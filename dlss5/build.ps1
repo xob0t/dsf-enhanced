@@ -4,17 +4,16 @@ param(
 )
 
 # Builds the x64 DLSS 5 helper, its offscreen test and the x86 protocol test client with
-# the VS 2022 toolchain into dlss5\build. Fetches the public DLSS SDK headers and static
-# NGX loader on first use (see fetch-sdk.ps1); nothing from NVIDIA is committed.
+# the VS 2022 toolchain into dlss5\build. fetch-sdk.ps1 runs first on every build: it checks
+# the pinned DLSS SDK headers and static NGX loader by SHA-256 and downloads any file that
+# is missing or does not match. Nothing from NVIDIA is committed.
 
 $ErrorActionPreference = "Stop"
 
 $root = $PSScriptRoot
 $build = Join-Path $root "build"
 $sdk = Join-Path $root "external\dlss-sdk"
-if (-not (Test-Path -LiteralPath (Join-Path $sdk "lib\nvsdk_ngx_s.lib"))) {
-  & (Join-Path $root "fetch-sdk.ps1")
-}
+& (Join-Path $root "fetch-sdk.ps1") -Destination $sdk
 $x64 = Join-Path $build "x64"
 $x86 = Join-Path $build "x86"
 foreach ($dir in @($x64, $x86)) {
@@ -38,6 +37,9 @@ $shared = @("src\nr_d3d12.cpp", "src\ngx_trust.cpp", "src\d3d12_util.cpp") | For
 $ngxLibs = @("`"$sdk\lib\nvsdk_ngx_s.lib`"", "d3d12.lib", "dxgi.lib", "advapi32.lib", "user32.lib", "ole32.lib")
 
 # One cl invocation per target, its arguments in a response file so paths need no shell quoting.
+# /DEPENDENTLOADFLAG:0x800 (LOAD_LIBRARY_SEARCH_SYSTEM32) makes the loader resolve the
+# executables' DLL imports (d3d12, dxgi, wintrust, ...) from System32 only, never from the
+# application folder.
 # vcvarsall looks for vswhere on PATH.
 $installerDir = Split-Path -Parent $vswhere
 function Invoke-Cl([string]$arch, [string]$name, [string[]]$arguments) {
@@ -46,7 +48,7 @@ function Invoke-Cl([string]$arch, [string]$name, [string[]]$arguments) {
   $all = $common + $arguments + @("/Fo`"$outDir\\`"", "/Fe`"$outDir\$name.exe`"")
   Set-Content -LiteralPath $rsp -Value ($all -join "`r`n") -Encoding ascii
   $machine = if ($arch -eq "x64") { "X64" } else { "X86" }
-  cmd /d /c "set `"PATH=%PATH%;$installerDir`" && call `"$vcvarsall`" $arch >nul && cl @`"$rsp`" /link /MACHINE:$machine"
+  cmd /d /c "set `"PATH=%PATH%;$installerDir`" && call `"$vcvarsall`" $arch >nul && cl @`"$rsp`" /link /MACHINE:$machine /DEPENDENTLOADFLAG:0x800"
   if ($LASTEXITCODE -ne 0) {
     throw "Building $name ($arch) failed with exit code $LASTEXITCODE"
   }
