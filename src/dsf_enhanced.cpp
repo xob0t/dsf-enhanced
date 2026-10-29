@@ -21,6 +21,7 @@
 
 #include "cinematic_fit.h"
 #include "dlss5_shared.h"
+#include "vs_jitter_patch.h"
 #include "../dlss5/include/dsf_dlss5_pipe.h"
 #include "vk_min.h"
 
@@ -370,6 +371,11 @@ void TrackLastD3DDevice(IDirect3DDevice9* device);
 void RehookTrackedD3DDevice(const char* source);
 void LoadDlss5Config(const char* ini_path);
 void Dlss5OnReset();
+// [DLAA] (dlaa.inl)
+extern bool g_dlaa_jitter;
+void LoadDlaaConfig(const char* ini_path);
+void DlaaApplyPresentation(D3DPRESENT_PARAMETERS* pp, const char* source);
+DWORD DlaaSamplerLodBias(DWORD sampler, DWORD value);
 void Dlss5Shutdown();
 
 void BuildGamePath(char* out, DWORD out_size, const char* name)
@@ -544,6 +550,7 @@ void LoadConfig()
     g_shadow_map_size = shadow_map_size <= 0 ? 0 : ClampInt(shadow_map_size, kShadowMapMinSize, kShadowMapMaxSize);
     LoadFlareConfig(ini_path);
     LoadDlss5Config(ini_path);
+    LoadDlaaConfig(ini_path);
 }
 
 bool WriteMemory(void* address, const void* data, size_t size)
@@ -2030,6 +2037,8 @@ void ApplyPresentationTweaks(D3DPRESENT_PARAMETERS* presentation_parameters, HWN
         Log("%s: PresentationInterval %u -> %u", source, old_interval, presentation_parameters->PresentationInterval);
     }
 
+    DlaaApplyPresentation(presentation_parameters, source);
+
     UpdateBackbuffer(presentation_parameters->BackBufferWidth, presentation_parameters->BackBufferHeight, source);
 }
 
@@ -2177,6 +2186,10 @@ HRESULT STDMETHODCALLTYPE ProxySetSamplerState(
         if (g_texture_lod_bias != 0.0f && type == D3DSAMP_MIPMAPLODBIAS) {
             value = FloatBits(g_texture_lod_bias);
         }
+
+        if (g_dlaa_jitter && type == D3DSAMP_MIPMAPLODBIAS) {
+            value = DlaaSamplerLodBias(sampler, value);
+        }
     }
 
     return g_real_set_sampler_state(device, sampler, type, value);
@@ -2198,6 +2211,7 @@ HRESULT STDMETHODCALLTYPE ProxyReset(IDirect3DDevice9* device, D3DPRESENT_PARAME
 #include "dlss5_feed.inl"
 #include "dlss5_objects.inl"
 #include "dlss5_bridge.inl"
+#include "dlaa.inl"
 
 bool HookDeviceVTable(void** vtable, size_t index, void* replacement, void** original, const char* name)
 {

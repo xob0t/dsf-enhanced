@@ -2251,6 +2251,7 @@ void Dlss5OnReset()
     g_d5_counting_rt = nullptr;
     g_d5_counting_frame = -1;
     g_d5_counting_full = false;
+    DlaaOnReset();
 }
 
 // DLL_PROCESS_DETACH.

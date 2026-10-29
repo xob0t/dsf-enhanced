@@ -1,6 +1,8 @@
 # DLAA for Driver SF: research and design
 
-Status 2026-10-29: research only, no code yet. DLAA here is NVIDIA DLSS Super Resolution (NGX feature
+Status 2026-10-30: PR 1 (game-side jitter and the AA switches, `feat/dlaa-jitter`) is built and tested
+offline; see "PR 1 as built". PR 2 (the helper) is on `feat/dlaa-helper`. Game-side DLAA (PR 3) is not
+started. The design below is from 2026-10-29. DLAA here is NVIDIA DLSS Super Resolution (NGX feature
 `NVSDK_NGX_Feature_SuperSampling`) at a render scale of 1.0, run by the existing 64-bit helper on the
 game's HDR scene target, the same point the parallel `feat/dlss5-hdr-input` work uses for DLSS 5.
 
@@ -193,6 +195,62 @@ Per draw, in `D5BeforeDraw`: if the bound vertex shader is patched, compute
 `(0, 0, 0, 0)` otherwise. Upload `cJ` only when its value differs from the shadow copy.
 `D5SetVsConstantF` already sees every constant upload, so a game upload to that register from another
 shader invalidates the shadow copy.
+
+### The free constant register (static)
+
+`J` is **c255** in every patched shader. Proof, from `tests/vs_jitter_test.cpp` run over the game's
+files (2026-10-30):
+
+- **Which files.** Every package in `media` and `Install` that is not audio (`*.fchunk`, `*.sp`, the
+  3.1 GB `dngvehicles.sp` and the 795 MB `san_francisco.dngc`), plus `Driver.exe` and `DFEngine.dll`.
+- **How shaders are found.** Every byte offset that holds a vertex shader version token (vs_1_1, 2_0,
+  2_x, 3_0) is walked to its end token and disassembled with `D3DDisassemble`. Blobs whose disassembly
+  has unknown opcodes (`???`) or no instruction are not shaders. Duplicates are removed by the
+  plugin's shader hash.
+- **Result.** 383 unique vertex shaders, all vs_3_0, all with a constant table.
+- **What each shader can reach.** For each shader the patcher takes the highest of:
+  - every `c` operand;
+  - every `def`;
+  - every float4 range in the constant table, which covers arrays read through `a0`/`aL`, such as
+    the 183-register bone palette or the 208-register `g_litterToWorld`.
+
+  Any relative read whose base lies outside every table range would make the shader's reach unknown.
+  That shader would be left unpatched. None of the 383 has one.
+- **Highest register any shader reaches: c215.** That is `vs_7F46FBDC` (litter): `g_litterToWorld`
+  `c0-c207`, `s_WorldToScreen` `c208-c211`, `s_FogParams` `c214`, and `def c215`. The next highest
+  are the vehicle shaders (`g_mtxWorldRotationToScreen` up to `c195`, `g_WorldToCam` `c199-c202`,
+  `g_TexUVScale` `c204`). c216-c255 are unused by every shader.
+- **Runtime guard.** The patcher checks each shader again when the game creates it, and leaves it
+  unpatched if it reaches c255. The plugin also logs once if the game ever writes c255.
+- **Layouts covered** (shaders by the clip transform in their constant table; one shader can have
+  more than one):
+
+  | Clip transform | Shaders |
+  | --- | --- |
+  | `g_ObjectToScreen` | 226 |
+  | `g_mtxWorldRotationToScreen` (vehicles) | 76 |
+  | `g_ViewToProj_Column0-3` | 29 |
+  | `g_CameraToScreen` (particles) | 21 |
+  | `g_boneMatrixArray` (skinned) | 12 |
+  | `s_WorldToScreen` | 8 |
+
+- **Flow control.** 16 shaders use `if`, `loop` or `rep`. None uses `call`, `label` or `ret`. The
+  patcher would still insert its two instructions before main's first top-level `ret`.
+- **The patch holds up.** All 383 patch. Each patched shader disassembles, has exactly one
+  `mad o0.xy, rN.w, c255.xyyy, rN.xyyy`, and keeps its declarations.
+
+Run it again with:
+
+```powershell
+build\vs_jitter_test.exe [--dump <dir>] "D:\Games\Driver San Francisco\media\SfxMisc.fchunk" ...
+```
+
+The test's `--gpu` mode draws through a patched pass-through shader on a D3D9 HAL device. The draw
+is a 64x64 target at w = 2, with `J = (2·4/64, −2·3/64)`. Result on the RTX 5070 Ti:
+
+- the picture's centroid moved from (32.000, 30.000) to (36.000, 33.000), +4 px right and +3 px down,
+  as the sign convention says;
+- with J = 0 the patched shader draws exactly what the original draws.
 
 Why this method rather than editing the matrices:
 
@@ -487,6 +545,50 @@ is set 35 with a target of exactly the render size, not the busiest pass. Files:
   unchanged. Run it locally on the shaders extracted from the game files and on `TraceShaders=1`
   dumps. Game shaders are not committed.
 
+**PR 1 as built** (`feat/dlaa-jitter`, 2026-10-30):
+
+- **Files.**
+  - `src/vs_jitter_patch.h`: the token walker and the patch. It has no Windows dependency.
+  - `src/dlaa.inl`: the ini, the Halton sequence, the per-draw J, the scene's LOD bias, and the MLAA
+    and MSAA switches.
+  - Hooks in `src/dlss5_feed.inl`, `src/dsf_enhanced.cpp` (`ProxySetSamplerState`,
+    `ApplyPresentationTweaks`) and `Dlss5OnReset`.
+- **Ini keys** (`[DLAA]`, all off by default): `Jitter`, `JitterPhases` (16), `JitterDebugPixels`,
+  `MipBias` (−1), `DisableMLAA`, `DisableSwapChainMSAA`. These replace the planned `ForceGameAAOff`,
+  so the two parts can be tested on their own. `Enable` and `Preset` come with PR 3. With every key 0
+  nothing is hooked: `Jitter` and `DisableMLAA` install the existing detours, without `Export`.
+- **Shader model 1.** vs_1_x has no instruction length field, so the walker uses an opcode table, and
+  any opcode outside it leaves the shader unpatched. J is c255 there too. vs_1_x only guarantees 96
+  constants, and a device that refuses the patched copy gets the original. The game has no vs_1_x
+  shaders.
+- **Scene gate.** J is non-zero only on draws that meet all three conditions:
+  - the target is the scene target (`D5IsScenePass`);
+  - the render queue's set is 35 or 30;
+  - the scene end has not been seen yet this frame.
+
+  Draws after the scene end (a re-entered scene target), the shadow map, the minimap, post and the
+  HUD get J = 0. J is uploaded only when the value differs from what c255 already holds.
+- **LOD bias.** The scene's LOD bias goes on at the first jittered draw. It comes off at the scene end
+  (and at Present as a fallback), back to what the game and `TextureLODBias` set.
+- **MLAA skip.** It checks the targets before skipping:
+  - set 24 must draw to `R5G6B5` at the render size, and set 25 to `A8R8G8B8` at the render size;
+  - anything else keeps MLAA and logs once.
+
+  The first skipped draw of set 25 clears its target to 0. The log names the skipped passes' pixel
+  shaders (`3405C219`, `AECA6459` expected).
+- **Swap-chain MSAA.** `DisableSwapChainMSAA` sets `MultiSampleType` and `MultiSampleQuality` to 0 in
+  `CreateDevice` and `Reset`. It logs what the game asked for, which also answers V5.
+- **Logging.** `Trace=1` logs each patched shader. A shader left unpatched is always logged once,
+  with its hash and the reason.
+- **Test name.** The test is `vs_jitter_test`, not `vs_patch_test` as planned. Windows' installer
+  detection asks to elevate unmanifested 32-bit programs whose names contain "patch".
+- **Offline results.**
+  - the self-test passes (vs_1_1, vs_2_0 and vs_3_0 world, skinned and particle layouts; c255 in use;
+    a table range over c255; relative reads with the table stripped; partial position writes;
+    truncated bytecode; pixel shaders);
+  - the game scan and `--gpu` gave the results above.
+- **Not yet run in a VM or on the host.** The checks are V1-V5 below.
+
 **PR 2: helper (DLSS SR at 1.0).**
 
 - `dlss5/include/dsf_dlss5_protocol.h`: v2 as above.
@@ -555,9 +657,9 @@ Host A/B shots, when the user allows a host run:
 | # | Check | How |
 | --- | --- | --- |
 | V1 | Does `AntiAliasing = 0` turn MLAA off? | One VM run with the guest's `graphics.ini` set to `AntiAliasing = 0` (`setup-vm.ps1` rewrites only the window size today) and `[DLSS5] Trace=1`. Do target sets 24 and 25 (`3405C219`, `AECA6459`) disappear? |
-| V2 | Which scene draws move with jitter | PR 1 build, `JitterDebugPixels=48`: cockpit, chase and Shift shots. Everything 3D in the scene should move (characters, particles, sky, cars); the HUD, shadows and minimap should not |
-| V3 | The patcher over the real shader set | PR 1 build, `Trace=1`: count of patched and rejected vertex shaders over a drive and a cutscene; no D3D errors |
-| V4 | MLAA skip and the forced non-MSAA swap chain | `ForceGameAAOff=1`: sets 24 and 25 skipped, `T#29` cleared, the composite unchanged otherwise; `CreateDevice` logs `MultiSampleType` 4 requested, 0 used |
+| V2 | Which scene draws move with jitter | PR 1 build, `Jitter=1 JitterDebugPixels=48`: cockpit, chase and Shift shots. Everything 3D in the scene should move (characters, particles, sky, cars); the HUD, shadows, minimap and mirrors should not. Then `JitterDebugPixels=0`: the scene should shimmer by under a pixel, the HUD not at all |
+| V3 | The patcher over the real shader set | PR 1 build, `Jitter=1 [DLSS5] Trace=1`: count of patched and rejected vertex shaders over a drive and a cutscene (the offline scan expects 0 rejected); no D3D errors; no "game writes vertex constant c255" line |
+| V4 | MLAA skip and the forced non-MSAA swap chain | `DisableMLAA=1`: the log names sets 24 and 25 skipped with `3405C219`/`AECA6459`, `T#29` cleared, and the composite otherwise unchanged (edges visibly aliased). `DisableSwapChainMSAA=1`: `CreateDevice` logs `MultiSampleType` 4 requested, forced to none |
 | V5 | What the game requests today | the `MultiSampleType` log line from V4 with `AntiAliasing = 1`, confirming the static reading at runtime |
 | V6 | Split screen | two viewports in set 35: does the plugin detect them and keep DLAA off? |
 
