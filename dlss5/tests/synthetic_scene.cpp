@@ -239,6 +239,8 @@ bool Project(const Camera& c, V3 p, uint32_t width, uint32_t height, float* px, 
 
 }  // namespace
 
+float ToneMapValue(float linear) { return ToneMap(linear); }
+
 void HaltonJitter(int index, float* x, float* y) {
   auto halton = [](int i, int base) {
     float f = 1.0f;
@@ -259,6 +261,7 @@ void Render(uint32_t width, uint32_t height, int frame, float jitterX, float jit
   out->color.assign(static_cast<size_t>(width) * height * 4, 1.0f);
   out->depth.assign(static_cast<size_t>(width) * height, 1.0f);
   out->motion.assign(static_cast<size_t>(width) * height * 2, 0.0f);
+  out->linear.assign(static_cast<size_t>(width) * height * 4, 1.0f);
   const Camera cur = CameraAt(frame);
   const Camera prev = CameraAt(frame - 1);
   const float aspect = static_cast<float>(width) / static_cast<float>(height);
@@ -276,6 +279,9 @@ void Render(uint32_t width, uint32_t height, int frame, float jitterX, float jit
         out->color[i * 4 + 0] = ToneMap(c.x);
         out->color[i * 4 + 1] = ToneMap(c.y);
         out->color[i * 4 + 2] = ToneMap(c.z);
+        out->linear[i * 4 + 0] = c.x;
+        out->linear[i * 4 + 1] = c.y;
+        out->linear[i * 4 + 2] = c.z;
 
         const Hit hit = Trace(cur.position, d);
         // Sky reprojects as a direction: a point far beyond the scene.
@@ -284,8 +290,10 @@ void Render(uint32_t width, uint32_t height, int frame, float jitterX, float jit
         if (hit.kind >= 0 && Project(cur, world, width, height, &px, &py, &depth)) out->depth[i] = depth;
         float ppx, ppy, pdepth;
         if (Project(prev, world, width, height, &ppx, &ppy, &pdepth)) {
-          out->motion[i * 2 + 0] = ppx - (x + 0.5f);
-          out->motion[i * 2 + 1] = ppy - (y + 0.5f);
+          // The sampled point is at (sx, sy) now: its own motion, which carries no jitter. Measured
+          // from the pixel centre it would carry -jitter (and DLAA would be told the wrong motion).
+          out->motion[i * 2 + 0] = ppx - sx;
+          out->motion[i * 2 + 1] = ppy - sy;
         }
       }
     }

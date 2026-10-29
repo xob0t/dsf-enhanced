@@ -1,7 +1,8 @@
 # DLAA for Driver SF: research and design
 
 Status 2026-10-30: PR 1 (game-side jitter and the AA switches, `feat/dlaa-jitter`) is built and tested
-offline; see "PR 1 as built". PR 2 (the helper) is on `feat/dlaa-helper`. Game-side DLAA (PR 3) is not
+offline; see "PR 1 as built". PR 2 (the helper: protocol v2 and the DLAA pass, `feat/dlaa-helper`) is
+built and tested offline, including the jitter sign test; see "PR 2 as built". Game-side DLAA (PR 3) is not
 started. The design below is from 2026-10-29. DLAA here is NVIDIA DLSS Super Resolution (NGX feature
 `NVSDK_NGX_Feature_SuperSampling`) at a render scale of 1.0, run by the existing 64-bit helper on the
 game's HDR scene target, the same point the parallel `feat/dlss5-hdr-input` work uses for DLSS 5.
@@ -296,6 +297,8 @@ section 3.7, and the 310.9.16 headers:
 - **Checking the sign.** A wrong sign leaves static scenes fuzzy or wobbling (3.7.4). Check it offline
   first (PR 2 test) and, in a debug build only, with the SDK's development DLL, whose `CTRL+ALT+F10`
   hotkey cycles negations of the jitter (guide 8.4).
+- **Checked (PR 2, offline).** The offscreen test confirms the protocol's convention: +x +y at 1x is the
+  only variant that settles to a sharp, still image. The numbers are under "PR 2 as built".
 - **Mip bias.** `NativeBias + log2(render / display) − 1` = **−1.0** at DLAA (3.5). DSF Enhanced's
   `[Quality] TextureLODBias` currently applies to all samplers. With DLAA on, apply −1 only during the
   scene pass. The post shaders sample with `texldl` at an explicit LOD, so they wouldn't change, but the
@@ -608,6 +611,91 @@ is set 35 with a target of exactly the render size, not the busiest pass. Files:
   - Also `--hdr` with jittered PFM sequences dumped from the game (PR 3's `TraceDump`).
   - Runs a few seconds on the host GPU, no game needed.
 - `client_test.cpp`: run both features over one pipe, with separate fences; `--robustness` per feature.
+
+**PR 2 as built** (`feat/dlaa-helper`, 2026-10-30):
+
+- **Protocol v2** (`dsf_dlss5_protocol.h`, `DSF_DLSS5_VERSION 2`).
+  - `DsfDlss5Configure::reserved` became `feature`, and `DsfDlss5Frame` gained `feature` plus padding
+    (56 bytes).
+  - `DsfDlss5FrameAck::reserved` echoes the feature.
+  - `DsfDlss5HelloAck` gained `features` (a bitmask), `dlaa_runtime_version` and padding (360 bytes).
+  - HELLO succeeds if either DLL is there and its feature runs on the GPU. Each missing feature is
+    named in the message.
+  - A version 1 header is refused (MSG_ERROR). The game side speaks version 2 automatically. For DLSS
+    5 it now checks that HELLO_ACK offers DLSS 5 (`D5StartHelper`); otherwise nothing changes.
+- **Helper.**
+  - `src/ngx_d3d12.*`: one NGX initialization, with the `--runtime` folder as the path list.
+  - `src/nr_d3d12.*`: DLSS 5 uses it unchanged, still on NGX's capability parameters.
+  - `src/sr_d3d12.*`: DLAA, on its own allocated parameter block, through `NGX_D3D12_CREATE_DLSS_EXT`
+    and `NGX_D3D12_EVALUATE_DLSS_EXT`.
+    - Input = output size, `PerfQualityValue_DLAA`, `IsHDR | MVLowRes | AutoExposure`.
+    - `DLSS.Hint.Render.Preset.DLAA` = K (11) when CONFIGURE's `preset` is 0 or 11, L (12) on request.
+    - `FreeMemOnReleaseFeature`.
+  - `helper_main.cpp` keeps per-feature state: slots, fences, frame numbers, the configured flag and
+    the timeout handling. DLAA's colour and output default to `R16G16B16A16_FLOAT`; it has no mask
+    slot.
+- **Trust.** `ngx_trust` takes a `RuntimeSpec` per file: name, allowlist, version floor and where to
+  get it. `nvngx_dlss.dll` must be:
+  - SHA-256 `d00b5b0a…6123e`;
+  - signed by NVIDIA Corporation;
+  - version 310.9.16.0 or later;
+  - locked while in use, and the copy NGX mapped (`IsSameFile` after CreateFeature).
+
+  `fetch-sdk.ps1` adds `nvsdk_ngx_helpers_d3d.h`, pinned by SHA-256. The downloaded copy used for the
+  tests matched the size, hash, version and signature above. It is not committed.
+- **Synthetic scene fix.** The motion vectors were measured from the pixel centre to the jittered
+  sample's previous position, so they carried −jitter. The header says they are without jitter, and
+  DLAA (`MVJittered = 0`) needs that. They are now the sampled point's own motion. DLSS 5's tests barely
+  depend on it. The static-camera DLAA runs also zero the motion: the scene renders frame 0 every time,
+  but its motion still describes a move from frame −1.
+- **Sign and scale test** (`dsf-dlss5-offscreen --feature dlaa`, RTX 5070 Ti, driver as installed).
+  - Setup: 640x360, preset K, 16 Halton phases, 24 frames per variant.
+  - Reference: 8x8 supersampled, no jitter.
+  - Errors are mean |difference| over RGB after the scene's tone map, in 1/255.
+  - Shimmer is the mean frame-to-frame change over the last 16 frames with the camera still.
+  - Sharpness is the mean gradient over the reference's.
+  - The input alone (one sample at each pixel centre) has error 1.134.
+
+  | Variant (factor on the reported jitter) | Static error after 1 / 8 / 16 / 24 | Shimmer | Sharpness | Moving error after 8 / 16 / 24 |
+  | --- | --- | --- | --- | --- |
+  | **+x +y, 1x (the protocol's convention)** | 1.075 / 0.440 / 0.372 / **0.354** | **0.075** | 0.982 | 1.176 / 1.043 / **1.058** |
+  | −x −y | 1.321 / 1.105 / 0.894 / 0.922 | 0.278 | 0.918 | 2.174 / 1.905 / 2.063 |
+  | +x −y | 1.321 / 0.745 / 0.581 / 0.646 | 0.219 | 0.951 | 1.545 / 1.155 / 1.393 |
+  | −x +y | 1.075 / 0.777 / 0.651 / 0.588 | 0.122 | 0.953 | 1.681 / 1.714 / 1.609 |
+  | 2x scale | 1.234 / 0.761 / 0.709 / 0.714 | 0.110 | 0.929 | 1.394 / 1.189 / 1.256 |
+  | 0.5x scale | 1.109 / 0.377 / 0.321 / 0.318 | 0.092 | 0.998 | 1.205 / 1.091 / 1.098 |
+  | no jitter | 1.005 / 0.988 / 1.001 / 1.006 | 0.006 | 1.070 | 1.121 / 0.997 / 1.020 |
+
+  - **Sign.** The right sign converges to a third of the input's error. Flipping both axes gives 2.6x
+    the error, 3.7x the shimmer and a visibly softer image (sharpness 0.92). Flipping one axis falls
+    in between. The right sign also has the lowest moving error of the jittered variants.
+  - **Scale.**
+    - 2x is clearly worse.
+    - 0.5x scores a slightly lower static error against the box-filtered reference: a smaller
+      reported jitter averages a little more. But it shimmers more (0.092 against 0.075) and has a
+      higher moving error.
+    - The test therefore judges the scale on shimmer and the sign on all three measures. It exits 0
+      when they hold, 10 otherwise.
+  - **No jitter.** It is the reference point. The image is still and stays aliased (static error
+    1.006). With the camera moving at this speed, DLAA's 24-frame error stays near the aliased input
+    either way (1.06 jittered, 1.02 not). The gain is in the still and slow shots.
+- **Protocol test** (`dsf-dlss5-client-test`, x86 client → helper over the pipe, D3D11 shared
+  textures):
+  - `--feature dlaa --robustness` with only `nvngx_dlss.dll`: HELLO_ACK has features 0x2 and says
+    "DLSS 5: not in …". 12/12 frames OK, and every check passes:
+    - the old checks: repeated and zero frame numbers, the fence_in timeout and its fence_out,
+      unconfigured frames, reconfigure;
+    - FRAME and CONFIGURE with an unknown feature → `ERR_PROTOCOL`;
+    - FRAME for the other, never-configured feature → `ERR_NOT_CONFIGURED`, after which the
+      configured one still runs;
+    - a version 1 header → MSG_ERROR.
+  - `--host-creates` (helper-created f16 textures): 6/6 frames.
+  - `--feature both --robustness` with both DLLs: features 0x3. DLSS 5 and DLAA ran frame by frame over
+    one pipe and one NGX instance, 16/16 frames OK, and the robustness checks passed.
+  - Round trip at 640x360 through the CPU test client (it converts frames on the CPU): DLSS 5 9.7 ms,
+    DLAA 18 ms. GPU time of the evaluate: DLSS 5 1.12 ms, DLAA 0.28 ms.
+- **DLSS 5 regression.** `dsf-dlss5-offscreen` (DLSS 5, 6 frames) after the NGX refactor: 6/6
+  evaluates.
 
 **PR 3: game-side DLAA.**
 

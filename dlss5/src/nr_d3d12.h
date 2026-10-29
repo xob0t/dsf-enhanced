@@ -2,8 +2,8 @@
 //
 // DLSS 5 (NGX DLSSNR) on D3D12 through the official NGX path: the public DLSS SDK's
 // static loader finds the driver's NGX core, and the core loads and verifies the signed
-// nvngx_dlssnr.dll from the folder of the VerifiedRuntime passed to Initialize. CreateFeature
-// fails if NGX mapped any other file.
+// nvngx_dlssnr.dll from the folder NgxD3D12 names, where the VerifiedRuntime passed to
+// Initialize is. CreateFeature fails if NGX mapped any other file.
 
 #pragma once
 
@@ -17,6 +17,7 @@ struct NVSDK_NGX_Handle;
 
 namespace dsf_dlss5 {
 
+class NgxD3D12;
 class VerifiedRuntime;
 
 struct NrSettings {
@@ -50,9 +51,9 @@ class NrD3D12 {
   NrD3D12(const NrD3D12&) = delete;
   NrD3D12& operator=(const NrD3D12&) = delete;
 
-  // runtime must stay alive (and so keep the file locked) until Shutdown. dataDir
-  // receives NGX logs.
-  bool Initialize(ID3D12Device* device, const VerifiedRuntime& runtime, const std::wstring& dataDir, bool verboseLog);
+  // Checks that DLSSNR is available. ngx and runtime (which keeps the file locked) must stay
+  // alive until Shutdown; runtime must be in ngx's folder.
+  bool Initialize(NgxD3D12& ngx, const VerifiedRuntime& runtime);
   // Records feature creation into list. The list must be executed before Evaluate.
   bool CreateFeature(ID3D12GraphicsCommandList* list, uint32_t width, uint32_t height, int preset);
   bool Evaluate(ID3D12GraphicsCommandList* list, const NrResources& resources, const NrSettings& settings);
@@ -69,13 +70,11 @@ class NrD3D12 {
  private:
   bool Fail(const char* what, unsigned int result);
 
-  ID3D12Device* device_ = nullptr;
   const VerifiedRuntime* runtime_ = nullptr;
-  NVSDK_NGX_Parameter* params_ = nullptr;
+  NVSDK_NGX_Parameter* params_ = nullptr;   // NgxD3D12's capability parameters
   NVSDK_NGX_Handle* feature_ = nullptr;
   uint32_t width_ = 0;
   uint32_t height_ = 0;
-  bool initialized_ = false;
   std::string error_;
 };
 

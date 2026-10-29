@@ -10,20 +10,12 @@
 #include "nvsdk_ngx.h"
 #include "dlssnr_defs.h"
 #include "log.h"
+#include "ngx_d3d12.h"
 #include "ngx_trust.h"
 
 namespace dsf_dlss5 {
 
 namespace {
-
-// NGX project id for DSF Enhanced. Projects without an NVIDIA-assigned application id
-// identify themselves with a GUID and NVSDK_NGX_ENGINE_TYPE_CUSTOM.
-constexpr char kProjectId[] = "9cad904d-8216-4482-b2e7-7c2ccba2973e";
-constexpr char kEngineVersion[] = "1.0";
-
-void NVSDK_CONV NgxLog(const char* message, NVSDK_NGX_Logging_Level, NVSDK_NGX_Feature) {
-  LogRaw("[ngx] ", message, false);
-}
 
 void SetSubrect(NVSDK_NGX_Parameter* params, const char* prefix, ID3D12Resource* resource) {
   unsigned int width = 0;
@@ -49,36 +41,19 @@ void SetSubrect(NVSDK_NGX_Parameter* params, const char* prefix, ID3D12Resource*
 NrD3D12::~NrD3D12() { Shutdown(); }
 
 bool NrD3D12::Fail(const char* what, unsigned int result) {
-  char buffer[256];
-  std::snprintf(buffer, sizeof(buffer), "%s failed: 0x%08X (%ls)", what, result,
-                GetNGXResultAsString(static_cast<NVSDK_NGX_Result>(result)));
-  error_ = buffer;
-  Log("%s", buffer);
+  error_ = NgxFailure(what, result);
   return false;
 }
 
-bool NrD3D12::Initialize(ID3D12Device* device, const VerifiedRuntime& runtime, const std::wstring& dataDir, bool verboseLog) {
-  device_ = device;
+bool NrD3D12::Initialize(NgxD3D12& ngx, const VerifiedRuntime& runtime) {
   runtime_ = &runtime;
-  const std::wstring runtimeDir = runtime.Directory();
-  const wchar_t* paths[] = {runtimeDir.c_str()};
-  NVSDK_NGX_FeatureCommonInfo info = {};
-  info.PathListInfo.Path = paths;
-  info.PathListInfo.Length = 1;
-  info.LoggingInfo.LoggingCallback = &NgxLog;
-  info.LoggingInfo.MinimumLoggingLevel = verboseLog ? NVSDK_NGX_LOGGING_LEVEL_VERBOSE : NVSDK_NGX_LOGGING_LEVEL_ON;
-  info.LoggingInfo.DisableOtherLoggingSinks = true;
-
-  NVSDK_NGX_Result result = NVSDK_NGX_D3D12_Init_with_ProjectID(
-      kProjectId, NVSDK_NGX_ENGINE_TYPE_CUSTOM, kEngineVersion, dataDir.c_str(), device, &info, NVSDK_NGX_Version_API);
-  if (NVSDK_NGX_FAILED(result)) return Fail("NVSDK_NGX_D3D12_Init_with_ProjectID", result);
-  initialized_ = true;
-
-  result = NVSDK_NGX_D3D12_GetCapabilityParameters(&params_);
-  if (NVSDK_NGX_FAILED(result)) return Fail("NVSDK_NGX_D3D12_GetCapabilityParameters", result);
-
+  params_ = ngx.Capabilities();
+  if (params_ == nullptr) {
+    error_ = "NGX is not initialized";
+    return false;
+  }
   int needsUpdatedDriver = 0;
-  result = NVSDK_NGX_Parameter_GetI(params_, dlssnr::kNeedsUpdatedDriver, &needsUpdatedDriver);
+  NVSDK_NGX_Result result = NVSDK_NGX_Parameter_GetI(params_, dlssnr::kNeedsUpdatedDriver, &needsUpdatedDriver);
   if (NVSDK_NGX_FAILED(result)) return Fail("DLSSNR support query", result);
   if (needsUpdatedDriver) {
     unsigned int major = 0;
@@ -98,7 +73,7 @@ bool NrD3D12::Initialize(ID3D12Device* device, const VerifiedRuntime& runtime, c
     NVSDK_NGX_Parameter_GetI(params_, dlssnr::kFeatureInitResult, &initResult);
     return Fail("DLSSNR not available on this GPU/driver; feature init result", static_cast<unsigned int>(initResult));
   }
-  Log("NGX initialized; DLSSNR is available");
+  Log("DLSSNR is available");
   return true;
 }
 
@@ -180,14 +155,7 @@ void NrD3D12::ReleaseFeature() {
 
 void NrD3D12::Shutdown() {
   ReleaseFeature();
-  if (params_ != nullptr) {
-    NVSDK_NGX_D3D12_DestroyParameters(params_);
-    params_ = nullptr;
-  }
-  if (initialized_) {
-    NVSDK_NGX_D3D12_Shutdown1(device_);
-    initialized_ = false;
-  }
+  params_ = nullptr;   // NgxD3D12 owns them
 }
 
 std::wstring NrD3D12::LoadedRuntimePath() const {
