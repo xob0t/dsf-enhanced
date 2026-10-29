@@ -68,6 +68,19 @@ void D5EndSceneTagging(IDirect3DDevice9* device);
 void D5FinishObjects();
 void D5ResetObjectsFrame();
 extern bool g_d5_object_motion;
+// [DLAA] (dlaa.inl)
+extern bool g_dlaa_disable_mlaa;
+extern bool g_dlaa_skip_pass;
+bool DlaaWantsDeviceHooks();
+void DlaaBeforeDraw(IDirect3DDevice9* device);
+void DlaaFrameEnd(IDirect3DDevice9* device);
+void DlaaEndSceneBias(IDirect3DDevice9* device);
+HRESULT DlaaCreateVertexShader(IDirect3DDevice9* device, const DWORD* function, void** out, DWORD hash);
+void DlaaSetVertexShader(const void* shader);
+void DlaaNoteConstants(UINT start, UINT count);
+void DlaaNotePass(const void* surface, DWORD target_set);
+void DlaaSkipDraw(IDirect3DDevice9* device);
+void DlaaOnReset();
 // The game's render resolution: the back buffer size it asked for (BorderlessWindowed makes the
 // swap chain the monitor's size), else the back buffer's.
 UINT D5RenderWidth()
@@ -117,7 +130,7 @@ void LoadDlss5Config(const char* ini_path)
 
 bool Dlss5Wanted()
 {
-    return g_d5_trace || g_d5_export;
+    return g_d5_trace || g_d5_export || DlaaWantsDeviceHooks();
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1273,6 +1286,9 @@ bool D5IsScenePass()
 
 void D5BeforeDraw(IDirect3DDevice9* device, UINT prims, UINT vertices)
 {
+    if (g_dlaa_jitter) {
+        DlaaBeforeDraw(device);
+    }
     ++g_d5_pass_draws;
     if (D5IsScenePass()) {
         ++g_d5_scene_draws_this_frame;
@@ -1499,6 +1515,9 @@ void D5LeavePass(IDirect3DDevice9* device)
         // export treats the first exit after the scene's draws as the scene end.
         g_d5_scene_done = true;
         g_d5_post_pass_index = 0;
+        if (g_dlaa_jitter) {
+            DlaaEndSceneBias(device);
+        }
         if (g_d5_helper && g_d5_object_motion) {
             D5EndSceneTagging(device);
         }
@@ -1704,6 +1723,7 @@ void D5FrameEnd(IDirect3DDevice9* device)
     }
 
     D5FrameTimeTick();
+    DlaaFrameEnd(device);
     InterlockedIncrement(&g_d5_frame_index);
     g_d5_frame_best_rt = nullptr;
     g_d5_frame_best_ds = nullptr;
@@ -1845,6 +1865,9 @@ HRESULT STDMETHODCALLTYPE D5SetRenderTarget(IDirect3DDevice9* device, DWORD inde
     if (index == 0) {
         g_d5_pass_draws = 0;
         g_d5_pass_target_set = D5CurrentTargetSet(nullptr);
+        if (g_dlaa_disable_mlaa) {
+            DlaaNotePass(surface, g_d5_pass_target_set);
+        }
     }
     if (index == 0 && surface != g_d5.rt0) {
         D5LeavePass(device);
@@ -1997,6 +2020,10 @@ HRESULT STDMETHODCALLTYPE D5DrawPrimitive(IDirect3DDevice9* device, D3DPRIMITIVE
     if (g_d5_internal) {
         return g_d5_draw_primitive(device, type, start, prims);
     }
+    if (g_dlaa_skip_pass) {
+        DlaaSkipDraw(device);   // DisableMLAA
+        return D3D_OK;
+    }
     D5NoteBusiestPass();
     g_d5_draw_key = g_d5_trace_frame != nullptr ? D5DrawKey(start, prims, 0, 1) : 0;
     D5BeforeDraw(device, prims, 0);
@@ -2011,6 +2038,10 @@ HRESULT STDMETHODCALLTYPE D5DrawIndexedPrimitive(IDirect3DDevice9* device, D3DPR
     if (g_d5_internal) {
         return g_d5_draw_indexed_primitive(device, type, base, min_index, vertices, start, prims);
     }
+    if (g_dlaa_skip_pass) {
+        DlaaSkipDraw(device);   // DisableMLAA
+        return D3D_OK;
+    }
     D5NoteBusiestPass();
     g_d5_draw_key = g_d5_trace_frame != nullptr ? D5DrawKey(static_cast<DWORD>(base), start, prims, vertices) : 0;
     D5BeforeDraw(device, prims, vertices);
@@ -2023,6 +2054,10 @@ HRESULT STDMETHODCALLTYPE D5DrawPrimitiveUP(IDirect3DDevice9* device, D3DPRIMITI
 {
     if (g_d5_internal) {
         return g_d5_draw_primitive_up(device, type, prims, data, stride);
+    }
+    if (g_dlaa_skip_pass) {
+        DlaaSkipDraw(device);   // DisableMLAA
+        return D3D_OK;
     }
     D5NoteBusiestPass();
     g_d5_draw_key = g_d5_trace_frame != nullptr ? D5DrawKey(prims, stride, 0, 2) : 0;
@@ -2037,6 +2072,10 @@ HRESULT STDMETHODCALLTYPE D5DrawIndexedPrimitiveUP(IDirect3DDevice9* device, D3D
 {
     if (g_d5_internal) {
         return g_d5_draw_indexed_primitive_up(device, type, min_index, vertices, prims, indices, index_format, data, stride);
+    }
+    if (g_dlaa_skip_pass) {
+        DlaaSkipDraw(device);   // DisableMLAA
+        return D3D_OK;
     }
     D5NoteBusiestPass();
     g_d5_draw_key = g_d5_trace_frame != nullptr ? D5DrawKey(prims, vertices, stride, 3) : 0;
@@ -2081,9 +2120,11 @@ void D5DumpShader(const DWORD* function, DWORD hash, const char* prefix)
 
 HRESULT STDMETHODCALLTYPE D5CreateVertexShader(IDirect3DDevice9* device, const DWORD* function, void** out)
 {
-    const HRESULT hr = g_d5_create_vertex_shader(device, function, out);
+    // Jitter: the game gets a patched copy; the hash and the object-motion notes stay the original's.
+    const DWORD hash = D5HashBytecode(function);
+    const HRESULT hr = g_dlaa_jitter && !g_d5_internal ? DlaaCreateVertexShader(device, function, out, hash)
+                                                       : g_d5_create_vertex_shader(device, function, out);
     if (SUCCEEDED(hr) && out != nullptr && *out != nullptr) {
-        const DWORD hash = D5HashBytecode(function);
         AcquireSRWLockExclusive(&g_d5_resource_lock);
         g_d5_shader_hash[*out] = hash;
         ReleaseSRWLockExclusive(&g_d5_resource_lock);
@@ -2118,6 +2159,9 @@ HRESULT STDMETHODCALLTYPE D5SetVertexShader(IDirect3DDevice9* device, void* shad
         return g_d5_set_vertex_shader(device, shader);
     }
     g_d5.vs = shader;
+    if (g_dlaa_jitter) {
+        DlaaSetVertexShader(shader);
+    }
     return g_d5_set_vertex_shader(device, shader);
 }
 
@@ -2134,6 +2178,9 @@ HRESULT STDMETHODCALLTYPE D5SetVsConstantF(IDirect3DDevice9* device, UINT start,
 {
     if (g_d5_internal) {
         return g_d5_set_vs_constant_f(device, start, data, count);
+    }
+    if (g_dlaa_jitter) {
+        DlaaNoteConstants(start, count);
     }
     if (data != nullptr) {
         D5FrameTrace* t = g_d5_trace_frame;
@@ -2207,9 +2254,9 @@ void InstallDlss5Hooks(IDirect3DDevice9* device)
         Log("DLSS5: back buffer %s", text);
         back->Release();
     }
-    Log("DLSS5: hooks installed trace=%d dump=%d export=%d wvp=c%d world=c%d pre_hud_set=%d",
+    Log("DLSS5: hooks installed trace=%d dump=%d export=%d wvp=c%d world=c%d pre_hud_set=%d dlaa_jitter=%d dlaa_disable_mlaa=%d",
         g_d5_trace ? 1 : 0, g_d5_trace_dump ? 1 : 0, g_d5_export ? 1 : 0, g_d5_wvp_register, g_d5_world_register,
-        g_d5_pre_hud_target_set);
+        g_d5_pre_hud_target_set, g_dlaa_jitter ? 1 : 0, g_dlaa_disable_mlaa ? 1 : 0);
 }
 
 } // namespace

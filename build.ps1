@@ -18,10 +18,15 @@ foreach ($dir in @($build, $dist)) {
 
 $asi = Join-Path $build "dsf_enhanced.asi"
 $test = Join-Path $build "cinematic_fit_test.exe"
+$jitterTest = Join-Path $build "vs_jitter_test.exe"
 $commands = @(
   "cl /nologo /std:c++17 /EHsc /O2 /MT /LD /Fo:`"$build\\`" /Fe:`"$asi`" `"$root\src\dsf_enhanced.cpp`" user32.lib d3d9.lib dxguid.lib /link /MACHINE:X86 /MAP:`"$build\dsf_enhanced.map`"",
   "cl /nologo /std:c++17 /EHsc /O2 /Fo:`"$build\\`" /Fe:`"$test`" `"$root\tests\cinematic_fit_test.cpp`"",
-  "`"$test`""
+  "`"$test`"",
+  # DLAA jitter's vertex shader patch: the self-test (d3dcompiler_47). The file says how to run it
+  # over the game's shaders and on the GPU.
+  "cl /nologo /std:c++17 /EHsc /O2 /D_CRT_SECURE_NO_WARNINGS /Fo:`"$build\\`" /Fe:`"$jitterTest`" `"$root\tests\vs_jitter_test.cpp`" d3d9.lib user32.lib",
+  "`"$jitterTest`""
 )
 # Optional: checks src/vk_min.h against the Khronos Vulkan headers (a Vulkan-Headers include folder).
 if ($env:VULKAN_HEADERS_INCLUDE) {

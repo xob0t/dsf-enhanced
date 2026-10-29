@@ -107,6 +107,16 @@ Set `Helper=0` and `Export=0` in `dsf_enhanced.ini`, or delete the two lines you
 
 The helper contains NVIDIA's NGX loader from the NVIDIA DLSS SDK, under the NVIDIA RTX SDKs license (`dlss5\NVIDIA-RTX-SDKs-LICENSE.txt` in the ZIP). NVIDIA, RTX and DLSS are trademarks of NVIDIA Corporation. This project is not sponsored or endorsed by NVIDIA. How it works: [research/dlss5-renderer.md](research/dlss5-renderer.md) and [dlss5/README.md](dlss5/README.md).
 
+## DLAA (in progress)
+
+DLAA is NVIDIA's DLSS anti-aliasing at the game's own resolution, on any RTX GPU. It isn't in yet. The `[DLAA]` section of `dsf_enhanced.ini` has the switches for the parts it needs, all off by default, for testing:
+
+- `Jitter=1` moves the 3D scene by a sub-pixel offset that changes every frame. DLAA needs that, but without DLAA the picture only shimmers. `JitterDebugPixels=48` moves the scene 48 pixels instead, so you can see in a screenshot what moves: the scene should, the HUD, shadows and minimap should not. `JitterPhases` and `MipBias` tune the cycle and the texture sharpness during the scene.
+- `DisableMLAA=1` turns off the game's own anti-aliasing, a morphological AA pass on the finished frame.
+- `DisableSwapChainMSAA=1` drops the 4x MSAA that the game's `AntiAliasing` setting puts on the swap chain. The swap chain only gets a copy of the finished frame, so that MSAA changes nothing visible and costs video memory.
+
+How it works: [research/dlaa.md](research/dlaa.md).
+
 ## worldlod: a high-detail upper Shift
 
 When you Shift up, the game draws one low-detail model of the whole city: flat ground under plain building shells. worldlod rebuilds it from the game's own detailed areas, with real roads, kerbs, paving, trees and bushes, building detail and painted road text. It reads your `san_francisco.dngc` and writes the new map into it, with a backup. No game data is shipped.
@@ -158,7 +168,7 @@ The workflow then runs worldlod's tests and lint and `build.ps1` on that tag, an
 ## Repository layout
 
 - `src/` has the plugin source and the default `dsf_enhanced.ini`.
-- `tests/` has the cinematic fit test. `build.ps1` runs it and stops if it fails.
+- `tests/` has the cinematic fit test and the DLAA jitter's vertex shader patch test. `build.ps1` runs both and stops if one fails.
 - `dlss5/` has the experimental DLSS 5 helper: a 64-bit process that runs NVIDIA's DLSS 5 pass for the 32-bit game, and its offscreen tests. It has its own build script and README. The release ZIP carries the helper in its `dlss5` folder.
 - `research/` has design notes.
 - `third_party/winmm.dll` is the bundled [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader), MIT-licensed.
