@@ -53,6 +53,11 @@ The file used for testing was version 310.9.16.0, 266,424,944 bytes, SHA-256 `2b
 # DLSS 5 on a screenshot (static, zero motion, flat depth unless --depth/--mv are given as PFM)
 .\dlss5\build\x64\dsf-dlss5-offscreen.exe --runtime out\ngx --out out\dlss5-still --color shot.png --frames 16
 
+# DLSS 5 on an HDR scene dump (TraceDump's scene-end.pfm) the way Input=1 runs it in game: tone map,
+# DLSS 5, inverse tone map with highlight recovery; logs per-channel differences, writes hdr_output.pfm.
+# --bypass checks the round trip without DLSS 5.
+.\dlss5\build\x64\dsf-dlss5-offscreen.exe --runtime out\ngx --out out\dlss5-hdr --hdr scene-end.pfm --exposure 0.6 --frames 4
+
 # The full cross-process chain: 32-bit client -> helper -> DLSS 5 -> back
 .\dlss5\build\x86\dsf-dlss5-client-test.exe --helper dlss5\build\x64\dsf-dlss5-helper.exe --runtime out\ngx --out out\dlss5-client
 .\dlss5\build\x86\dsf-dlss5-client-test.exe ... --host-creates   # the helper creates the shared textures (the DXVK direction)

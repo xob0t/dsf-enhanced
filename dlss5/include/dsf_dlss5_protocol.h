@@ -71,7 +71,10 @@
 //   works on n must copy its inputs into the shared slots only after that wait.
 //
 // Input conventions (research/dlss5-helper.md has the sources)
-//   Color   display-encoded (sRGB) SDR in [0,1], taken before the HUD is drawn.
+//   Color   display-encoded (sRGB) SDR in [0,1], taken before the HUD is drawn. Or, as RTX
+//           Remix and DSF Enhanced's Input=1 do it, the HDR scene before post-processing,
+//           tone-mapped (exposure, ACES fit, 1/2.2 gamma) into R16G16B16A16_FLOAT; Output in the
+//           same format then goes back through the inverse. Any colour format CONFIGURE names.
 //   Depth   hardware depth z/w, 0 = near and 1 = far (set DSF_DLSS5_CONFIG_DEPTH_INVERTED
 //           for reversed Z). R32_FLOAT.
 //   Motion  previous minus current screen position of the surface, in pixels, +x right,

@@ -24,7 +24,7 @@ probe ID 227 (Nissan 370Z: chase view, cockpit view driven at 20 and 40 mph) and
 | Where the 3D scene ends and the HUD starts | Scene end: the `SetRenderTarget` that leaves the scene target (render-queue target set 35), at `0xBB0FE4` in the pass setup `FUN_00BB0ED0`. HUD start: draw 2 of the pass on target set 0 (`T#1`, 1280x720 `A8R8G8B8`). Draw 1 of that pass is a full-screen quad (pixel shader hash `F5ACBC8D`) that composites the post chain into `T#1`. Draws 2 onwards are the HUD. `T#1` is then `StretchRect`'d to the back buffer (`0xBB293F`). | runtime |
 | View and projection matrices | No per-frame matrix is uploaded. Each scene draw sets `c0-c3` = World·View·Proj rows and `c4-c6` = the object's 3x4 world rows, so VP = WVP · World⁻¹. DSF Enhanced solves it per frame and keeps the previous frame's. The game also keeps camera matrices on the heap in D3DX (transposed) layout. No static pointer chain to them is known yet. | runtime (constants, VP solve), runtime but unresolved (heap copies) |
 | Velocity data | None. No velocity or motion target is created, and no vertex constant carries last frame's matrices. Motion vectors have to be made from depth and the two VP matrices (camera motion), plus per-object data later. | runtime |
-| Post-process order | Scene (HDR) → downsample and bright pass (320x180) → eye adaptation (luminance mip chain to 1x1 `R32F`) → bloom (320x176 down to 40x22 and back) → tone map into LDR `T#30` (reads the scene, bloom and adaptation) → two full-resolution LDR passes (`T#28` `R5G6B5`, then `T#29`) → composite of `T#30` and `T#29` into `T#1` → HUD → back buffer. Vignette and film grain are already in the image at the pre-HUD point. What `T#28`/`T#29` do (anti-aliasing, a blur) is not identified. | runtime (order), inferred (what the last two passes do) |
+| Post-process order | Scene (HDR, linear) → a low-resolution particle layer (320x180) → half-size scene with the particles → eye adaptation (luminance mip chain to 1x1 `R32F`) → bright pass and bloom (320x176 down to 40x22 and back) → tone map into LDR `T#30` (scene plus particles and bloom, extended Reinhard on luminance with the adapted exposure, 3D LUT grade, film grain, vignette, sRGB encode; "HDR input" below) → two full-resolution LDR passes (`T#28` `R5G6B5`, then `T#29`) → composite of `T#30` and `T#29` into `T#1` → HUD → back buffer. Vignette and film grain are already in the image at the pre-HUD point. What `T#28`/`T#29` do (anti-aliasing, a blur) is not identified. | runtime (order), inferred (what the last two passes do) |
 | Projection jitter through the existing projection patch | Not through the FOV patch: `0xDD9A80` is a degrees-to-radians scalar that feeds the projection's scale, so it cannot add an offset. Through the vertex constants it works for world draws: adding `j·row3` to rows 0 and 1 of `c0-c3` at draw time shifted the world by the asked 48 px with the HUD in place (`host-20261029-103256`). Skinned and cockpit shaders use another constant layout and did not move. Since PR #14 found that the DLSS 5 runtime never reads jitter, jitter was taken out of the scope and the code removed. | runtime |
 
 ## The frame
@@ -132,8 +132,11 @@ layout).
 at their prologue (`D5Hook`, a small x86 length decoder; anything that does not decode falls back
 to a vtable write). Logged per route in each run's `dsf_enhanced.log` ("DLSS5: detoured ...").
 
-**Pre-HUD point.** The scene target is the busiest target of back-buffer size that draws with a
-depth surface. The pre-HUD point is just before draw 2 of the pass whose render-queue target set
+**Pre-HUD point.** The scene target is the busiest target that draws with a depth surface, is
+`A16B16G16R16F` at exactly the game's render size, and is bound under render-queue target set 35
+(or 30, which some frames use). An earlier test, "at least half the render size", let the 3072x3072
+shadow map (set 60) through at 3440x1440, where it draws about as much as the scene, and the
+detected scene flipped between the two in the user's session (research/dlaa.md). The pre-HUD point is just before draw 2 of the pass whose render-queue target set
 (read from `0x1D4AD10` when the target changes) is `PreHudTargetSet` (0). A counter in the shared
 memory (`pre_hud_missed`) counts frames where the scene ended but the point was not found.
 
@@ -429,6 +432,162 @@ previous frame (`host-20261029-172933`):
   the table above.) Some terrain shaders (`8DCC1218`, 106 draws) upload a plain VP at `c16-c19`, which
   could serve as a second VP source.
 
+## HDR input (`Input=1`)
+
+On a 36,600-frame host session at 3440x1440 the pre-HUD path worked frame after frame, but the
+picture barely changed. DSF Enhanced's NGX parameters equal RTX Remix 1.6.1's defaults, so the
+other difference from Remix is where DLSS 5 sees the frame. Remix runs it (`rtx_context.cpp`,
+`dispatchDlssNR`) before bloom, motion blur, tone mapping and lens effects. It tone-maps its HDR
+output with exposure, Narkowicz's ACES fit and a 1/2.2 gamma into an `R16G16B16A16_SFLOAT` input,
+then tone-maps DLSS 5's f16 output back into the HDR image, and its post chain runs on that.
+`Input=1` does the same in this game. `Input=0`, the default for now, keeps the pre-HUD point.
+Code: `D5BridgeFrame(device, true)` in `src/dlss5_bridge.inl`, called from `D5LeavePass` in
+`src/dlss5_feed.inl`.
+
+**The hook point: the scene end.** That is the first `SetRenderTarget` away from the scene
+target `T#3` (`A16B16G16R16F`, render size) after its draws, where render-queue target set 35
+gives way to set 38. The scene is one pass. In every traced frame (`host-20261029-103023`,
+`host-20261029-202625`, `vm1-20261029-101941`, `vm1-20261029-234338`, `vm1-20261029-235019`)
+`T#3` is drawn once, with no `StretchRect` or other pass in between, and the next pass is the
+first post pass to read it. The pass includes the blended draws (180 to 975 a frame in the
+traces): glass, decals, skid marks and full-size particles. They are therefore in DLSS 5's
+input. At this point the scene depth `D#4` is complete, and `D5LeavePass` has just solved the VP
+(`D5FinishViewProj`) and matched the cars (`D5FinishObjects`). The depth and motion inputs are
+the same as at the pre-HUD point.
+
+At 3440x1440 the old scene detector sometimes took the 3072x3072 `A8R8G8B8` shadow map
+("Pre-HUD point" above). The scene target now has to be `A16B16G16R16F` at exactly the render
+size under target set 35 or 30, and `Input=1` checks the same again (single-sampled too), so
+the shadow map is never taken.
+
+**What the post chain does with `T#3`.** Read from the pixel and vertex shaders
+(`TraceShaders=1`, which now writes `ps_<hash>.asm` too) and from the shader constants logged
+for each post draw (`vm1-20261029-234338`, `vm1-20261029-235019`):
+
+| Pass | Shader | What |
+| --- | --- | --- |
+| `T#5` 320x180, set 38, 3 draws | `66658436` (`DiffuseMapOnly.fx`) and others | a low-resolution particle layer, drawn after the scene |
+| `T#11` 320x180 | `C669E14F` | 4-tap filter of `T#5`: the particle layer, premultiplied colour and transmittance in alpha |
+| `T#6` 640x352 | `C0305A02` (`PostProcessCombinerPixel.hlsl`) | `scene * particles.a + particles.rgb`, clamped to [0, 6] (`HDR.hlsl`) |
+| `T#12` 320x180 `R32F`, then down to `T#19` | `EAF259B6`, `0E0535E4` | ln(luminance + 1e-5) (Rec. 709 weights), averaged down |
+| `T#21`, `T#20` 1x1 `R32F` | `760780ED`, `F02445F9` | `T#21` = last frame's `T#20`, then `T#20` = the adapted luminance La (0.27-0.40 in the traced daytime frames) |
+| `T#9` and the bloom chain | `0CFF7616`, `5F91AEC4` | bright pass with a threshold relative to La, 7-tap blurs |
+| `T#30` 1280x720 `A8R8G8B8` | VS `F1076FF6`, PS `2F0359F4` (`PostProcessing.fx`) | the tone map, below |
+
+The tone map: c = scene · particles.a + particles.rgb + bloom · bloom.a · tint (`c0` = 0.1). Then
+L = Rec. 709 luminance of c, Lw = e · L, and c ·= e · (1 + Lw / W²) / (1 + Lw). That is Reinhard's
+extended operator on luminance, with `g_v4LuminanceParams` = (W, 1/W², 1, 1 − 1/W²). W was
+1.86-4.9 in the overview frames and 2.0 in the driving frames. After that come a 16³ 3D LUT
+colour grade (a blend of two LUTs), film grain, the vignette, and an exact sRGB encode in the
+shader (sRGB write is off). **So `T#3` holds linear radiance**, and the game's grade works on
+display-referred linear values.
+
+The exposure e comes from the vertex shader. It reads La from `T#21` by vertex texture fetch:
+e = LC.y + (g_fMiddleGrey − LC.y) · saturate(1.5 − (LC.w / 2) / La). Here LC is
+`g_vLuminanceControl`, with LC.w = 0.3 (from the uploaded preshader results 3/LC.w = 10.01 and
+−LC.w/2 = −0.1498). g_fMiddleGrey − LC.y was 0.39-0.40 while driving and 0 in the first frames
+traced. LC.y itself is not in the logged registers. With La around 0.3, e is about 0.4 + LC.y.
+
+**The values in `T#3`** (`TraceDump=1` now also writes the HDR targets as PFM). The five
+scene-end dumps of the two VM runs are all Shift views, at the VM's lower detail:
+
+| Frame | Mean R, G, B | Luminance median | p99 | p99.9 | Peak |
+| --- | --- | --- | --- | --- | --- |
+| 1933 | 0.33, 0.29, 0.23 | 0.29 | 0.83 | 1.08 | 2.34 |
+| 2137 | 0.35, 0.34, 0.28 | 0.28 | 1.02 | 1.54 | 2.83 |
+| 2477 | 0.35, 0.35, 0.29 | 0.28 | 1.06 | 1.61 | 2.90 |
+| 2820 | 0.29, 0.27, 0.24 | 0.27 | 0.76 | 1.02 | 1.81 |
+| 2822 | 0.30, 0.28, 0.25 | 0.28 | 0.76 | 1.03 | 3.16 |
+
+The range is narrow: the lighting is close to display range before exposure, with the sky
+around 1.
+
+**The exposure for DLSS 5's input** (`HdrExposure`, default 0.6). Remix scales by its auto
+exposure, which aims at mid-grey. A fixed 0.6 brings the game's own adapted average (La
+0.27-0.40) near 0.18. The game's own curve (e ≈ 0.4, W = 2) puts mid-tones about as bright as
+ACES at an exposure of about 0.3. The scale cancels on the way back, so it only changes what
+DLSS 5 works on. Night scenes were not traced: the scene target is not pre-exposed, so a dark
+scene reaches DLSS 5 darker.
+
+**The colour path.** Every step is a D3D9 pass at the scene end. The device state is saved
+once and restored once, around everything.
+
+1. `StretchRect` `T#3` into our `A16B16G16R16F` copy, because the inverse reads the original
+   while it writes `T#3`.
+2. `HdrTonemapPS`: copy → colour input (`A16B16G16R16F`): sanitize to [0, 65504], × exposure,
+   ACES fit, ^(1/2.2).
+3. Depth and motion as before.
+4. The transport, with Color and Output as `R16G16B16A16_FLOAT`. The helper already takes any
+   format CONFIGURE names, in both directions, and research/dlss5-helper.md had f16 colour
+   tested. The Vulkan transport maps it to `VK_FORMAT_R16G16B16A16_SFLOAT` (it copies between
+   DXVK's `A16B16G16R16F` images and the helper's). The CPU transport reads it back from the
+   `A16B16G16R16F` system-memory surface and copies the output rows into a dynamic
+   `A16B16G16R16F` texture.
+5. `HdrInversePS`: output and copy → `T#3`. It mirrors Remix's `tonemapping_inverse_tonemapping`:
+   - out = saturate(output)^2.2 · (x / max(ACES(x), 1e-6)) / exposure, where x = original ·
+     exposure. An unchanged pixel gives the original back.
+   - Highlight recovery: mask = smoothstep(1, 8, max channel of x) · smoothstep(0.75, 0.99, max
+     channel of ACES(x)^(1/2.2)), then out = lerp(out, original, mask). The mask picks pixels
+     that were very bright in exposed HDR and sit in the curve's shoulder, where the LDR output
+     cannot carry them. With this game's range (x ≤ 0.6 · 3.2) it rarely triggers.
+   - The result is clamped to [0, 65504]. The scene's alpha is kept, where Remix writes DLSS 5's
+     alpha. The post shaders traced read only the colour of `T#3`, so this is a precaution.
+
+   Both shaders are `ps_2_0` (the inverse uses 57 of its 64 arithmetic slots).
+6. Nothing is drawn at the pre-HUD point.
+
+**State.** The game's next call is a `SetRenderTarget` in the middle of its pass setup, so
+everything has to be as it was. One `D3DSBT_ALL` state block, plus render targets 0-3 and the
+depth surface saved and restored, wraps all of it. That also covers the pre-HUD path, which
+before restored only render target 0. On the first three bridge frames, on traced frames and on
+the first 30 `SelfTest` frames, the bridge reads back these states before and after and logs
+whether they match:
+- render targets, depth surface, shaders, declaration and FVF, stream 0, indices and textures 0-2;
+- viewport and scissor;
+- 20 render states;
+- 6 sampler states on stages 0-1;
+- pixel constants c0-c15.
+
+**`SelfTest=1`** runs all of DSF Enhanced's side without the helper. DLSS 5's output is
+replaced by its input (a `StretchRect`), so the frame must come back unchanged. That way the
+passes and the state restore can be checked in the VMs, which have neither Vulkan nor an NVIDIA
+GPU. With `TraceDump=1`, `scene-end-dlss5.pfm` sits beside `scene-end.pfm`.
+
+**Measurements, offline** (`dsf-dlss5-offscreen --hdr`). This runs the same tone map,
+DLSS 5 and inverse in C++ and D3D12 on the PFM dumps, at zero motion and flat depth, with 4
+frames per run. The CPU maths mirrors the two shaders.
+- Round trip without DLSS 5 (`--bypass`, f16): the HDR values change by 0.04 % on average, and
+  0.02/255 after tone mapping again. The tone map and the inverse give the frame back.
+- DLSS 5 itself, in the space it works in: the mean |output − input| per channel (R, G, B, of
+  255). "Default" is Remix's settings; "max" is `Style=1`, `ToneStrength=1`, `StructureStrength=1`.
+
+| Frame | Input=0 (pre-HUD BMP) default | Input=0 max | Input=1, exposure 0.6, default | Input=1, 0.6, max | Input=1, 1.0, default | Input=1, 1.0, max |
+| --- | --- | --- | --- | --- | --- | --- |
+| 1933 | 2.6, 2.8, 2.8 | 11.1, 7.7, 5.5 | | | 2.8, 3.0, 3.3 | 16.7, 14.6, 9.5 |
+| 2137 | 2.8, 3.2, 3.0 | 13.4, 10.8, 7.4 | 3.2, 3.3, 3.2 | 10.0, 9.6, 6.6 | 3.3, 3.5, 3.6 | 11.8, 11.7, 9.6 |
+| 2820 | 2.9, 3.4, 2.9 | 8.3, 5.5, 6.8 | 3.2, 3.8, 3.3 | 9.0, 8.2, 6.8 | 3.7, 4.3, 3.8 | 13.3, 12.6, 10.8 |
+
+- What reaches the screen is the inverse's HDR result after the game's own curve. Approximated
+  here with e = 0.4, W = 2 and the sRGB encode, without the LUT, grain and vignette (the LUTs
+  were not dumped); mean |difference| per channel, and the share of pixels that change by more
+  than 8/255:
+
+| Frame | Exposure | Default | Max |
+| --- | --- | --- | --- |
+| 1933 | 1.0 | 1.6, 1.7, 1.9 (0.8 %) | 9.3, 8.0, 5.1 (73 %) |
+| 2137 | 0.6 | 2.2, 2.2, 2.2 (2.7 %) | 6.7, 6.3, 4.4 (43 %) |
+| 2137 | 1.0 | 1.9, 1.9, 2.0 (1.6 %) | 6.5, 6.3, 5.1 (38 %) |
+| 2820 | 0.3 | 2.5, 3.1, 2.7 (5.2 %) | 4.3, 4.8, 5.3 (26 %) |
+| 2820 | 0.6 | 2.4, 2.9, 2.6 (4.6 %) | 6.3, 5.8, 5.0 (35 %) |
+| 2820 | 1.0 | 2.1, 2.5, 2.3 (3.4 %) | 7.4, 7.0, 6.0 (41 %) |
+
+On these frames the HDR input does not make DLSS 5 change the picture more. At the default
+settings it is about as subtle as the pre-HUD path. What changes is what DLSS 5 works on: no film
+grain, no sepia grade and no bloom in its input, and the game's grading applied to its result.
+Whether that looks better is for the in-game A/B. That is why `Input` defaults to 0 until then.
+These are still frames of Shift views, rendered by the VM at its lower detail. Street level, the
+cockpit, motion over a sequence and night scenes are still to measure in game.
+
 ## Tools
 
 - `[DLSS5] Trace=1` logs a few frame pairs: every pass (target, depth, target set, draws,
@@ -437,8 +596,12 @@ previous frame (`host-20261029-172933`):
   the memory scan for the solved VP, which stalls that frame for seconds. `TraceDump=1` writes BMPs
   (scene end, pre-HUD, the HUD pass after draws 1 to 48, and the helper's depth and motion).
 - `FrameTimeLog=1` logs frame times every 600 frames.
-- `TraceShaders=1` writes every vertex shader's disassembly (`vs_<hash>.asm`, with its constant
-  table) to `TraceDumpDir`. `ObjectMotionDebug=1` paints each tagged car in a flat colour of its
+- `TraceShaders=1` writes every shader's disassembly (`vs_<hash>.asm`, `ps_<hash>.asm`, with
+  the constant table) to `TraceDumpDir`. Trace frames also log, for the first two draws of each
+  pass after the scene, the pixel constants c0-c7, the vertex constants c0-c7, the sRGB states and
+  the vertex textures (`@v0`), and the value of each 1x1 float target the post chain writes (the
+  eye adaptation). `TraceDump=1` also writes `A16B16G16R16F` targets as PFM (`scene-end.pfm`, and
+  with `Input=1` `scene-end-dlss5.pfm`), which `dsf-dlss5-offscreen --hdr` reads. `ObjectMotionDebug=1` paints each tagged car in a flat colour of its
   own in the motion target. With `TraceDump=1` both frames of each traced pair are dumped, the
   motion also as raw floats (`.rg32f`), and the camera-only motion before the object pass
   (`dlss5-motion-camera`). driversf-forza's `out\dlss5\scripts\reproject.py` turns
@@ -483,6 +646,14 @@ previous frame (`host-20261029-172933`):
 - **Mask.** No `ControlMask` yet. The Shift-mode edge glow and the 3D HUD meshes are drawn in the
   HUD pass, so they stay out of DLSS already. Fog, particles and tyre smoke are in the scene and
   get the full effect.
+- **`Input=1` in game.** Not run in game yet: the A/B against `Input=0` and DLSS 5 off, the
+  state check lines, the frame cost of the extra full-size copy and two passes, both transports,
+  and `SelfTest=1` in a VM. Then the default.
+- **`HdrExposure` at night and in tunnels.** The traced frames are all daytime. A fixed scale
+  sees darker scenes darker; an automatic one could follow the game's own La (`T#21`).
+- **The particle layer.** With `Input=1` the low-resolution particles are added after DLSS 5.
+  Running DLSS 5 after the particles combine would need the half-size `T#6` path or a later
+  hook.
 - **The two LDR passes before the composite** (`T#28` `R5G6B5` and `T#29`): which effect they are,
   and whether DLSS 5 should see the frame before them.
 - **Static camera address.** Turning the heap copies of the camera matrices into a pointer path

@@ -9,11 +9,19 @@
 //       [--structure f] [--input-format f16|u8] [--no-jitter] [--save-every] [--verbose-ngx]
 //       [--static-camera] [--jitter-scale f] [--stability] [--zero-mv] [--flat-depth]
 //       [--allow-runtime-sha256 <hash>]
+//       [--hdr in.pfm [--exposure f] [--no-highlight-recovery] [--bypass]]
 //
 // --static-camera keeps the synthetic camera still (only the jitter moves), --jitter-scale
 // multiplies the jitter reported to NGX (-1 tests the opposite sign convention), and
 // --stability reads back every output and reports the mean frame-to-frame change, which is
 // how the jitter convention in research/dlss5-helper.md was checked.
+//
+// --hdr takes a linear HDR frame (an RGB PFM, as DSF Enhanced's TraceDump writes the scene
+// target) and runs it the way DSF Enhanced's Input=1 does in game: the fast tone map (exposure,
+// ACES approximation, 1/2.2 gamma) into the f16 colour input, DLSS 5, then the inverse tone map
+// with highlight recovery back to HDR (hdr_output.pfm). The maths here mirrors the D3D9 shaders
+// in src/dlss5_bridge.inl (HdrTonemapPS, HdrInversePS) and Remix's fast and inverse tone map.
+// --bypass skips DLSS 5 (output = input) to check that the round trip gives the frame back.
 //
 // Exit code 0 means every evaluate succeeded and the output was written.
 
@@ -57,6 +65,10 @@ struct Options {
   bool stability = false;
   bool zeroMotion = false;
   bool flatDepth = false;
+  std::wstring hdrPath;
+  float exposure = 1.0f;
+  bool highlightRecovery = true;
+  bool bypass = false;
   std::vector<std::string> allowedSha256;
   NrSettings nr;
 };
@@ -86,6 +98,10 @@ bool ParseArgs(int argc, wchar_t** argv, Options* o) {
     else if (a == L"--stability") o->stability = true;
     else if (a == L"--zero-mv") o->zeroMotion = true;
     else if (a == L"--flat-depth") o->flatDepth = true;
+    else if (a == L"--hdr") o->hdrPath = next();
+    else if (a == L"--exposure") o->exposure = static_cast<float>(_wtof(next()));
+    else if (a == L"--no-highlight-recovery") o->highlightRecovery = false;
+    else if (a == L"--bypass") o->bypass = true;
     else if (a == L"--allow-runtime-sha256") o->allowedSha256.push_back(Narrow(next()));
     else {
       std::fwprintf(stderr, L"unknown argument: %ls\n", a.c_str());
@@ -138,6 +154,50 @@ bool Save(const std::wstring& path, const Rgba8Image& image) {
   return true;
 }
 
+// Remix's fast tone map and its inverse with highlight recovery (thresholds 1, 8, 0.75, 0.99),
+// per channel, as HdrTonemapPS and HdrInversePS do it on the GPU.
+float Aces(float x) {
+  return std::clamp((x * (2.51f * x + 0.03f)) / (x * (2.43f * x + 0.59f) + 0.14f), 0.0f, 1.0f);
+}
+
+float Sanitize(float v) { return std::isfinite(v) ? std::clamp(v, 0.0f, 65504.0f) : 0.0f; }
+
+float Smooth(float e0, float e1, float v) {
+  const float t = std::clamp((v - e0) / (e1 - e0), 0.0f, 1.0f);
+  return t * t * (3.0f - 2.0f * t);
+}
+
+void FastTonemap(const float* hdr, float exposure, float* ldr) {
+  for (int c = 0; c < 3; ++c) ldr[c] = std::pow(Aces(Sanitize(hdr[c]) * exposure), 1.0f / 2.2f);
+  ldr[3] = 1.0f;
+}
+
+void InverseTonemap(const float* nr, const float* hdr, float exposure, bool recovery, float* out) {
+  float x[3], t[3], original[3];
+  float hdrMax = 0.0f, ldrMax = 0.0f;
+  for (int c = 0; c < 3; ++c) {
+    original[c] = Sanitize(hdr[c]);
+    x[c] = original[c] * exposure;
+    t[c] = Aces(x[c]);
+    const float linear = std::pow(std::clamp(std::isfinite(nr[c]) ? nr[c] : 0.0f, 0.0f, 1.0f), 2.2f);
+    out[c] = linear * (x[c] / std::max(t[c], 1e-6f)) / exposure;
+    hdrMax = std::max(hdrMax, x[c]);
+    ldrMax = std::max(ldrMax, std::pow(t[c], 1.0f / 2.2f));
+  }
+  const float mask = recovery ? Smooth(1.0f, 8.0f, hdrMax) * Smooth(0.75f, 0.99f, ldrMax) : 0.0f;
+  for (int c = 0; c < 3; ++c) out[c] = std::clamp(out[c] + (original[c] - out[c]) * mask, 0.0f, 65504.0f);
+}
+
+// Mean |a - b| per channel, in 1/255 of the [0,1] range.
+void LogChannelDiff(const char* what, const std::vector<float>& a, const std::vector<float>& b, size_t stride) {
+  double sum[3] = {};
+  const size_t n = a.size() / stride;
+  for (size_t i = 0; i < n; ++i) {
+    for (int c = 0; c < 3; ++c) sum[c] += std::fabs(std::clamp(a[i * stride + c], 0.0f, 1.0f) - std::clamp(b[i * stride + c], 0.0f, 1.0f));
+  }
+  Log("%s: mean |difference| per channel R %.2f G %.2f B %.2f /255", what, 255.0 * sum[0] / n, 255.0 * sum[1] / n, 255.0 * sum[2] / n);
+}
+
 struct Inputs {
   std::vector<float> color;   // RGBA
   std::vector<float> depth;   // 1 channel
@@ -174,9 +234,34 @@ int wmain(int argc, wchar_t** argv) {
   // 2. Inputs: a still image, or the synthetic scene.
   uint32_t width = o.width;
   uint32_t height = o.height;
-  const bool still = !o.colorPath.empty();
+  const bool hdrMode = !o.hdrPath.empty();
+  const bool still = !o.colorPath.empty() || hdrMode;
   Inputs stillInputs;
-  if (still) {
+  FloatImage hdr;
+  if (hdrMode) {
+    if (!LoadPfm(o.hdrPath, &hdr, &error) || hdr.channels != 3) {
+      Log("%ls: %s (needs an RGB PFM)", o.hdrPath.c_str(), error.c_str());
+      return 4;
+    }
+    width = hdr.width;
+    height = hdr.height;
+    const size_t n = static_cast<size_t>(width) * height;
+    stillInputs.color.resize(n * 4);
+    double sum[3] = {};
+    float peak = 0.0f;
+    for (size_t i = 0; i < n; ++i) {
+      FastTonemap(&hdr.pixels[i * 3], o.exposure, &stillInputs.color[i * 4]);
+      for (int c = 0; c < 3; ++c) {
+        sum[c] += Sanitize(hdr.pixels[i * 3 + c]);
+        peak = std::max(peak, Sanitize(hdr.pixels[i * 3 + c]));
+      }
+    }
+    stillInputs.depth.assign(n, 0.5f);
+    stillInputs.motion.assign(n * 2, 0.0f);
+    o.jitter = false;
+    Log("HDR input %ls, %ux%u, mean R %.4f G %.4f B %.4f, peak %.3f, exposure %.3f", o.hdrPath.c_str(), width, height, sum[0] / n,
+        sum[1] / n, sum[2] / n, static_cast<double>(peak), static_cast<double>(o.exposure));
+  } else if (still) {
     Rgba8Image color;
     if (!LoadImageRgba8(o.colorPath, &color, &error)) {
       Log("%ls: %s", o.colorPath.c_str(), error.c_str());
@@ -303,7 +388,17 @@ int wmain(int argc, wchar_t** argv) {
     settings.jitter[0] = jx * o.jitterScale;
     settings.jitter[1] = jy * o.jitterScale;
     list = gpu.Begin();
-    const bool ok = nr.Evaluate(list, {color.Get(), output.Get(), motion.Get(), depth.Get(), mask.Get()}, settings);
+    bool ok = true;
+    if (o.bypass) {
+      // The round trip without DLSS 5: the colour input is copied to the output.
+      Gpu::Transition(list, color.Get(), kRead, D3D12_RESOURCE_STATE_COPY_SOURCE);
+      Gpu::Transition(list, output.Get(), D3D12_RESOURCE_STATE_UNORDERED_ACCESS, D3D12_RESOURCE_STATE_COPY_DEST);
+      list->CopyResource(output.Get(), color.Get());
+      Gpu::Transition(list, color.Get(), D3D12_RESOURCE_STATE_COPY_SOURCE, kRead);
+      Gpu::Transition(list, output.Get(), D3D12_RESOURCE_STATE_COPY_DEST, D3D12_RESOURCE_STATE_UNORDERED_ACCESS);
+    } else {
+      ok = nr.Evaluate(list, {color.Get(), output.Get(), motion.Get(), depth.Get(), mask.Get()}, settings);
+    }
     double gpuMs = -1.0;
     if (!gpu.SubmitAndWait(&gpuMs) || !ok) {
       ++failures;
@@ -358,6 +453,26 @@ int wmain(int argc, wchar_t** argv) {
         const double pixels = static_cast<double>(width) * height;
         Log("last frame: mean max-channel difference %.2f/255, %.1f%% of pixels changed by more than 8/255", sum / pixels,
             100.0 * changed / pixels);
+        LogChannelDiff("last frame, DLSS 5 output against its input", out, frame.color, 4);
+        if (hdrMode) {
+          // Back to HDR, as the game's post chain would get it.
+          const size_t n = static_cast<size_t>(width) * height;
+          FloatImage back{width, height, 3, std::vector<float>(n * 3)};
+          std::vector<float> again(n * 4);
+          double relative = 0.0;
+          for (size_t i = 0; i < n; ++i) {
+            InverseTonemap(&out[i * 4], &hdr.pixels[i * 3], o.exposure, o.highlightRecovery, &back.pixels[i * 3]);
+            FastTonemap(&back.pixels[i * 3], o.exposure, &again[i * 4]);
+            for (int c = 0; c < 3; ++c) {
+              const float h = Sanitize(hdr.pixels[i * 3 + c]);
+              relative += std::fabs(back.pixels[i * 3 + c] - h) / std::max(h, 1e-3f);
+            }
+          }
+          Log("HDR round trip: mean relative change of the HDR values %.4f", relative / (3.0 * n));
+          LogChannelDiff("HDR round trip, tone-mapped again against the input", again, frame.color, 4);
+          SavePfm(o.outDir + L"\\hdr_output.pfm", back, &error);
+          Save(o.outDir + L"\\hdr_roundtrip.png", ToRgba8(again, width, height));
+        }
       }
     }
   }
