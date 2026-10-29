@@ -58,22 +58,27 @@ constexpr DWORD kD5ConfigureTimeoutMs = 20000;  // creates the feature
 constexpr DWORD kD5FrameTimeoutMs = 3000;       // the helper gives up on fence_in after about 2 s
 constexpr int kD5MaxConfigureAttempts = 3;
 
+// An ini path: empty gives the default, a relative one is taken from the game folder (beside
+// Driver.exe), not from the current directory.
+void ReadGamePathSetting(const char* key, const char* fallback, char* out, const char* ini_path)
+{
+    char value[MAX_PATH] = {};
+    GetPrivateProfileStringA("DLSS5", key, "", value, MAX_PATH, ini_path);
+    const bool absolute = (value[0] != '\0' && value[1] == ':') || (value[0] == '\\' && value[1] == '\\');
+    if (absolute) {
+        std::snprintf(out, MAX_PATH, "%s", value);
+    } else {
+        BuildGamePath(out, MAX_PATH, value[0] != '\0' ? value : fallback);
+    }
+}
+
 void LoadDlss5BridgeConfig(const char* ini_path)
 {
     g_d5_helper_bypass = GetPrivateProfileIntA("DLSS5", "HelperBypass", 0, ini_path) != 0;
     g_d5_helper_transport = ClampInt(GetPrivateProfileIntA("DLSS5", "HelperTransport", 0, ini_path), 0, 2);
-    GetPrivateProfileStringA("DLSS5", "HelperPath", "", g_d5_helper_path, MAX_PATH, ini_path);
-    if (g_d5_helper_path[0] == '\0') {
-        BuildGamePath(g_d5_helper_path, MAX_PATH, "dlss5\\dsf-dlss5-helper.exe");
-    }
-    GetPrivateProfileStringA("DLSS5", "HelperRuntime", "", g_d5_helper_runtime, MAX_PATH, ini_path);
-    if (g_d5_helper_runtime[0] == '\0') {
-        BuildGamePath(g_d5_helper_runtime, MAX_PATH, "dlss5");
-    }
-    GetPrivateProfileStringA("DLSS5", "HelperLog", "", g_d5_helper_log, MAX_PATH, ini_path);
-    if (g_d5_helper_log[0] == '\0') {
-        BuildGamePath(g_d5_helper_log, MAX_PATH, "dsf-dlss5-helper.log");
-    }
+    ReadGamePathSetting("HelperPath", "dlss5\\dsf-dlss5-helper.exe", g_d5_helper_path, ini_path);
+    ReadGamePathSetting("HelperRuntime", "dlss5", g_d5_helper_runtime, ini_path);
+    ReadGamePathSetting("HelperLog", "dsf-dlss5-helper.log", g_d5_helper_log, ini_path);
     g_d5_style = ClampInt(GetPrivateProfileIntA("DLSS5", "Style", 0, ini_path), 0, 2);
     g_d5_intensity = std::max(0.0f, std::min(ReadProfileFloat("DLSS5", "Intensity", 1.0f, ini_path), 1.0f));
     g_d5_tone_strength = std::max(0.0f, std::min(ReadProfileFloat("DLSS5", "ToneStrength", 0.3f, ini_path), 1.0f));

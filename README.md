@@ -44,6 +44,58 @@ Settings live in `dsf_enhanced.ini`. The defaults turn on borderless mode, 16x a
 
 To uninstall, delete the three files. If the game already has a `winmm.dll`, from another ASI loader for example, back it up before installing. Nothing here touches `Driver.exe` or `gameconfig.txt`.
 
+## DLSS 5 (experimental)
+
+DSF Enhanced can run NVIDIA DLSS 5 (DLSS 3D-Guided Neural Rendering) on the game's frame just before the HUD is drawn, so the HUD and menus stay as they are. DLSS 5 re-renders lighting and materials with NVIDIA's model. In this game, buildings and roads get firmer shading, and the film grain is smoothed out.
+
+The model is 64-bit and the game is 32-bit, so a small 64-bit helper (`dlss5\dsf-dlss5-helper.exe`, in the release ZIP) runs it next to the game. NVIDIA's runtime DLL is not included and cannot be: you download it from NVIDIA's RTX Remix release (step 2). DLSS 5 is off by default, and nothing below changes the game unless you turn it on.
+
+### Requirements
+
+- An NVIDIA GeForce RTX 50-series GPU. Tested on an RTX 5070 Ti with driver 621.01. DLSS 5 needs a driver with DLSS 5 (DLSSNR) support.
+- 64-bit Windows 10 or 11.
+- DXVK 3.1.1 (step 3). Without DXVK it still works, but every frame is copied through the CPU, which costs about 15 ms a frame.
+- `nvngx_dlssnr.dll` version 310.9.16.0 from NVIDIA's RTX Remix 1.6.1 (step 2). The helper accepts only that exact file.
+
+### Turn it on
+
+1. Install DSF Enhanced from the release ZIP as above, and also copy the ZIP's `dlss5` folder into the game folder. You should then have `dlss5\dsf-dlss5-helper.exe` next to `Driver.exe`.
+2. Get `nvngx_dlssnr.dll`:
+   - Download `rtx-remix-for-x64-games-release-remix-1.6.1.zip` (557 MB) from https://github.com/NVIDIAGameWorks/rtx-remix/releases/tag/remix-1.6.1.
+   - Open it and copy `runtime\nvngx_dlssnr.dll` into the game's `dlss5` folder.
+   - It should be 266,424,944 bytes with SHA-256 `2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f`. To check, run this in PowerShell in the game folder: `Get-FileHash dlss5\nvngx_dlssnr.dll`.
+3. Get DXVK:
+   - Download `dxvk-3.1.1.tar.gz` from https://github.com/doitsujin/dxvk/releases/tag/v3.1.1. Its SHA-256 is `40565b4a724aadc4433fa4e010b4b23916d9b1f1baeee64e17186db94f54e608`.
+   - Unpack it with `tar -xf dxvk-3.1.1.tar.gz` (Windows' own `tar` works).
+   - Copy `dxvk-3.1.1\x32\d3d9.dll` into the game folder, next to `Driver.exe`. Its SHA-256 is `265888c31ca78dffa290c39cb7e50bfb02762590e41927906e46fb32f01497fa`.
+   - Take the `x32` copy, not `x64`: the game is 32-bit. If the game folder already has a `d3d9.dll` (ReShade, for example), back it up first. Only one file can be `d3d9.dll`.
+4. In `dsf_enhanced.ini`, under `[DLSS5]`, set:
+
+   ```ini
+   Export=1
+   Helper=1
+   ```
+
+   The ini already points `HelperPath` and `HelperRuntime` at the `dlss5` folder.
+5. Start the game. When a level loads, the picture changes after a second or two while the helper starts.
+
+To see what happened, read `dsf-dlss5-helper.log` next to `Driver.exe`, and the `DLSS5 helper:` lines in `dsf_enhanced.log`. If the helper can't start or rejects the DLL, the log says why and the game runs on without DLSS 5.
+
+### Turn it off
+
+Set `Helper=0` and `Export=0` in `dsf_enhanced.ini`, or delete the two lines you changed; they default to off. To remove it entirely, also delete the `dlss5` folder and DXVK's `d3d9.dll`.
+
+### Known limitations
+
+- Experimental. Tested in single-player driving on one RTX 5070 Ti: the chase, cockpit and side views, the Shift zoom and the pause menu. The game ran at 1280x720, also in borderless mode on a 3440x1440 desktop. Other game resolutions, split screen and other GPUs are untested.
+- Cars, the player's car and the car interior get their own motion vectors. Everything else uses camera motion: pedestrians, the driver's hands, wheel spin, loose panels and moving props. Those can smear when they move fast.
+- The HUD and the pause menu are drawn over DLSS 5's image and stay as they are (tested). Bink cinematics and loading screens should be skipped the same way, but they weren't tested with DLSS 5 on.
+- Frame cost on the RTX 5070 Ti with DXVK, at 1280x720 with nothing else loading the GPU: frames took 8.3-9.1 ms with DLSS 5 against 8.35-8.7 ms without. Without DXVK it adds about 15 ms a frame.
+- Changes to `[DLSS5]` need a restart of the game.
+- Only NVIDIA's signed `nvngx_dlssnr.dll` from RTX Remix 1.6.1 is accepted. A newer NVIDIA release would need a newer helper.
+
+The helper contains NVIDIA's NGX loader from the NVIDIA DLSS SDK, under the NVIDIA RTX SDKs license (`dlss5\NVIDIA-RTX-SDKs-LICENSE.txt` in the ZIP). NVIDIA, RTX and DLSS are trademarks of NVIDIA Corporation. This project is not sponsored or endorsed by NVIDIA. How it works: [research/dlss5-renderer.md](research/dlss5-renderer.md) and [dlss5/README.md](dlss5/README.md).
+
 ## worldlod: a high-detail upper Shift
 
 When you Shift up, the game draws one low-detail model of the whole city: flat ground under plain building shells. worldlod rebuilds it from the game's own detailed areas, with real roads, kerbs, paving, trees and bushes, building detail and painted road text. It reads your `san_francisco.dngc` and writes the new map into it, with a backup. No game data is shipped.
@@ -73,7 +125,7 @@ From the repository root:
 .\build.ps1
 ```
 
-This writes the plugin files, this README, the license, `DSF-Enhanced.zip` and `worldlod.zip` to `dist/`. To install the plugin into a local copy of the game:
+This writes the plugin files, this README, the license, `DSF-Enhanced.zip` and `worldlod.zip` to `dist/`. It also builds the DLSS 5 helper (`dlss5\build.ps1`) into `dist/dlss5/` and the ZIP. That build needs the x64 toolchain and downloads NVIDIA's DLSS SDK headers and static NGX loader from https://github.com/NVIDIA/DLSS, pinned by SHA-256. `.\build.ps1 -SkipDlss5` leaves the helper out. To install the plugin into a local copy of the game:
 
 ```powershell
 .\install.ps1 -GamePath "D:\Games\Driver San Francisco"
@@ -96,7 +148,7 @@ The workflow then runs worldlod's tests and lint and `build.ps1` on that tag, an
 
 - `src/` has the plugin source and the default `dsf_enhanced.ini`.
 - `tests/` has the cinematic fit test. `build.ps1` runs it and stops if it fails.
-- `dlss5/` has the experimental DLSS 5 helper: a 64-bit process that runs NVIDIA's DLSS 5 pass for the 32-bit game, and its offscreen tests. It has its own build script and README and is not part of the release package yet.
+- `dlss5/` has the experimental DLSS 5 helper: a 64-bit process that runs NVIDIA's DLSS 5 pass for the 32-bit game, and its offscreen tests. It has its own build script and README. The release ZIP carries the helper in its `dlss5` folder.
 - `research/` has design notes.
 - `third_party/winmm.dll` is the bundled [Ultimate ASI Loader](https://github.com/ThirteenAG/Ultimate-ASI-Loader), MIT-licensed.
 - `worldlod/` is the map pipeline (Python, `src/dsfworld/`), its release launcher (`release/`), the vendored meshoptimizer simplifier (`native/`, MIT) and its research notes.

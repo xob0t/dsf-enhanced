@@ -148,8 +148,12 @@ render its effects at the pre-HUD point this way.
 copied every frame through the CPU. The next section covers the GPU path under DXVK, the
 protocol rework and the frame times.
 
-1. The back-buffer-sized `D24S8` depth surfaces are created as the top level of an `INTZ`
-   texture, so the scene depth can be sampled (logged as "created as INTZ").
+1. The `D24S8` depth surfaces of the game's render size are created as the top level of an
+   `INTZ` texture, so the scene depth can be sampled (logged as "created as INTZ"). The render
+   size is the back buffer size the game asks for. `BorderlessWindowed` makes the swap chain the
+   monitor's size, and the game then stretches a smaller frame into it; keying on the swap chain
+   picked the shadow map as the scene, and DLSS 5 never started (found in the release package's
+   end-to-end run, `host-20261029-205754`).
 2. At the pre-HUD point two D3D9 quads write depth (`R32F`, z/w) and motion (`G16R16F`, previous
    minus current position in pixels, +y down). Motion reprojects each pixel through
    `VP_prev · VP_cur⁻¹`, which DSF Enhanced builds in double precision. The shader never forms a

@@ -60,6 +60,10 @@ float g_fov_scalar = 0.0f;
 float g_current_aspect = 16.0f / 9.0f;
 UINT g_backbuffer_width = 0;
 UINT g_backbuffer_height = 0;
+// The back buffer size the game asked for: its render resolution. BorderlessWindowed makes the
+// swap chain the monitor's size, and the game stretches its frame into it.
+UINT g_game_render_width = 0;
+UINT g_game_render_height = 0;
 char g_log_path[MAX_PATH] = {};
 bool g_aspect_constant_patched = false;
 bool g_global_fov_scalar_patched = false;
@@ -2013,6 +2017,8 @@ void ApplyPresentationTweaks(D3DPRESENT_PARAMETERS* presentation_parameters, HWN
     if (presentation_parameters == nullptr) {
         return;
     }
+    g_game_render_width = presentation_parameters->BackBufferWidth;
+    g_game_render_height = presentation_parameters->BackBufferHeight;
 
     if (g_borderless_windowed) {
         ApplyBorderlessWindow(window, presentation_parameters);
