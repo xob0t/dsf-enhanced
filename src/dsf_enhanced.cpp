@@ -5,6 +5,7 @@
 #include <d3d11_4.h>
 #include <d3dcommon.h>
 #include <dxgi1_2.h>
+#include <dbghelp.h>
 #include <intrin.h>
 
 #include <algorithm>

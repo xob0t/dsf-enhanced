@@ -447,6 +447,10 @@ bool D5VkInit(IDirect3DDevice9* device)
             }
         }
     }
+    D3DDEVICE_CREATION_PARAMETERS creation = {};
+    device->GetCreationParameters(&creation);
+    Log("DLSS5 helper: device behaviour flags 0x%08lX (multithreaded %d)", static_cast<unsigned long>(creation.BehaviorFlags),
+        (creation.BehaviorFlags & D3DCREATE_MULTITHREADED) != 0 ? 1 : 0);
     Log("DLSS5 helper: Vulkan transport through DXVK interop: queue family %u, adapter LUID %08lX:%08lX%s", g_d5_vk_family,
         static_cast<unsigned long>(g_d5_adapter_luid.HighPart), static_cast<unsigned long>(g_d5_adapter_luid.LowPart),
         id.deviceLUIDValid ? "" : " (not reported)");
@@ -828,8 +832,99 @@ DWORD WINAPI D5BridgeWorker(LPVOID)
     return 0;
 }
 
+// While the helper path is on, exceptions are logged (code, module and offset, the C++ type for
+// C++ throws, the DLSS 5 step the render thread was in), and the first one that is not routine
+// is written to dsf_dlss5_crash_<pid>.dmp beside Driver.exe. Logging only: every exception then
+// goes on to the game's own handlers as before.
+volatile LONG g_d5_veh_count = 0;
+volatile LONG g_d5_veh_dumped = 0;
+volatile LONG g_d5_step = 0;   // where D5BridgeFrame is (0: outside it)
+
+using MiniDumpWriteDumpFn = BOOL (WINAPI*)(HANDLE, DWORD, HANDLE, MINIDUMP_TYPE, PMINIDUMP_EXCEPTION_INFORMATION,
+    PMINIDUMP_USER_STREAM_INFORMATION, PMINIDUMP_CALLBACK_INFORMATION);
+
+const char* D5CxxTypeName(const EXCEPTION_RECORD* record)
+{
+    // MSVC x86 throw info: ThrowInfo -> CatchableTypeArray -> CatchableType -> TypeDescriptor.
+    if (record->NumberParameters < 3) {
+        return "?";
+    }
+    const auto* throw_info = reinterpret_cast<const DWORD*>(record->ExceptionInformation[2]);
+    if (!IsReadableMemory(throw_info, 16)) {
+        return "?";
+    }
+    const auto* types = reinterpret_cast<const DWORD*>(throw_info[3]);
+    if (!IsReadableMemory(types, 8) || types[0] < 1) {
+        return "?";
+    }
+    const auto* catchable = reinterpret_cast<const DWORD*>(types[1]);
+    if (!IsReadableMemory(catchable, 8)) {
+        return "?";
+    }
+    const auto* descriptor = reinterpret_cast<const char*>(catchable[1]);
+    return IsReadableMemory(descriptor, 16) ? descriptor + 8 : "?";
+}
+
+void D5WriteCrashDump(EXCEPTION_POINTERS* info)
+{
+    HMODULE dbghelp = LoadLibraryA("dbghelp.dll");
+    auto write = dbghelp != nullptr ? reinterpret_cast<MiniDumpWriteDumpFn>(GetProcAddress(dbghelp, "MiniDumpWriteDump")) : nullptr;
+    if (write == nullptr) {
+        return;
+    }
+    char name[64] = {};
+    std::snprintf(name, sizeof(name), "dsf_dlss5_crash_%lu.dmp", GetCurrentProcessId());
+    char path[MAX_PATH] = {};
+    BuildGamePath(path, MAX_PATH, name);
+    const HANDLE file = CreateFileA(path, GENERIC_WRITE, 0, nullptr, CREATE_ALWAYS, FILE_ATTRIBUTE_NORMAL, nullptr);
+    if (file == INVALID_HANDLE_VALUE) {
+        return;
+    }
+    MINIDUMP_EXCEPTION_INFORMATION exception = {GetCurrentThreadId(), info, FALSE};
+    const BOOL ok = write(GetCurrentProcess(), GetCurrentProcessId(), file,
+        static_cast<MINIDUMP_TYPE>(MiniDumpWithIndirectlyReferencedMemory | MiniDumpWithThreadInfo | MiniDumpWithDataSegs), &exception,
+        nullptr, nullptr);
+    CloseHandle(file);
+    Log("DLSS5: %s %s", ok ? "wrote" : "could not write", path);
+}
+
+LONG CALLBACK D5LogException(EXCEPTION_POINTERS* info)
+{
+    if (info == nullptr || info->ExceptionRecord == nullptr) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    const EXCEPTION_RECORD* record = info->ExceptionRecord;
+    const DWORD code = record->ExceptionCode;
+    // Thread names and debug output are routine.
+    if (code == 0x406D1388 || code == 0x40010006 || code == 0x4001000A || InterlockedIncrement(&g_d5_veh_count) > 32) {
+        return EXCEPTION_CONTINUE_SEARCH;
+    }
+    char where[160] = {};
+    D5ModuleName(record->ExceptionAddress, where, sizeof(where));
+    if (code == EXCEPTION_ACCESS_VIOLATION) {
+        Log("DLSS5: exception 0x%08lX (access violation, %s 0x%08lX) at %s thread %lu step %ld", code,
+            record->ExceptionInformation[0] == 0 ? "read" : record->ExceptionInformation[0] == 1 ? "write" : "execute",
+            static_cast<unsigned long>(record->ExceptionInformation[1]), where, GetCurrentThreadId(), g_d5_step);
+    } else if (code == 0xE06D7363) {
+        Log("DLSS5: exception 0x%08lX (C++ %s) at %s thread %lu step %ld", code, D5CxxTypeName(record), where, GetCurrentThreadId(),
+            g_d5_step);
+    } else {
+        Log("DLSS5: exception 0x%08lX flags 0x%lX at %s thread %lu step %ld", code, record->ExceptionFlags, where, GetCurrentThreadId(),
+            g_d5_step);
+    }
+    if (code != 0xE06D7363 && InterlockedCompareExchange(&g_d5_veh_dumped, 1, 0) == 0) {
+        D5WriteCrashDump(info);
+    }
+    return EXCEPTION_CONTINUE_SEARCH;
+}
+
 void D5BridgeStart(IDirect3DDevice9* device)
 {
+    static bool veh = false;
+    if (!veh) {
+        veh = true;
+        AddVectoredExceptionHandler(1, D5LogException);   // first: DriverNGHook handles fatal ones itself
+    }
     if (!g_d5_helper || InterlockedCompareExchange(&g_d5_bridge_state, D5_BRIDGE_STARTING, D5_BRIDGE_OFF) != D5_BRIDGE_OFF) {
         return;
     }
@@ -1319,12 +1414,17 @@ bool D5VkFrame(IDirect3DDevice9* device, IDirect3DSurface9* target, UINT w, UINT
         return false;
     }
 
+    // The game also calls the device from its main thread (it locks dynamic vertex and index
+    // buffers there). DXVK's interop calls don't take the device lock that D3D9 calls take, so
+    // hold it while they run: without it a Flush raced a buffer Lock and crashed in DXVK.
+    g_d5_vk_interop->LockDevice();
     const vkm::VkImageSubresourceRange range = {vkm::VK_IMAGE_ASPECT_COLOR_BIT, 0, 1, 0, 1};
     const D5VkTexture* sources[3] = {&color, &depth, &motion};
     for (const D5VkTexture* source : sources) {
         g_d5_vk_interop->TransitionTextureLayout(source->interop, &range, source->layout, vkm::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL);
     }
     g_d5_vk_interop->TransitionTextureLayout(composite.interop, &range, composite.layout, vkm::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL);
+    g_d5_step = 3;
     g_d5_vk_interop->FlushRenderingCommands();
 
     // Inputs: the game's colour and our depth and motion into the helper's textures, fence_in = n.
@@ -1352,9 +1452,12 @@ bool D5VkFrame(IDirect3DDevice9* device, IDirect3DSurface9* target, UINT w, UINT
         copy_src[i] = sources[i]->image;
         copy_dst[i] = shared;
     }
+    g_d5_step = 4;
     g_d5_vk_interop->LockSubmissionQueue();
+    g_d5_step = 5;
     const bool submitted = D5VkSubmit(0, before, 6, copies, copy_src, copy_dst, 3, after, 3, 0, 0, g_d5_vk_fence_in, n);
     g_d5_vk_interop->ReleaseSubmissionQueue();
+    g_d5_vk_interop->UnlockDevice();   // not held while the helper works
 
     bool ack_ok = false;
     DsfDlss5FrameAck ack = {};
@@ -1362,6 +1465,7 @@ bool D5VkFrame(IDirect3DDevice9* device, IDirect3DSurface9* target, UINT w, UINT
     if (!submitted) {
         D5BridgeFail("submitting the input copies failed");
     } else {
+        g_d5_step = 6;
         alive = D5ExchangeFrame(n, &ack_ok, &ack);
     }
 
@@ -1388,7 +1492,9 @@ bool D5VkFrame(IDirect3DDevice9* device, IDirect3DSurface9* target, UINT w, UINT
         copy.srcSubresource = {vkm::VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.dstSubresource = {vkm::VK_IMAGE_ASPECT_COLOR_BIT, 0, 0, 1};
         copy.extent = {w, h, 1};
+        g_d5_step = 7;
         g_d5_vk_interop->LockSubmissionQueue();
+        g_d5_step = 8;
         composited = D5VkSubmit(1, out_before, 2, &copy, &output, &composite.image, 1, out_after, 2, g_d5_vk_fence_out, n, 0, 0);
         g_d5_vk_interop->ReleaseSubmissionQueue();
         if (!composited) {
@@ -1397,11 +1503,14 @@ bool D5VkFrame(IDirect3DDevice9* device, IDirect3DSurface9* target, UINT w, UINT
     }
     g_d5_vk_ring = (g_d5_vk_ring + 1) % kD5VkRing;
 
+    g_d5_step = 9;
+    g_d5_vk_interop->LockDevice();
     // Back to the layouts DXVK expects, then draw the output over the HUD target.
     for (const D5VkTexture* source : sources) {
         g_d5_vk_interop->TransitionTextureLayout(source->interop, &range, vkm::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, source->layout);
     }
     g_d5_vk_interop->TransitionTextureLayout(composite.interop, &range, vkm::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, composite.layout);
+    g_d5_vk_interop->UnlockDevice();
     release();
     if (composited) {
         D5Composite(device, target, g_d5_ps_copy_swap);
@@ -1459,11 +1568,14 @@ void D5BridgeFrame(IDirect3DDevice9* device)
     }
 
     const double start = D5NowMs();
+    g_d5_step = 1;
     const bool have_motion = D5RenderInputs(device, target, depth, desc.Width, desc.Height);
+    g_d5_step = 2;
     float gpu_ms = -1.0f;
     const bool composited = g_d5_transport == D5_TRANSPORT_VULKAN ? D5VkFrame(device, target, desc.Width, desc.Height, &gpu_ms) :
         D5CpuFrame(device, target, desc.Width, desc.Height, &gpu_ms);
     g_d5_internal = false;
+    g_d5_step = 0;
     const double ms = D5NowMs() - start;
     if (!composited) {
         return;
