@@ -68,6 +68,10 @@ def parser() -> argparse.ArgumentParser:
     sub.add_parser("config", parents=[common, built], help="print the settings in effect")
     sub.add_parser("info", parents=[common, dev], help="summarise the game's world archive")
     p = sub.add_parser("bake", parents=[common, built, dev], help="bake the regions only (a build's first step)")
+    p = sub.add_parser(
+        "overlaps", parents=[common, built, dev], help="count the baked surfaces that z-fight with the building shells"
+    )
+    p.add_argument("--cell", action="append", help="only this region (repeatable), e.g. R_267")
     p = sub.add_parser("render", parents=[common, dev], help="draw the stock and the built map over the same area")
     p.add_argument("--area", type=float, nargs=4, metavar=("MIN_X", "MIN_Z", "MAX_X", "MAX_Z"), help="metres")
     p.add_argument("--cell", help="the area of this region's cell, e.g. R_360")
@@ -102,7 +106,7 @@ def open_world(cfg: config.Config) -> World:
 
 def run_stage(cfg: config.Config, world: World, args: argparse.Namespace) -> None:
     """Run the command that needs the open world."""
-    from dsfworld.stages import bake, info, pack, render
+    from dsfworld.stages import bake, info, overlaps, pack, render
 
     if args.command == "render":
         area, name = args.area, args.name
@@ -114,6 +118,7 @@ def run_stage(cfg: config.Config, world: World, args: argparse.Namespace) -> Non
     stages = {
         "info": lambda: info.run(world),
         "bake": lambda: bake.run(cfg, world, force=args.force),
+        "overlaps": lambda: overlaps.run(cfg, world, names=args.cell, force=args.force),
         "build": lambda: pack.run(cfg, world, force=args.force),
         "install": lambda: pack.run(cfg, world, force=args.force, show_file=False),
     }

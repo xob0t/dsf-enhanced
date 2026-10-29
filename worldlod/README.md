@@ -69,6 +69,11 @@ min_model_size = { buildings = 2.0 }  # leave out building detail smaller than 2
 error = 0.5  # simplify the ground (metres): lighter, a little less exact
 ```
 
+Building detail is moved off the building shells so the two don't flicker from
+afar (`[bake] wall_offset`, 0.3 m by default; `0.0` leaves it where the game has
+it), and faces that repeat a shell face, or another baked face of the same
+material, are left out (`drop_duplicates`).
+
 Tables keyed by class name (`[classes]`, `min_model_size`) replace the default
 table as a whole.
 
@@ -86,6 +91,7 @@ repository, `uv run worldlod <command>` runs any of them:
 | `worldlod info` | summarises the game's world archive |
 | `worldlod bake` | a build's first step only: `bake/<region>.pkl` and `bake/summary.tsv` |
 | `worldlod render [--cell R_360 \| --area ...] [--view top\|oblique]` | `render/<name>_<view>_{stock,baked,compare}.png`: the stock and the built map, textured, over the same area |
+| `worldlod overlaps [--cell R_267]` | bakes if needed, then counts per cell the building detail faces that lie on a building shell face (within 2, 5, 10 and 30 cm) or on each other, and the duplicates: `bake/overlaps.tsv` |
 
 A build is skipped while the code, the settings and the game's archive are
 unchanged; `bake` likewise reuses each region's earlier output. `--archive
