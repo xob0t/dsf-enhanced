@@ -57,7 +57,8 @@ bool g_d5_trace = false;
 bool g_d5_helper = false;      // [DLSS5] Helper: run DLSS 5 through dsf-dlss5-helper (dlss5_bridge.inl)
 thread_local bool g_d5_internal = false;   // DSF Enhanced's own D3D9 calls on this thread: the hooks pass them through
 void LoadDlss5BridgeConfig(const char* ini_path);
-void D5BridgeFrame(IDirect3DDevice9* device);
+void D5BridgeFrame(IDirect3DDevice9* device, bool hdr);
+extern int g_d5_input;
 bool D5CreateIntzDepth(IDirect3DDevice9* device, UINT w, UINT h, IDirect3DSurface9** out);
 void D5FrameTimeTick();
 void D5NoteShader(const void* shader, const DWORD* function);
@@ -98,7 +99,9 @@ void LoadDlss5Config(const char* ini_path)
     g_d5_trace_scan = GetPrivateProfileIntA("DLSS5", "TraceScan", 0, ini_path) != 0;
     g_d5_trace_shaders = GetPrivateProfileIntA("DLSS5", "TraceShaders", 0, ini_path) != 0;
     g_d5_export = GetPrivateProfileIntA("DLSS5", "Export", 0, ini_path) != 0;
-    g_d5_helper = g_d5_export && GetPrivateProfileIntA("DLSS5", "Helper", 0, ini_path) != 0;
+    // SelfTest runs the game side of the helper path without the helper (dlss5_bridge.inl).
+    g_d5_helper = g_d5_export && (GetPrivateProfileIntA("DLSS5", "Helper", 0, ini_path) != 0 ||
+        GetPrivateProfileIntA("DLSS5", "SelfTest", 0, ini_path) != 0);
     LoadDlss5BridgeConfig(ini_path);
     g_d5_trace_start_seconds = ClampInt(GetPrivateProfileIntA("DLSS5", "TraceStartSeconds", 60, ini_path), 0, 3600);
     g_d5_trace_interval_seconds = ClampInt(GetPrivateProfileIntA("DLSS5", "TraceIntervalSeconds", 20, ini_path), 1, 3600);
@@ -448,6 +451,7 @@ struct D5State
     const void* rt0 = nullptr;
     const void* ds = nullptr;
     IDirect3DBaseTexture9* bound[16] = {};
+    IDirect3DBaseTexture9* vertex_bound[4] = {};   // vertex texture samplers (trace only)
     const void* vs = nullptr;
     const void* ps = nullptr;
     DWORD blend = 0;
@@ -644,6 +648,26 @@ void D5DumpSurface(IDirect3DDevice9* device, const void* surface_object, const c
         }
         std::fclose(file);
         Log("DLSS5 dump %s -> %s", label, path);
+    }
+    if (half4) {
+        // The HDR values in full as well: a PFM (RGB floats, bottom row first), which
+        // dsf-dlss5-offscreen reads with --hdr.
+        std::snprintf(path, sizeof(path), "%s\\f%05ld-%s.pfm", g_d5_dump_dir, static_cast<long>(g_d5_frame_index), label);
+        fopen_s(&file, path, "wb");
+        if (file != nullptr) {
+            std::fprintf(file, "PF\n%u %u\n-1.0\n", desc.Width, desc.Height);
+            std::vector<float> row(desc.Width * 3);
+            for (UINT y = desc.Height; y-- > 0;) {
+                const auto* h = reinterpret_cast<const std::uint16_t*>(static_cast<const std::uint8_t*>(locked.pBits) + static_cast<size_t>(y) * locked.Pitch);
+                for (UINT x = 0; x < desc.Width; ++x) {
+                    for (int c = 0; c < 3; ++c) {
+                        row[x * 3 + c] = D5HalfToFloat(h[x * 4 + c]);
+                    }
+                }
+                std::fwrite(row.data(), sizeof(float), row.size(), file);
+            }
+            std::fclose(file);
+        }
     }
     if (motion16) {
         // The motion in full as well: .rg32f, width * height pairs of float pixels, top row first.
@@ -1295,7 +1319,9 @@ void D5BeforeDraw(IDirect3DDevice9* device, UINT prims, UINT vertices)
         }
         if (g_d5_export) {
             D5Publish(device, DSFE5_POINT_PRE_HUD);
-            D5BridgeFrame(device);
+            if (g_d5_input == 0) {
+                D5BridgeFrame(device, false);
+            }
             if (g_d5_trace_frame != nullptr && g_d5_trace_dump && g_d5_trace_pair_step != 0 && g_d5_helper) {
                 D5DumpSurface(device, g_d5.rt0, "pre-hud-dlss5");
             }
@@ -1330,6 +1356,17 @@ void D5BeforeDraw(IDirect3DDevice9* device, UINT prims, UINT vertices)
     }
 
     char reads[160] = {};
+    for (int stage = 0; stage < 4; ++stage) {
+        D5Resource r = {};
+        if (g_d5.vertex_bound[stage] != nullptr && D5Lookup(g_d5.vertex_bound[stage], &r)) {
+            char tag[24] = {};
+            std::snprintf(tag, sizeof(tag), " %c#%d@v%d", r.kind, r.id, stage);
+            D5AppendTag(pass->reads, sizeof(pass->reads), tag);
+            if (std::strlen(reads) + std::strlen(tag) + 1 < sizeof(reads)) {
+                std::strncat(reads, tag, sizeof(reads) - std::strlen(reads) - 1);
+            }
+        }
+    }
     for (int stage = 0; stage < 16; ++stage) {
         D5Resource r = {};
         if (g_d5.bound[stage] != nullptr && D5Lookup(g_d5.bound[stage], &r)) {
@@ -1364,6 +1401,29 @@ void D5BeforeDraw(IDirect3DDevice9* device, UINT prims, UINT vertices)
             reads, other,
             static_cast<double>(g_d5.vs_c[0].v[0]), static_cast<double>(g_d5.vs_c[0].v[1]),
             static_cast<double>(g_d5.vs_c[0].v[2]), static_cast<double>(g_d5.vs_c[0].v[3]));
+        // The post chain's own constants (exposure, tone curve) and colour-space states.
+        float pc[8 * 4] = {};
+        DWORD srgb_write = 0, srgb_read = 0;
+        if (g_d5_scene_done && pass->draws <= 2 && t->draw_line_count < kD5MaxDrawLines &&
+            SUCCEEDED(device->GetPixelShaderConstantF(0, pc, 8))) {
+            device->GetRenderState(D3DRS_SRGBWRITEENABLE, &srgb_write);
+            device->GetSamplerState(0, D3DSAMP_SRGBTEXTURE, &srgb_read);
+            char text[200] = {};
+            size_t used = std::snprintf(text, sizeof(text), "  ps c0-7 srgb w%lu r%lu:", static_cast<unsigned long>(srgb_write),
+                static_cast<unsigned long>(srgb_read));
+            for (int i = 0; i < 32 && used + 12 < sizeof(text); ++i) {
+                used += std::snprintf(text + used, sizeof(text) - used, "%s%.4g", i % 4 == 0 ? " " : ",", static_cast<double>(pc[i]));
+            }
+            std::snprintf(t->draw_lines[t->draw_line_count++], sizeof(t->draw_lines[0]), "%s", text);
+            if (t->draw_line_count < kD5MaxDrawLines) {
+                used = std::snprintf(text, sizeof(text), "  vs c0-7:");
+                for (int i = 0; i < 32 && used + 12 < sizeof(text); ++i) {
+                    used += std::snprintf(text + used, sizeof(text) - used, "%s%.4g", i % 4 == 0 ? " " : ",",
+                        static_cast<double>(g_d5.vs_c[i / 4].v[i % 4]));
+                }
+                std::snprintf(t->draw_lines[t->draw_line_count++], sizeof(t->draw_lines[0]), "%s", text);
+            }
+        }
     }
 
     // Final-size LDR passes after the scene: dump after the first few draws to see where the
@@ -1371,9 +1431,41 @@ void D5BeforeDraw(IDirect3DDevice9* device, UINT prims, UINT vertices)
     (void)device;
 }
 
+// Trace frames: the value of a 1x1 float target the post chain just wrote (eye adaptation).
+void D5LogTinyTarget(IDirect3DDevice9* device, const void* surface_object)
+{
+    auto* surface = static_cast<IDirect3DSurface9*>(const_cast<void*>(surface_object));
+    D3DSURFACE_DESC desc = {};
+    if (surface == nullptr || FAILED(surface->GetDesc(&desc)) || desc.Width != 1 || desc.Height != 1 ||
+        (desc.Format != D3DFMT_R32F && desc.Format != D3DFMT_A16B16G16R16F)) {
+        return;
+    }
+    IDirect3DSurface9* staging = nullptr;
+    D3DLOCKED_RECT locked = {};
+    if (SUCCEEDED(device->CreateOffscreenPlainSurface(1, 1, desc.Format, D3DPOOL_SYSTEMMEM, &staging, nullptr)) &&
+        SUCCEEDED(device->GetRenderTargetData(surface, staging)) && SUCCEEDED(staging->LockRect(&locked, nullptr, D3DLOCK_READONLY))) {
+        char name[64] = {};
+        D5Describe(surface_object, name, sizeof(name));
+        if (desc.Format == D3DFMT_R32F) {
+            Log("DLSS5  1x1 %s = %.6g", name, static_cast<double>(*static_cast<const float*>(locked.pBits)));
+        } else {
+            const auto* h = static_cast<const std::uint16_t*>(locked.pBits);
+            Log("DLSS5  1x1 %s = %.6g %.6g %.6g %.6g", name, static_cast<double>(D5HalfToFloat(h[0])), static_cast<double>(D5HalfToFloat(h[1])),
+                static_cast<double>(D5HalfToFloat(h[2])), static_cast<double>(D5HalfToFloat(h[3])));
+        }
+        staging->UnlockRect();
+    }
+    if (staging != nullptr) {
+        staging->Release();
+    }
+}
+
 void D5AfterDraw(IDirect3DDevice9* device)
 {
     D5FrameTrace* t = g_d5_trace_frame;
+    if (t != nullptr && g_d5_scene_done && g_d5_pass_draws == 1) {
+        D5LogTinyTarget(device, g_d5.rt0);
+    }
     if (t == nullptr || !g_d5_trace_dump || g_d5_trace_pair_step != 1 || !g_d5_scene_done) {
         return;
     }
@@ -1419,6 +1511,14 @@ void D5LeavePass(IDirect3DDevice9* device)
         }
         if (g_d5_export) {
             D5Publish(device, DSFE5_POINT_SCENE_END);
+        }
+        // Input=1: DLSS 5 on the HDR scene target, here, after the scene's opaque and blended draws
+        // (glass, skid marks, full-size particles) and before the first post pass reads it.
+        if (g_d5_helper && g_d5_input == 1) {
+            D5BridgeFrame(device, true);
+            if (t != nullptr && g_d5_trace_dump && g_d5_trace_pair_step == 1) {
+                D5DumpSurface(device, g_d5_scene_rt, "scene-end-dlss5");
+            }
         }
     }
 }
@@ -1837,16 +1937,28 @@ HRESULT STDMETHODCALLTYPE D5SetTexture(IDirect3DDevice9* device, DWORD stage, ID
     }
     if (stage < 16) {
         g_d5.bound[stage] = texture;
+    } else if (stage >= D3DVERTEXTEXTURESAMPLER0 && stage <= D3DVERTEXTEXTURESAMPLER3) {
+        g_d5.vertex_bound[stage - D3DVERTEXTEXTURESAMPLER0] = texture;
     }
     return g_d5_set_texture(device, stage, texture);
 }
 
-// The scene candidate: the busiest render target this frame that draws with a depth surface and
-// covers the back buffer (the distant-scene strips, 128x832, can draw more than the scene).
+// The scene candidate: the busiest render target this frame that draws with a depth surface, is
+// the HDR format (A16B16G16R16F) at exactly the game's render size, and is bound by the render
+// queue's scene target set. Size alone is not enough: at 3440x1440 the 3072x3072 sun shadow map
+// (A8R8G8B8, set 60) passed a "covers half the screen" test and draws about as much as the scene,
+// so the scene target flipped between the two (research/dlaa.md, "Which draws"). The scene runs
+// under set 35, and under set 30 in some frames (host-20261029-103023 frames 2954-2955,
+// host-20261029-202625 frames 3010-3011).
 const void* g_d5_counting_rt = nullptr;
 int g_d5_counting_draws = 0;
 LONG g_d5_counting_frame = -1;
 bool g_d5_counting_full = false;
+
+bool D5IsSceneTargetSet(DWORD set)
+{
+    return set == 35 || set == 30;
+}
 
 void D5NoteBusiestPass()
 {
@@ -1859,9 +1971,18 @@ void D5NoteBusiestPass()
         counting_rt = g_d5.rt0;
         counting_draws = 0;
         D3DSURFACE_DESC desc = {};
-        counting_full = g_d5.rt0 != nullptr &&
+        const bool hdr_at_render_size = g_d5.rt0 != nullptr &&
             SUCCEEDED(static_cast<IDirect3DSurface9*>(const_cast<void*>(g_d5.rt0))->GetDesc(&desc)) &&
-            desc.Width * 2 >= D5RenderWidth() && desc.Height * 2 >= D5RenderHeight();
+            desc.Format == D3DFMT_A16B16G16R16F && desc.Width == D5RenderWidth() && desc.Height == D5RenderHeight();
+        counting_full = hdr_at_render_size && D5IsSceneTargetSet(g_d5_pass_target_set);
+        static DWORD said_set = 0xFFFFFFFF;
+        if (hdr_at_render_size && !counting_full && g_d5.ds != nullptr && said_set != g_d5_pass_target_set) {
+            said_set = g_d5_pass_target_set;
+            char rt[64] = {};
+            D5Describe(g_d5.rt0, rt, sizeof(rt));
+            Log("DLSS5: %s with a depth surface under render-queue target set %lu, not taken as the scene", rt,
+                static_cast<unsigned long>(g_d5_pass_target_set));
+        }
     }
     ++counting_draws;
     if (counting_full && g_d5.ds != nullptr && counting_draws > g_d5_frame_best_draws) {
@@ -1937,9 +2058,10 @@ void D5DumpShader(const DWORD* function, DWORD hash, const char* prefix)
             return;
         }
     }
-    size_t tokens = 0;
+    // Comment blocks (the constant table) can hold a 0x0000FFFF word: skip them by their length.
+    size_t tokens = 1;
     while (tokens < 65536 && function[tokens] != 0x0000FFFF) {
-        ++tokens;
+        tokens += (function[tokens] & 0xFFFF) == 0xFFFE ? 1 + ((function[tokens] >> 16) & 0x7FFF) : 1;
     }
     ID3DBlob* text = nullptr;
     if (FAILED(disassemble(function, (tokens + 1) * sizeof(DWORD), 0, nullptr, &text)) || text == nullptr) {
@@ -1983,6 +2105,9 @@ HRESULT STDMETHODCALLTYPE D5CreatePixelShader(IDirect3DDevice9* device, const DW
         AcquireSRWLockExclusive(&g_d5_resource_lock);
         g_d5_shader_hash[*out] = hash;
         ReleaseSRWLockExclusive(&g_d5_resource_lock);
+        if (g_d5_trace_shaders) {
+            D5DumpShader(function, hash, "ps");
+        }
     }
     return hr;
 }

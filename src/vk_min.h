@@ -82,6 +82,7 @@ constexpr VkStructureType VK_STRUCTURE_TYPE_SEMAPHORE_SIGNAL_INFO = 1000207005;
 constexpr VkFormat VK_FORMAT_R8G8B8A8_UNORM = 37;
 constexpr VkFormat VK_FORMAT_B8G8R8A8_UNORM = 44;
 constexpr VkFormat VK_FORMAT_R16G16_SFLOAT = 83;
+constexpr VkFormat VK_FORMAT_R16G16B16A16_SFLOAT = 97;
 constexpr VkFormat VK_FORMAT_R32_SFLOAT = 100;
 
 constexpr VkImageLayout VK_IMAGE_LAYOUT_UNDEFINED = 0;

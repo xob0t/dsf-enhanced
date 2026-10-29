@@ -1,14 +1,23 @@
 // DLSS 5 through dsf-dlss5-helper (dlss5/include/dsf_dlss5_protocol.h). [DLSS5] Helper=1 (with
 // Export=1) turns it on.
 //
-// Each frame, at the pre-HUD point (dlss5_feed.inl):
-//   1. two small D3D9 passes write the inputs the helper wants: depth as R32F z/w from the
-//      scene depth (an INTZ texture that replaces the game's back-buffer-sized D24S8 surface)
-//      and camera motion vectors as RG16F, reprojected through this and the previous frame's
-//      view-projection;
+// Where DLSS 5 sees the frame (Input):
+//   0 at the pre-HUD point: the game's final LDR image (graded, film grain, bloom), and the
+//     output is drawn over the HUD target before the HUD;
+//   1 at the scene end, before the post chain, as RTX Remix does it: the HDR scene target is
+//     tone-mapped into an f16 colour input (exposure, ACES approximation, 1/2.2 gamma), and
+//     DLSS 5's output is tone-mapped back (Remix's inverse, with its highlight recovery) into
+//     the scene target. The game's bloom, tone map, grading and HUD then run on it as usual.
+//
+// Each frame, at that point (dlss5_feed.inl):
+//   1. small D3D9 passes write the inputs the helper wants: the colour (Input=1), depth as R32F
+//      z/w from the scene depth (an INTZ texture that replaces the game's back-buffer-sized
+//      D24S8 surface) and camera motion vectors as RG16F, reprojected through this and the
+//      previous frame's view-projection;
 //   2. colour, depth and motion go to the helper's shared textures, fence_in = n, FRAME n;
 //   3. FRAME_ACK n (the helper sends it once its GPU work is done, so fence_out >= n), then
-//      the output is drawn over the HUD target before the HUD.
+//      the output is drawn back.
+// Every D3D9 state the bridge changes is put back before the game's next call.
 //
 // Two transports move the images (HelperTransport):
 //   - Vulkan, under DXVK: DXVK's D3D9 interop (ID3D9VkInteropDevice) gives the VkImages of the
@@ -52,6 +61,9 @@ float g_d5_skin_strength = 0.5f;
 float g_d5_cockpit_depth = 1.5f;
 bool g_d5_frame_time_log = false;
 bool g_d5_crash_dump = false;
+int g_d5_input = 0;                // 0: the pre-HUD LDR frame, 1: the HDR scene target (Remix's way)
+float g_d5_hdr_exposure = 0.6f;    // Input=1: scale on the scene's linear values before the ACES curve
+bool g_d5_self_test = false;       // the game-side passes without the helper (DLSS 5's output = its input)
 
 constexpr DWORD kD5HelloTimeoutMs = 20000;      // the helper loads and checks the runtime, starts NGX
 constexpr DWORD kD5ConfigureTimeoutMs = 20000;  // creates the feature
@@ -87,6 +99,9 @@ void LoadDlss5BridgeConfig(const char* ini_path)
     g_d5_cockpit_depth = std::max(0.0f, std::min(ReadProfileFloat("DLSS5", "CockpitDepth", 1.5f, ini_path), 10.0f));
     g_d5_frame_time_log = GetPrivateProfileIntA("DLSS5", "FrameTimeLog", 0, ini_path) != 0;
     g_d5_crash_dump = GetPrivateProfileIntA("DLSS5", "CrashDump", 0, ini_path) != 0;
+    g_d5_input = ClampInt(GetPrivateProfileIntA("DLSS5", "Input", 0, ini_path), 0, 1);
+    g_d5_hdr_exposure = std::max(1.0f / 64.0f, std::min(ReadProfileFloat("DLSS5", "HdrExposure", 0.6f, ini_path), 64.0f));
+    g_d5_self_test = GetPrivateProfileIntA("DLSS5", "SelfTest", 0, ini_path) != 0;
     g_d5_object_motion = GetPrivateProfileIntA("DLSS5", "ObjectMotion", 1, ini_path) != 0;
     g_d5_object_debug = GetPrivateProfileIntA("DLSS5", "ObjectMotionDebug", 0, ini_path) != 0;
 }
@@ -552,6 +567,7 @@ vkm::VkFormat D5VkFormatOf(uint32_t dxgi)
     case DXGI_FORMAT_R8G8B8A8_UNORM: return vkm::VK_FORMAT_R8G8B8A8_UNORM;
     case DXGI_FORMAT_R32_FLOAT: return vkm::VK_FORMAT_R32_SFLOAT;
     case DXGI_FORMAT_R16G16_FLOAT: return vkm::VK_FORMAT_R16G16_SFLOAT;
+    case DXGI_FORMAT_R16G16B16A16_FLOAT: return vkm::VK_FORMAT_R16G16B16A16_SFLOAT;
     default: return 0;
     }
 }
@@ -1026,7 +1042,13 @@ void D5BridgeStart(IDirect3DDevice9* device)
         }
     }
     g_d5_transport_name = g_d5_transport == D5_TRANSPORT_VULKAN ? "vulkan" : "cpu";
-    Log("DLSS5 helper: transport %s", g_d5_transport_name);
+    if (g_d5_input == 1) {
+        // The tone-mapped scene goes in and comes back in f16, as in Remix.
+        g_d5_slot_formats[DSF_DLSS5_SLOT_COLOR] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+        g_d5_slot_formats[DSF_DLSS5_SLOT_OUTPUT] = DXGI_FORMAT_R16G16B16A16_FLOAT;
+    }
+    Log("DLSS5 helper: transport %s, input %s", g_d5_transport_name,
+        g_d5_input == 1 ? "the HDR scene target at the scene end (f16)" : "the pre-HUD frame (8-bit)");
     g_d5_worker_event = CreateEventA(nullptr, FALSE, FALSE, nullptr);
     const HANDLE thread = CreateThread(nullptr, 0, D5BridgeWorker, nullptr, 0, nullptr);
     if (thread != nullptr) {
@@ -1047,6 +1069,8 @@ IDirect3DPixelShader9* g_d5_ps_motion = nullptr;
 IDirect3DPixelShader9* g_d5_ps_copy = nullptr;
 IDirect3DPixelShader9* g_d5_ps_copy_swap = nullptr;   // RGBA bytes copied raw into an A8R8G8B8 texture
 IDirect3DPixelShader9* g_d5_ps_object_motion = nullptr;   // per-car motion, stencil-tested
+IDirect3DPixelShader9* g_d5_ps_hdr_tonemap = nullptr;     // Input=1: scene -> colour input
+IDirect3DPixelShader9* g_d5_ps_hdr_inverse = nullptr;     // Input=1: output -> scene
 
 // FrameTimeLog=1: timestamp queries around the object pass, read back a couple of frames later.
 struct D5PassTimer
@@ -1123,7 +1147,11 @@ IDirect3DSurface9* g_d5_rt_motion = nullptr;
 IDirect3DSurface9* g_d5_sys_color = nullptr;
 IDirect3DSurface9* g_d5_sys_depth = nullptr;
 IDirect3DSurface9* g_d5_sys_motion = nullptr;
-IDirect3DTexture9* g_d5_composite = nullptr;          // the helper's output, A8R8G8B8
+IDirect3DTexture9* g_d5_composite = nullptr;          // the helper's output: A8R8G8B8, or A16B16G16R16F for Input=1
+IDirect3DTexture9* g_d5_tex_hdr_copy = nullptr;       // Input=1: the scene as it was (the scene target can't be read and written at once)
+IDirect3DSurface9* g_d5_rt_hdr_copy = nullptr;
+IDirect3DTexture9* g_d5_tex_color_in = nullptr;       // Input=1: the tone-mapped colour input, A16B16G16R16F
+IDirect3DSurface9* g_d5_rt_color_in = nullptr;
 IDirect3DStateBlock9* g_d5_state = nullptr;
 UINT g_d5_d9_width = 0;
 UINT g_d5_d9_height = 0;
@@ -1132,11 +1160,14 @@ bool g_d5_shaders_failed = false;
 
 const char kD5ShaderSource[] = R"(
 sampler2D tex0 : register(s0);
+sampler2D tex1 : register(s1);
 float4 reproject[4] : register(c0);   // rows of VP_prev * inverse(VP_cur), built in double on the CPU
 float4 worldW : register(c4);         // row 3 of inverse(VP_cur): the world point's homogeneous w
 float4 size : register(c8);           // width, height, cockpit depth (m), 0
 float4 objectReproject[4] : register(c9);   // one car: VP_prev * W_prev * inverse(W_cur) * inverse(VP_cur), in double on the CPU
 float4 debug : register(c13);         // ObjectMotionDebug: x > 0 paints the car's pixels with motion (y, z)
+float4 hdrParams : register(c14);     // Input=1: exposure, 1 / exposure
+float4 recovery : register(c15);      // highlight recovery edges: exposed HDR max channel 1..8, LDR max channel 0.75..0.99
 
 float4 DepthPS(float2 uv : TEXCOORD0) : COLOR0
 {
@@ -1182,6 +1213,44 @@ float4 CopySwapPS(float2 uv : TEXCOORD0) : COLOR0
 {
     return tex2D(tex0, uv).bgra;
 }
+
+// Input=1, RTX Remix's fast tone map and its inverse (tonemapping_fast_tonemapping and
+// tonemapping_inverse_tonemapping in dxvk-remix). The ACES fit is Narkowicz's approximation.
+float3 AcesApprox(float3 x)
+{
+    return saturate((x * (2.51 * x + 0.03)) / (x * (2.43 * x + 0.59) + 0.14));
+}
+
+// fp16 range, negatives to 0 (min/max also turn a NaN into the other operand on GPUs).
+float3 SanitizeHdr(float3 c)
+{
+    return min(max(c, 0), 65504);
+}
+
+// The scene target (linear HDR) -> DLSS 5's colour input: exposure, ACES, 1/2.2 gamma.
+float4 HdrTonemapPS(float2 uv : TEXCOORD0) : COLOR0
+{
+    float3 x = SanitizeHdr(tex2D(tex0, uv).rgb) * hdrParams.x;
+    return float4(pow(AcesApprox(x), 1 / 2.2), 1);
+}
+
+// DLSS 5's output (tex0) back to HDR, with the scene as it was (tex1): the output's linear
+// value times the ratio by which the curve compressed the original, per channel, so an
+// unchanged pixel gives the original back. Highlight recovery: a pixel that was very bright
+// and sits in the curve's shoulder, where the LDR output cannot carry it, blends back to the
+// original. The scene's alpha is kept.
+float4 HdrInversePS(float2 uv : TEXCOORD0) : COLOR0
+{
+    float4 original = tex2D(tex1, uv);
+    float3 hdr = SanitizeHdr(original.rgb);
+    float3 x = hdr * hdrParams.x;
+    float3 t = AcesApprox(x);
+    float3 color = pow(saturate(tex2D(tex0, uv).rgb), 2.2) * (x / max(t, 1e-6)) * hdrParams.y;
+    float3 ldr = pow(t, 1 / 2.2);
+    float mask = smoothstep(recovery.x, recovery.y, max(x.r, max(x.g, x.b))) *
+        smoothstep(recovery.z, recovery.w, max(ldr.r, max(ldr.g, ldr.b)));
+    return float4(min(max(lerp(color, hdr, mask), 0), 65504), original.a);
+}
 )";
 
 bool g_d5_object_shader_failed = false;
@@ -1225,9 +1294,12 @@ bool D5CompileShaders(IDirect3DDevice9* device)
         Log("DLSS5 helper: d3dcompiler_47.dll not found");
         return false;
     }
-    const char* entries[4] = {"DepthPS", "MotionPS", "CopyPS", "CopySwapPS"};
-    IDirect3DPixelShader9** targets[4] = {&g_d5_ps_depth, &g_d5_ps_motion, &g_d5_ps_copy, &g_d5_ps_copy_swap};
-    for (int i = 0; i < 4 && g_d5_ps_copy_swap == nullptr; ++i) {
+    // CopySwapPS last: it marks the set as compiled.
+    const char* entries[6] = {"DepthPS", "MotionPS", "CopyPS", "HdrTonemapPS", "HdrInversePS", "CopySwapPS"};
+    IDirect3DPixelShader9** targets[6] = {&g_d5_ps_depth, &g_d5_ps_motion, &g_d5_ps_copy, &g_d5_ps_hdr_tonemap, &g_d5_ps_hdr_inverse,
+        &g_d5_ps_copy_swap};
+    for (int i = 0; i < 6 && g_d5_ps_copy_swap == nullptr; ++i) {
+        D5SafeRelease(*targets[i]);   // from an earlier attempt that stopped half-way
         ID3DBlob* code = nullptr;
         ID3DBlob* errors = nullptr;
         const HRESULT hr = compile(kD5ShaderSource, sizeof(kD5ShaderSource) - 1, "dsf_dlss5", nullptr, nullptr, entries[i], "ps_2_0", 0, 0,
@@ -1261,24 +1333,40 @@ void D5ReleaseD3D9()
     D5SafeRelease(g_d5_sys_depth);
     D5SafeRelease(g_d5_sys_motion);
     D5SafeRelease(g_d5_composite);
+    D5SafeRelease(g_d5_rt_hdr_copy);
+    D5SafeRelease(g_d5_tex_hdr_copy);
+    D5SafeRelease(g_d5_rt_color_in);
+    D5SafeRelease(g_d5_tex_color_in);
     D5SafeRelease(g_d5_state);
     g_d5_d9_width = 0;
     g_d5_d9_height = 0;
 }
 
+// color_format: the format of the frame DLSS 5 reads (the HUD target, or for Input=1 the HDR
+// scene target, whose tone-mapped copy is A16B16G16R16F too).
 bool D5EnsureD3D9(IDirect3DDevice9* device, UINT w, UINT h, D3DFORMAT color_format)
 {
     if (g_d5_d9_width == w && g_d5_d9_height == h && g_d5_d9_color_format == color_format && g_d5_composite != nullptr) {
         return true;
     }
     D5ReleaseD3D9();
-    const bool cpu = g_d5_transport == D5_TRANSPORT_CPU;
+    const bool hdr = color_format == D3DFMT_A16B16G16R16F;
+    const bool cpu = g_d5_transport == D5_TRANSPORT_CPU && !g_d5_self_test;
+    // The output: the CPU transport locks it, the Vulkan one copies into it, SelfTest StretchRects into it.
+    const DWORD composite_usage = g_d5_self_test ? D3DUSAGE_RENDERTARGET : cpu ? D3DUSAGE_DYNAMIC : 0;
     bool ok = SUCCEEDED(device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_R32F, D3DPOOL_DEFAULT, &g_d5_tex_depth, nullptr)) &&
         SUCCEEDED(g_d5_tex_depth->GetSurfaceLevel(0, &g_d5_rt_depth)) &&
         SUCCEEDED(device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_G16R16F, D3DPOOL_DEFAULT, &g_d5_tex_motion, nullptr)) &&
         SUCCEEDED(g_d5_tex_motion->GetSurfaceLevel(0, &g_d5_rt_motion)) &&
-        SUCCEEDED(device->CreateTexture(w, h, 1, cpu ? D3DUSAGE_DYNAMIC : 0, D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT, &g_d5_composite, nullptr)) &&
+        SUCCEEDED(device->CreateTexture(w, h, 1, composite_usage, hdr ? D3DFMT_A16B16G16R16F : D3DFMT_A8R8G8B8, D3DPOOL_DEFAULT,
+            &g_d5_composite, nullptr)) &&
         SUCCEEDED(device->CreateStateBlock(D3DSBT_ALL, &g_d5_state));
+    if (ok && hdr) {
+        ok = SUCCEEDED(device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &g_d5_tex_hdr_copy, nullptr)) &&
+            SUCCEEDED(g_d5_tex_hdr_copy->GetSurfaceLevel(0, &g_d5_rt_hdr_copy)) &&
+            SUCCEEDED(device->CreateTexture(w, h, 1, D3DUSAGE_RENDERTARGET, D3DFMT_A16B16G16R16F, D3DPOOL_DEFAULT, &g_d5_tex_color_in, nullptr)) &&
+            SUCCEEDED(g_d5_tex_color_in->GetSurfaceLevel(0, &g_d5_rt_color_in));
+    }
     if (ok && cpu) {
         // GetRenderTargetData needs the target's own format (A8R8G8B8 or X8R8G8B8, both BGRA bytes).
         ok = SUCCEEDED(device->CreateOffscreenPlainSurface(w, h, color_format, D3DPOOL_SYSTEMMEM, &g_d5_sys_color, nullptr)) &&
@@ -1286,7 +1374,7 @@ bool D5EnsureD3D9(IDirect3DDevice9* device, UINT w, UINT h, D3DFORMAT color_form
             SUCCEEDED(device->CreateOffscreenPlainSurface(w, h, D3DFMT_G16R16F, D3DPOOL_SYSTEMMEM, &g_d5_sys_motion, nullptr));
     }
     if (!ok) {
-        Log("DLSS5 helper: D3D9 resources %ux%u could not be created", w, h);
+        Log("DLSS5 helper: D3D9 resources %ux%u (format %d) could not be created", w, h, static_cast<int>(color_format));
         D5ReleaseD3D9();
         return false;
     }
@@ -1297,7 +1385,7 @@ bool D5EnsureD3D9(IDirect3DDevice9* device, UINT w, UINT h, D3DFORMAT color_form
 }
 
 void D5DrawQuad(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect3DPixelShader9* shader, IDirect3DBaseTexture9* texture,
-    int stencil_ref = -1, const RECT* scissor = nullptr)
+    int stencil_ref = -1, const RECT* scissor = nullptr, IDirect3DBaseTexture9* texture1 = nullptr)
 {
     device->SetRenderTarget(0, target);
     for (DWORD i = 1; i < 4; ++i) {
@@ -1310,19 +1398,24 @@ void D5DrawQuad(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect3DPi
     device->SetFVF(D3DFVF_XYZRHW | D3DFVF_TEX1);
     device->SetTexture(0, texture);
     // Past DSF Enhanced's own sampler overrides (anisotropic, trilinear): these quads need exact texels.
-    auto set_sampler = [device](D3DSAMPLERSTATETYPE type, DWORD value) {
+    auto set_sampler = [device](DWORD stage, D3DSAMPLERSTATETYPE type, DWORD value) {
         if (g_real_set_sampler_state != nullptr) {
-            g_real_set_sampler_state(device, 0, type, value);
+            g_real_set_sampler_state(device, stage, type, value);
         } else {
-            device->SetSamplerState(0, type, value);
+            device->SetSamplerState(stage, type, value);
         }
     };
-    set_sampler(D3DSAMP_MINFILTER, D3DTEXF_POINT);
-    set_sampler(D3DSAMP_MAGFILTER, D3DTEXF_POINT);
-    set_sampler(D3DSAMP_MIPFILTER, D3DTEXF_NONE);
-    set_sampler(D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
-    set_sampler(D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
-    set_sampler(D3DSAMP_SRGBTEXTURE, FALSE);
+    if (texture1 != nullptr) {
+        device->SetTexture(1, texture1);
+    }
+    for (DWORD stage = 0; stage < (texture1 != nullptr ? 2u : 1u); ++stage) {
+        set_sampler(stage, D3DSAMP_MINFILTER, D3DTEXF_POINT);
+        set_sampler(stage, D3DSAMP_MAGFILTER, D3DTEXF_POINT);
+        set_sampler(stage, D3DSAMP_MIPFILTER, D3DTEXF_NONE);
+        set_sampler(stage, D3DSAMP_ADDRESSU, D3DTADDRESS_CLAMP);
+        set_sampler(stage, D3DSAMP_ADDRESSV, D3DTADDRESS_CLAMP);
+        set_sampler(stage, D3DSAMP_SRGBTEXTURE, FALSE);
+    }
     device->SetRenderState(D3DRS_ZENABLE, FALSE);
     device->SetRenderState(D3DRS_ZWRITEENABLE, FALSE);
     device->SetRenderState(D3DRS_ALPHABLENDENABLE, FALSE);
@@ -1461,8 +1554,157 @@ bool D5ObjectScissor(const double* vp, const float* world, UINT w, UINT h, RECT*
     return true;
 }
 
-// Depth and motion into our render targets; the device's state comes back as it was.
-bool D5RenderInputs(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect3DTexture9* depth, UINT w, UINT h)
+// The render targets and depth surface, which a state block does not hold.
+struct D5SavedTargets
+{
+    IDirect3DSurface9* rt[4] = {};
+    IDirect3DSurface9* ds = nullptr;
+};
+
+void D5SaveTargets(IDirect3DDevice9* device, D5SavedTargets* saved)
+{
+    for (DWORD i = 0; i < 4; ++i) {
+        device->GetRenderTarget(i, &saved->rt[i]);   // D3DERR_NOTFOUND (null) for an unbound slot
+    }
+    device->GetDepthStencilSurface(&saved->ds);
+}
+
+void D5RestoreTargets(IDirect3DDevice9* device, D5SavedTargets* saved)
+{
+    for (DWORD i = 0; i < 4; ++i) {
+        if (i != 0 || saved->rt[0] != nullptr) {   // slot 0 can't be unbound
+            device->SetRenderTarget(i, saved->rt[i]);
+        }
+        D5SafeRelease(saved->rt[i]);
+    }
+    device->SetDepthStencilSurface(saved->ds);
+    D5SafeRelease(saved->ds);
+}
+
+// The states the bridge touches, read back to check that it put them all back (the first
+// frames, traced frames and SelfTest frames; reads only, the device is not pure).
+struct D5StateCheck
+{
+    void* objects[14] = {};   // render targets 0-3, depth, shaders, declaration, stream 0, indices, textures 0-2
+    UINT stream_offset = 0;
+    UINT stream_stride = 0;
+    DWORD fvf = 0;
+    D3DVIEWPORT9 viewport = {};
+    RECT scissor = {};
+    DWORD render[20] = {};
+    DWORD sampler[2][6] = {};
+    float ps_constants[16 * 4] = {};
+};
+
+void D5ReadStates(IDirect3DDevice9* device, D5StateCheck* c)
+{
+    static const D3DRENDERSTATETYPE kRender[20] = {D3DRS_ZENABLE, D3DRS_ZWRITEENABLE, D3DRS_ZFUNC, D3DRS_ALPHABLENDENABLE,
+        D3DRS_SRCBLEND, D3DRS_DESTBLEND, D3DRS_ALPHATESTENABLE, D3DRS_STENCILENABLE, D3DRS_STENCILFUNC, D3DRS_STENCILREF,
+        D3DRS_STENCILMASK, D3DRS_STENCILWRITEMASK, D3DRS_STENCILPASS, D3DRS_TWOSIDEDSTENCILMODE, D3DRS_SCISSORTESTENABLE,
+        D3DRS_CULLMODE, D3DRS_COLORWRITEENABLE, D3DRS_SRGBWRITEENABLE, D3DRS_FOGENABLE, D3DRS_FILLMODE};
+    static const D3DSAMPLERSTATETYPE kSampler[6] = {D3DSAMP_MINFILTER, D3DSAMP_MAGFILTER, D3DSAMP_MIPFILTER, D3DSAMP_ADDRESSU,
+        D3DSAMP_ADDRESSV, D3DSAMP_SRGBTEXTURE};
+    IDirect3DSurface9* surface = nullptr;
+    for (DWORD i = 0; i < 4; ++i) {
+        surface = nullptr;
+        device->GetRenderTarget(i, &surface);
+        c->objects[i] = surface;
+    }
+    surface = nullptr;
+    device->GetDepthStencilSurface(&surface);
+    c->objects[4] = surface;
+    IDirect3DVertexShader9* vs = nullptr;
+    device->GetVertexShader(&vs);
+    c->objects[5] = vs;
+    IDirect3DPixelShader9* ps = nullptr;
+    device->GetPixelShader(&ps);
+    c->objects[6] = ps;
+    IDirect3DVertexDeclaration9* declaration = nullptr;
+    device->GetVertexDeclaration(&declaration);
+    c->objects[7] = declaration;
+    IDirect3DVertexBuffer9* stream = nullptr;
+    device->GetStreamSource(0, &stream, &c->stream_offset, &c->stream_stride);
+    c->objects[8] = stream;
+    IDirect3DIndexBuffer9* indices = nullptr;
+    device->GetIndices(&indices);
+    c->objects[9] = indices;
+    for (DWORD stage = 0; stage < 3; ++stage) {
+        IDirect3DBaseTexture9* texture = nullptr;
+        device->GetTexture(stage, &texture);
+        c->objects[10 + stage] = texture;
+    }
+    // Only the identities are compared: drop the references Get* took.
+    for (void* object : c->objects) {
+        if (object != nullptr) {
+            static_cast<IUnknown*>(object)->Release();
+        }
+    }
+    device->GetFVF(&c->fvf);
+    device->GetViewport(&c->viewport);
+    device->GetScissorRect(&c->scissor);
+    for (int i = 0; i < 20; ++i) {
+        device->GetRenderState(kRender[i], &c->render[i]);
+    }
+    for (DWORD stage = 0; stage < 2; ++stage) {
+        for (int i = 0; i < 6; ++i) {
+            device->GetSamplerState(stage, kSampler[i], &c->sampler[stage][i]);
+        }
+    }
+    device->GetPixelShaderConstantF(0, c->ps_constants, 16);
+}
+
+void D5CompareStates(const D5StateCheck& before, const D5StateCheck& after, const char* where)
+{
+    char diff[256] = {};
+    size_t used = 0;
+    auto note = [&](const char* what, int index) {
+        if (used + 24 < sizeof(diff)) {
+            used += std::snprintf(diff + used, sizeof(diff) - used, " %s%d", what, index);
+        }
+    };
+    for (int i = 0; i < 14; ++i) {
+        if (before.objects[i] != after.objects[i]) {
+            note("object", i);
+        }
+    }
+    if (before.stream_offset != after.stream_offset || before.stream_stride != after.stream_stride) {
+        note("stream", 0);
+    }
+    if (before.fvf != after.fvf) {
+        note("fvf", 0);
+    }
+    if (std::memcmp(&before.viewport, &after.viewport, sizeof(before.viewport)) != 0) {
+        note("viewport", 0);
+    }
+    if (std::memcmp(&before.scissor, &after.scissor, sizeof(before.scissor)) != 0) {
+        note("scissor", 0);
+    }
+    for (int i = 0; i < 20; ++i) {
+        if (before.render[i] != after.render[i]) {
+            note("render", i);
+        }
+    }
+    for (int stage = 0; stage < 2; ++stage) {
+        for (int i = 0; i < 6; ++i) {
+            if (before.sampler[stage][i] != after.sampler[stage][i]) {
+                note(stage == 0 ? "sampler0." : "sampler1.", i);
+            }
+        }
+    }
+    for (int i = 0; i < 16; ++i) {
+        if (std::memcmp(before.ps_constants + i * 4, after.ps_constants + i * 4, sizeof(float) * 4) != 0) {
+            note("psconst", i);
+        }
+    }
+    if (used == 0) {
+        Log("DLSS5 helper: device state after the bridge (%s) matches the state before it", where);
+    } else {
+        Log("DLSS5 helper: device state after the bridge (%s) differs:%s", where, diff);
+    }
+}
+
+// Depth and motion into our render targets. The caller saves and restores the device's state.
+bool D5RenderInputs(IDirect3DDevice9* device, IDirect3DTexture9* depth, UINT w, UINT h)
 {
     // VP_prev * inverse(VP_cur) in double: NDC of this frame -> clip space of the last.
     double current[16] = {}, previous[16] = {}, inv_vp[16] = {}, reproject[16] = {};
@@ -1472,9 +1714,6 @@ bool D5RenderInputs(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect
     }
     const bool have_motion = g_d5_vp_valid && g_d5_vp_previous_valid && D5Invert4x4(current, inv_vp);
     D5Multiply4x4(previous, inv_vp, reproject);
-    IDirect3DSurface9* saved_ds = nullptr;
-    device->GetDepthStencilSurface(&saved_ds);
-    g_d5_state->Capture();
     device->SetDepthStencilSurface(nullptr);
     D5DrawQuad(device, g_d5_rt_depth, g_d5_ps_depth, depth);
     float constants[9 * 4] = {};
@@ -1536,22 +1775,7 @@ bool D5RenderInputs(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect
         D5DumpSurface(device, g_d5_rt_depth, "dlss5-depth");
         D5DumpSurface(device, g_d5_rt_motion, "dlss5-motion");
     }
-    device->SetRenderTarget(0, target);
-    device->SetDepthStencilSurface(saved_ds);
-    g_d5_state->Apply();
-    D5SafeRelease(saved_ds);
     return have_motion;
-}
-
-void D5Composite(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect3DPixelShader9* shader)
-{
-    IDirect3DSurface9* saved_ds = nullptr;
-    device->GetDepthStencilSurface(&saved_ds);
-    g_d5_state->Capture();
-    D5DrawQuad(device, target, shader, g_d5_composite);
-    device->SetDepthStencilSurface(saved_ds);
-    g_d5_state->Apply();
-    D5SafeRelease(saved_ds);
 }
 
 DsfDlss5Frame D5MakeFrame(std::uint64_t n)
@@ -1601,8 +1825,9 @@ bool D5ExchangeFrame(std::uint64_t n, bool* ack_ok, DsfDlss5FrameAck* ack)
     return true;
 }
 
-// CPU transport frame. Returns true when the output was composited.
-bool D5CpuFrame(IDirect3DDevice9* device, IDirect3DSurface9* target, UINT w, UINT h, float* gpu_ms)
+// CPU transport frame: color_source is the frame DLSS 5 reads. Returns true when the output
+// is in g_d5_composite.
+bool D5CpuFrame(IDirect3DDevice9* device, IDirect3DSurface9* color_source, UINT w, UINT h, float* gpu_ms)
 {
     auto readback = [device](IDirect3DSurface9* source, IDirect3DSurface9* staging, ID3D11Texture2D* shared) {
         if (FAILED(device->GetRenderTargetData(source, staging))) {
@@ -1616,7 +1841,7 @@ bool D5CpuFrame(IDirect3DDevice9* device, IDirect3DSurface9* target, UINT w, UIN
         staging->UnlockRect();
         return true;
     };
-    if (!readback(target, g_d5_sys_color, g_d5_slot_tex[DSF_DLSS5_SLOT_COLOR]) ||
+    if (!readback(color_source, g_d5_sys_color, g_d5_slot_tex[DSF_DLSS5_SLOT_COLOR]) ||
         !readback(g_d5_rt_depth, g_d5_sys_depth, g_d5_slot_tex[DSF_DLSS5_SLOT_DEPTH]) ||
         !readback(g_d5_rt_motion, g_d5_sys_motion, g_d5_slot_tex[DSF_DLSS5_SLOT_MOTION])) {
         D5BridgeFail("readback failed");
@@ -1638,10 +1863,15 @@ bool D5CpuFrame(IDirect3DDevice9* device, IDirect3DSurface9* target, UINT w, UIN
     D3DLOCKED_RECT locked = {};
     bool copied = false;
     if (SUCCEEDED(g_d5_ctx->Map(g_d5_output_staging, 0, D3D11_MAP_READ, 0, &mapped))) {
+        const bool hdr = g_d5_slot_formats[DSF_DLSS5_SLOT_OUTPUT] == DXGI_FORMAT_R16G16B16A16_FLOAT;
         if (SUCCEEDED(g_d5_composite->LockRect(0, &locked, nullptr, D3DLOCK_DISCARD))) {
             for (UINT y = 0; y < h; ++y) {
                 const auto* src = static_cast<const std::uint8_t*>(mapped.pData) + static_cast<size_t>(y) * mapped.RowPitch;
                 auto* dst = static_cast<std::uint8_t*>(locked.pBits) + static_cast<size_t>(y) * locked.Pitch;
+                if (hdr) {
+                    std::memcpy(dst, src, static_cast<size_t>(w) * 8);   // RGBA16F in both
+                    continue;
+                }
                 for (UINT x = 0; x < w; ++x) {
                     dst[x * 4 + 0] = src[x * 4 + 2];
                     dst[x * 4 + 1] = src[x * 4 + 1];
@@ -1653,9 +1883,6 @@ bool D5CpuFrame(IDirect3DDevice9* device, IDirect3DSurface9* target, UINT w, UIN
             copied = true;
         }
         g_d5_ctx->Unmap(g_d5_output_staging, 0);
-    }
-    if (copied) {
-        D5Composite(device, target, g_d5_ps_copy);
     }
     return copied;
 }
@@ -1724,13 +1951,14 @@ bool D5VkSubmit(int kind, const vkm::VkImageMemoryBarrier* before, uint32_t befo
     return true;
 }
 
-// Vulkan transport frame (DXVK). Returns true when the output was composited.
-bool D5VkFrame(IDirect3DDevice9* device, IDirect3DSurface9* target, UINT w, UINT h, float* gpu_ms)
+// Vulkan transport frame (DXVK): color_source is the frame DLSS 5 reads. Returns true when the
+// output is in g_d5_composite.
+bool D5VkFrame(IDirect3DSurface9* color_source, UINT w, UINT h, float* gpu_ms)
 {
     IDirect3DSurface9* composite_surface = nullptr;
     g_d5_composite->GetSurfaceLevel(0, &composite_surface);
     D5VkTexture color, depth, motion, composite;
-    const bool found = D5VkTextureOf(target, &color) && D5VkTextureOf(g_d5_rt_depth, &depth) &&
+    const bool found = D5VkTextureOf(color_source, &color) && D5VkTextureOf(g_d5_rt_depth, &depth) &&
         D5VkTextureOf(g_d5_rt_motion, &motion) && composite_surface != nullptr && D5VkTextureOf(composite_surface, &composite);
     D5SafeRelease(composite_surface);
     auto release = [&]() {
@@ -1836,51 +2064,61 @@ bool D5VkFrame(IDirect3DDevice9* device, IDirect3DSurface9* target, UINT w, UINT
 
     g_d5_step = 9;
     g_d5_vk_interop->LockDevice();
-    // Back to the layouts DXVK expects, then draw the output over the HUD target.
+    // Back to the layouts DXVK expects; the caller then draws the output.
     for (const D5VkTexture* source : sources) {
         g_d5_vk_interop->TransitionTextureLayout(source->interop, &range, vkm::VK_IMAGE_LAYOUT_TRANSFER_SRC_OPTIMAL, source->layout);
     }
     g_d5_vk_interop->TransitionTextureLayout(composite.interop, &range, vkm::VK_IMAGE_LAYOUT_TRANSFER_DST_OPTIMAL, composite.layout);
     g_d5_vk_interop->UnlockDevice();
     release();
-    if (composited) {
-        D5Composite(device, target, g_d5_ps_copy_swap);
-    }
     return composited;
 }
 
-// Runs at the pre-HUD point with the HUD target bound and the composite drawn into it.
-void D5BridgeFrame(IDirect3DDevice9* device)
+// Runs at the frame's DLSS 5 point with the game's state as it is there:
+//   hdr = false (Input=0): the pre-HUD point, the HUD target bound; the output is drawn over it.
+//   hdr = true (Input=1): the scene end, the HDR scene target still bound; the output goes back
+//   into the scene target through the inverse tone map, before the post chain reads it.
+// Everything the bridge changes on the device is put back before it returns.
+void D5BridgeFrame(IDirect3DDevice9* device, bool hdr)
 {
     const LONG state = g_d5_bridge_state;
     if (!g_d5_helper || state == D5_BRIDGE_FAILED) {
         return;
     }
-    if (state == D5_BRIDGE_OFF) {
+    if (state == D5_BRIDGE_OFF && !g_d5_self_test) {
         D5BridgeStart(device);
         return;
     }
 
-    auto* target = static_cast<IDirect3DSurface9*>(const_cast<void*>(g_d5.rt0));
+    auto* target = static_cast<IDirect3DSurface9*>(const_cast<void*>(hdr ? g_d5_scene_rt : g_d5.rt0));
     D3DSURFACE_DESC desc = {};
-    if (target == nullptr || FAILED(target->GetDesc(&desc)) ||
-        (desc.Format != D3DFMT_A8R8G8B8 && desc.Format != D3DFMT_X8R8G8B8)) {
+    if (target == nullptr || FAILED(target->GetDesc(&desc))) {
         return;
     }
-    if (state == D5_BRIDGE_READY) {
-        // The worker configures for this size; frames go without DLSS 5 meanwhile.
-        g_d5_want_width = desc.Width;
-        g_d5_want_height = desc.Height;
-        InterlockedExchange(&g_d5_bridge_state, D5_BRIDGE_CONFIGURING);
-        SetEvent(g_d5_worker_event);
+    // Input=1 takes only the fp16 scene target at the game's render size: never the 3072x3072
+    // shadow map, which can be the busiest target with a depth surface in some frames.
+    const bool format_ok = hdr ? desc.Format == D3DFMT_A16B16G16R16F && desc.Width == D5RenderWidth() && desc.Height == D5RenderHeight() &&
+            desc.MultiSampleType == D3DMULTISAMPLE_NONE :
+        desc.Format == D3DFMT_A8R8G8B8 || desc.Format == D3DFMT_X8R8G8B8;
+    if (!format_ok) {
         return;
     }
-    if (state != D5_BRIDGE_RUNNING) {
-        return;
-    }
-    if (g_d5_bridge_width != desc.Width || g_d5_bridge_height != desc.Height) {
-        InterlockedExchange(&g_d5_bridge_state, D5_BRIDGE_READY);
-        return;
+    if (!g_d5_self_test) {
+        if (state == D5_BRIDGE_READY) {
+            // The worker configures for this size; frames go without DLSS 5 meanwhile.
+            g_d5_want_width = desc.Width;
+            g_d5_want_height = desc.Height;
+            InterlockedExchange(&g_d5_bridge_state, D5_BRIDGE_CONFIGURING);
+            SetEvent(g_d5_worker_event);
+            return;
+        }
+        if (state != D5_BRIDGE_RUNNING) {
+            return;
+        }
+        if (g_d5_bridge_width != desc.Width || g_d5_bridge_height != desc.Height) {
+            InterlockedExchange(&g_d5_bridge_state, D5_BRIDGE_READY);
+            return;
+        }
     }
     IDirect3DTexture9* depth = D5IntzTextureOf(g_d5_scene_ds);
     if (depth == nullptr) {
@@ -1900,13 +2138,62 @@ void D5BridgeFrame(IDirect3DDevice9* device)
     }
 
     const double start = D5NowMs();
+    const bool check_states = g_d5_bridge_frames < 3 || g_d5_trace_frame != nullptr || (g_d5_self_test && g_d5_bridge_frames < 30);
+    D5StateCheck before_check;
+    if (check_states) {
+        D5ReadStates(device, &before_check);
+    }
+    D5SavedTargets saved;
+    D5SaveTargets(device, &saved);
+    g_d5_state->Capture();
+
     g_d5_step = 1;
-    const bool have_motion = D5RenderInputs(device, target, depth, desc.Width, desc.Height);
+    IDirect3DSurface9* color_source = target;
+    const float hdr_params[8] = {g_d5_hdr_exposure, 1.0f / g_d5_hdr_exposure, 0.0f, 0.0f, 1.0f, 8.0f, 0.75f, 0.99f};
+    if (hdr) {
+        // Keep the scene as it was (the inverse reads it while it writes the scene target), and
+        // tone-map it into the colour input.
+        device->SetPixelShaderConstantF(14, hdr_params, 2);
+        g_d5_stretch_rect(device, target, nullptr, g_d5_rt_hdr_copy, nullptr, D3DTEXF_POINT);
+        device->SetDepthStencilSurface(nullptr);
+        D5DrawQuad(device, g_d5_rt_color_in, g_d5_ps_hdr_tonemap, g_d5_tex_hdr_copy);
+        color_source = g_d5_rt_color_in;
+    }
+    const bool have_motion = D5RenderInputs(device, depth, desc.Width, desc.Height);
     depth->Release();
     g_d5_step = 2;
     float gpu_ms = -1.0f;
-    const bool composited = g_d5_transport == D5_TRANSPORT_VULKAN ? D5VkFrame(device, target, desc.Width, desc.Height, &gpu_ms) :
-        D5CpuFrame(device, target, desc.Width, desc.Height, &gpu_ms);
+    bool composited = false;
+    if (g_d5_self_test) {
+        // No helper: DLSS 5's output is its input, so the frame should come back unchanged.
+        IDirect3DSurface9* composite_surface = nullptr;
+        composited = SUCCEEDED(g_d5_composite->GetSurfaceLevel(0, &composite_surface)) &&
+            SUCCEEDED(g_d5_stretch_rect(device, color_source, nullptr, composite_surface, nullptr, D3DTEXF_POINT));
+        D5SafeRelease(composite_surface);
+        g_d5_frame_number += 1;
+    } else {
+        composited = g_d5_transport == D5_TRANSPORT_VULKAN ? D5VkFrame(color_source, desc.Width, desc.Height, &gpu_ms) :
+            D5CpuFrame(device, color_source, desc.Width, desc.Height, &gpu_ms);
+    }
+    if (composited) {
+        g_d5_step = 10;
+        device->SetDepthStencilSurface(nullptr);
+        if (hdr) {
+            device->SetPixelShaderConstantF(14, hdr_params, 2);
+            D5DrawQuad(device, target, g_d5_ps_hdr_inverse, g_d5_composite, -1, nullptr, g_d5_tex_hdr_copy);
+        } else {
+            // The Vulkan output is R8G8B8A8 copied raw into an A8R8G8B8 texture: swap red and blue.
+            const bool swap = g_d5_transport == D5_TRANSPORT_VULKAN && !g_d5_self_test;
+            D5DrawQuad(device, target, swap ? g_d5_ps_copy_swap : g_d5_ps_copy, g_d5_composite);
+        }
+    }
+    D5RestoreTargets(device, &saved);
+    g_d5_state->Apply();
+    if (check_states) {
+        D5StateCheck after_check;
+        D5ReadStates(device, &after_check);
+        D5CompareStates(before_check, after_check, hdr ? "scene end" : "pre-HUD");
+    }
     g_d5_internal = false;
     g_d5_step = 0;
     const double ms = D5NowMs() - start;
@@ -1924,9 +2211,10 @@ void D5BridgeFrame(IDirect3DDevice9* device)
     g_d5_bridge_gpu_ms_sum += gpu_ms;
     const LONG frames = InterlockedIncrement(&g_d5_bridge_frames);
     if (frames <= 3 || frames % 600 == 0) {
-        Log("DLSS5 helper: frame %llu composited, motion=%d, bridge %.2f ms (mean %.2f) evaluate %.2f ms, transport %s%s",
-            static_cast<unsigned long long>(g_d5_frame_number), have_motion ? 1 : 0, ms, g_d5_bridge_ms_sum / frames,
-            static_cast<double>(gpu_ms), g_d5_transport_name, g_d5_helper_bypass ? " (bypass)" : "");
+        Log("DLSS5 helper: frame %llu composited at the %s, motion=%d, bridge %.2f ms (mean %.2f) evaluate %.2f ms, transport %s%s",
+            static_cast<unsigned long long>(g_d5_frame_number), hdr ? "scene end (HDR)" : "pre-HUD point", have_motion ? 1 : 0, ms,
+            g_d5_bridge_ms_sum / frames, static_cast<double>(gpu_ms), g_d5_self_test ? "none (SelfTest)" : g_d5_transport_name,
+            g_d5_helper_bypass ? " (bypass)" : "");
     }
 }
 
@@ -1939,6 +2227,8 @@ void Dlss5OnReset()
     D5SafeRelease(g_d5_ps_copy);
     D5SafeRelease(g_d5_ps_copy_swap);
     D5SafeRelease(g_d5_ps_object_motion);
+    D5SafeRelease(g_d5_ps_hdr_tonemap);
+    D5SafeRelease(g_d5_ps_hdr_inverse);
     g_d5_object_shader_failed = false;
     D5ReleasePassTimers();
     g_d5_shaders_failed = false;
@@ -1948,6 +2238,9 @@ void Dlss5OnReset()
     g_d5.rt0 = nullptr;
     g_d5.ds = nullptr;
     for (auto*& texture : g_d5.bound) {
+        texture = nullptr;
+    }
+    for (auto*& texture : g_d5.vertex_bound) {
         texture = nullptr;
     }
     g_d5_scene_rt = nullptr;

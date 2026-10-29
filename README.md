@@ -81,6 +81,16 @@ The model is 64-bit and the game is 32-bit, so a small 64-bit helper (`dlss5\dsf
 
 To see what happened, read `dsf-dlss5-helper.log` next to `Driver.exe`, and the `DLSS5 helper:` lines in `dsf_enhanced.log`. If the helper can't start or rejects the DLL, the log says why and the game runs on without DLSS 5.
 
+### Settings
+
+These keys are in `[DLSS5]` in `dsf_enhanced.ini`. Changes need a restart of the game.
+
+- `Input` chooses what DLSS 5 sees:
+  - `0` (the default) is the finished frame just before the HUD, with the game's colour grading, film grain and bloom already in it. DLSS 5's picture is drawn under the HUD.
+  - `1` is the 3D scene before the game's post-processing, the way RTX Remix feeds DLSS 5. The scene is tone-mapped for DLSS 5, and DLSS 5's picture is tone-mapped back into the scene (with Remix's highlight recovery). The game then adds its own bloom, tone mapping, colour grading, film grain and HUD on top. Untested in game so far.
+- `HdrExposure` (default `0.6`, `Input=1` only) sets how bright the image DLSS 5 gets is. The way back undoes it, so it only changes what DLSS 5 works on.
+- `Style` (0-2, the model), `Intensity`, `ToneStrength` and `StructureStrength` (0-1) are RTX Remix's settings, with Remix's defaults (0, 1, 0.3, 0.7). On this game the defaults change the picture little: about 3-5 of 255 per colour channel on average. `Style=1`, `ToneStrength=1` and `StructureStrength=1` give the strongest change, about 5-13 of 255. Measured on still game frames.
+
 ### Turn it off
 
 Set `Helper=0` and `Export=0` in `dsf_enhanced.ini`, or delete the two lines you changed; they default to off. To remove it entirely, also delete the `dlss5` folder and DXVK's `d3d9.dll`.
@@ -92,6 +102,7 @@ Set `Helper=0` and `Export=0` in `dsf_enhanced.ini`, or delete the two lines you
 - The HUD and the pause menu are drawn over DLSS 5's image and stay as they are (tested). Bink cinematics and loading screens should be skipped the same way, but they weren't tested with DLSS 5 on.
 - Frame cost on the RTX 5070 Ti with DXVK, at 1280x720 with nothing else loading the GPU: frames took 8.3-9.1 ms with DLSS 5 against 8.35-8.7 ms without. Without DXVK it adds about 15 ms a frame.
 - Changes to `[DLSS5]` need a restart of the game.
+- With `Input=1`, the game's low-resolution particle layer (drawn after the scene at a quarter of its width and height) is added after DLSS 5, so DLSS 5 does not process it.
 - Only NVIDIA's signed `nvngx_dlssnr.dll` from RTX Remix 1.6.1 is accepted. A newer NVIDIA release would need a newer helper.
 
 The helper contains NVIDIA's NGX loader from the NVIDIA DLSS SDK, under the NVIDIA RTX SDKs license (`dlss5\NVIDIA-RTX-SDKs-LICENSE.txt` in the ZIP). NVIDIA, RTX and DLSS are trademarks of NVIDIA Corporation. This project is not sponsored or endorsed by NVIDIA. How it works: [research/dlss5-renderer.md](research/dlss5-renderer.md) and [dlss5/README.md](dlss5/README.md).
