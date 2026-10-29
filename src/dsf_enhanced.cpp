@@ -2190,6 +2190,7 @@ HRESULT STDMETHODCALLTYPE ProxyReset(IDirect3DDevice9* device, D3DPRESENT_PARAME
 }
 
 #include "dlss5_feed.inl"
+#include "dlss5_objects.inl"
 #include "dlss5_bridge.inl"
 
 bool HookDeviceVTable(void** vtable, size_t index, void* replacement, void** original, const char* name)

@@ -60,8 +60,16 @@ void LoadDlss5BridgeConfig(const char* ini_path);
 void D5BridgeFrame(IDirect3DDevice9* device);
 bool D5CreateIntzDepth(IDirect3DDevice9* device, UINT w, UINT h, IDirect3DSurface9** out);
 void D5FrameTimeTick();
+void D5NoteShader(const void* shader, const DWORD* function);
+void D5NoteGameStencilState(D3DRENDERSTATETYPE state, DWORD value);
+void D5TagSceneDraw(IDirect3DDevice9* device);
+void D5EndSceneTagging(IDirect3DDevice9* device);
+void D5FinishObjects();
+void D5ResetObjectsFrame();
+extern bool g_d5_object_motion;
 bool g_d5_trace_dump = false;
-bool g_d5_trace_scan = false;   // TraceScan: look for the VP in game memory (stalls that frame for seconds)
+bool g_d5_trace_scan = false;      // TraceScan: look for the VP in game memory (stalls that frame for seconds)
+bool g_d5_trace_shaders = false;   // TraceShaders: write each vertex shader's disassembly to TraceDumpDir
 bool g_d5_export = false;
 int g_d5_trace_start_seconds = 60;
 int g_d5_trace_interval_seconds = 20;
@@ -76,6 +84,7 @@ void LoadDlss5Config(const char* ini_path)
     g_d5_trace = GetPrivateProfileIntA("DLSS5", "Trace", 0, ini_path) != 0;
     g_d5_trace_dump = GetPrivateProfileIntA("DLSS5", "TraceDump", 0, ini_path) != 0;
     g_d5_trace_scan = GetPrivateProfileIntA("DLSS5", "TraceScan", 0, ini_path) != 0;
+    g_d5_trace_shaders = GetPrivateProfileIntA("DLSS5", "TraceShaders", 0, ini_path) != 0;
     g_d5_export = GetPrivateProfileIntA("DLSS5", "Export", 0, ini_path) != 0;
     g_d5_helper = g_d5_export && GetPrivateProfileIntA("DLSS5", "Helper", 0, ini_path) != 0;
     LoadDlss5BridgeConfig(ini_path);
@@ -392,6 +401,7 @@ struct D5Pass
     UINT prims = 0;
     int blend_draws = 0;
     int z_draws = 0;
+    int stencil_draws = 0;
     bool stretch = false;          // a StretchRect record: rt = destination, ds = source
     DWORD target_set = 0;          // the render queue's target-set id when the pass started
     DWORD layer = 0;
@@ -431,6 +441,9 @@ struct D5State
     DWORD blend = 0;
     DWORD zenable = 1;
     DWORD zwrite = 1;
+    DWORD stencil = 0;
+    DWORD stencil_state[8] = {D3DCMP_ALWAYS, 0, 0xFFFFFFFF, 0xFFFFFFFF, D3DSTENCILOP_KEEP, D3DSTENCILOP_KEEP, D3DSTENCILOP_KEEP,
+        FALSE};   // func, ref, mask, writemask, pass, zfail, fail, twosided (the game's values)
     D5Constant vs_c[256] = {};
 };
 
@@ -619,6 +632,22 @@ void D5DumpSurface(IDirect3DDevice9* device, const void* surface_object, const c
         }
         std::fclose(file);
         Log("DLSS5 dump %s -> %s", label, path);
+    }
+    if (motion16) {
+        // The motion in full as well: .rg32f, width * height pairs of float pixels, top row first.
+        std::snprintf(path, sizeof(path), "%s\\f%05ld-%s.rg32f", g_d5_dump_dir, static_cast<long>(g_d5_frame_index), label);
+        fopen_s(&file, path, "wb");
+        if (file != nullptr) {
+            std::vector<float> row(desc.Width * 2);
+            for (UINT y = 0; y < desc.Height; ++y) {
+                const auto* h = reinterpret_cast<const std::uint16_t*>(static_cast<const std::uint8_t*>(locked.pBits) + static_cast<size_t>(y) * locked.Pitch);
+                for (UINT i = 0; i < desc.Width * 2; ++i) {
+                    row[i] = D5HalfToFloat(h[i]);
+                }
+                std::fwrite(row.data(), sizeof(float), row.size(), file);
+            }
+            std::fclose(file);
+        }
     }
     staging->UnlockRect();
     staging->Release();
@@ -1212,18 +1241,25 @@ void D5BeforeDraw(IDirect3DDevice9* device, UINT prims, UINT vertices)
     if (D5IsScenePass()) {
         ++g_d5_scene_draws_this_frame;
         const int bucket = D5AddViewProjCandidate();
+        if (g_d5_helper && g_d5_object_motion && !g_d5_scene_done) {
+            D5TagSceneDraw(device);   // not after the scene end: the scene target can be re-entered
+        }
         if (g_d5_trace_frame != nullptr) {
             D5RecordObjectDraw();
             // Draws whose c0-c6 do not give a perspective VP: dump c0-c19 (other constant layouts).
             float vp[16] = {};
             static int layout_lines = 0;
-            if (g_d5_trace_pair_step == 2 && layout_lines < 400 && !(D5SolveViewProj(g_d5.vs_c, vp) && D5LooksLikeViewProj(vp))) {
+            static std::unordered_map<DWORD, int> layout_per_shader;
+            const DWORD layout_vs = D5ShaderHash(g_d5.vs);
+            if (g_d5_trace_pair_step == 2 && layout_lines < 400 && layout_per_shader[layout_vs] < 3 &&
+                !(D5SolveViewProj(g_d5.vs_c, vp) && D5LooksLikeViewProj(vp))) {
                 ++layout_lines;
-                char text[1200] = {};
-                size_t used = std::snprintf(text, sizeof(text), "DLSS5  layout vs=%08lX prims=%u:", static_cast<unsigned long>(D5ShaderHash(g_d5.vs)), prims);
-                for (int reg = 0; reg < 20 && used < sizeof(text) - 64; ++reg) {
+                ++layout_per_shader[layout_vs];
+                static char text[256 * 48 + 128] = {};
+                size_t used = std::snprintf(text, sizeof(text), "DLSS5  layout vs=%08lX prims=%u:", static_cast<unsigned long>(layout_vs), prims);
+                for (int reg = 0; reg < 256 && used < sizeof(text) - 64; ++reg) {
                     const float* v = g_d5.vs_c[reg].v;
-                    used += std::snprintf(text + used, sizeof(text) - used, " c%d=%.2f,%.2f,%.2f,%.1f", reg, v[0], v[1], v[2], v[3]);
+                    used += std::snprintf(text + used, sizeof(text) - used, " c%d=%.6g,%.6g,%.6g,%.6g", reg, v[0], v[1], v[2], v[3]);
                 }
                 Log("%s", text);
             }
@@ -1242,13 +1278,13 @@ void D5BeforeDraw(IDirect3DDevice9* device, UINT prims, UINT vertices)
         // The composite + HUD pass: draw 1 is the full-screen composite of the post chain,
         // the HUD starts with draw 2.
         g_d5_pre_hud_fired = true;
-        if (g_d5_trace_frame != nullptr && g_d5_trace_dump && g_d5_trace_pair_step == 1) {
+        if (g_d5_trace_frame != nullptr && g_d5_trace_dump && g_d5_trace_pair_step != 0) {
             D5DumpSurface(device, g_d5.rt0, "pre-hud");
         }
         if (g_d5_export) {
             D5Publish(device, DSFE5_POINT_PRE_HUD);
             D5BridgeFrame(device);
-            if (g_d5_trace_frame != nullptr && g_d5_trace_dump && g_d5_trace_pair_step == 1 && g_d5_helper) {
+            if (g_d5_trace_frame != nullptr && g_d5_trace_dump && g_d5_trace_pair_step != 0 && g_d5_helper) {
                 D5DumpSurface(device, g_d5.rt0, "pre-hud-dlss5");
             }
         }
@@ -1263,6 +1299,19 @@ void D5BeforeDraw(IDirect3DDevice9* device, UINT prims, UINT vertices)
     pass->prims += prims;
     if (g_d5.blend != 0) {
         ++pass->blend_draws;
+    }
+    if (g_d5.stencil != 0) {
+        ++pass->stencil_draws;
+        if (t->draw_line_count < kD5MaxDrawLines && pass->rt == g_d5_scene_rt) {
+            const DWORD* st = g_d5.stencil_state;
+            std::snprintf(t->draw_lines[t->draw_line_count++], sizeof(t->draw_lines[0]),
+                "stencil scene d%d vs=%08lX ps=%08lX prims=%u z=%lu/%lu blend=%lu func=%lu ref=%lu mask=%lX wmask=%lX pass=%lu zfail=%lu fail=%lu two=%lu",
+                pass->draws, static_cast<unsigned long>(D5ShaderHash(g_d5.vs)), static_cast<unsigned long>(D5ShaderHash(g_d5.ps)), prims,
+                static_cast<unsigned long>(g_d5.zenable), static_cast<unsigned long>(g_d5.zwrite), static_cast<unsigned long>(g_d5.blend),
+                static_cast<unsigned long>(st[0]), static_cast<unsigned long>(st[1]), static_cast<unsigned long>(st[2]),
+                static_cast<unsigned long>(st[3]), static_cast<unsigned long>(st[4]), static_cast<unsigned long>(st[5]),
+                static_cast<unsigned long>(st[6]), static_cast<unsigned long>(st[7]));
+        }
     }
     if (g_d5.zenable != 0) {
         ++pass->z_draws;
@@ -1346,7 +1395,13 @@ void D5LeavePass(IDirect3DDevice9* device)
         // export treats the first exit after the scene's draws as the scene end.
         g_d5_scene_done = true;
         g_d5_post_pass_index = 0;
+        if (g_d5_helper && g_d5_object_motion) {
+            D5EndSceneTagging(device);
+        }
         D5FinishViewProj();
+        if (g_d5_helper && g_d5_object_motion) {
+            D5FinishObjects();
+        }
         if (t != nullptr && g_d5_trace_dump && g_d5_trace_pair_step == 1) {
             D5DumpSurface(device, g_d5_scene_rt, "scene-end");
         }
@@ -1390,9 +1445,9 @@ void D5LogTrace(const D5FrameTrace* t, const D5FrameTrace* previous)
         if (p.draws == 0 && p.clears == 0) {
             continue;
         }
-        Log("DLSS5  %2d rt=%s ds=%s caller=0x%08lX set=%lu/%lu vp=%lu,%lu %lux%lu clear=%lu draws=%d prims=%u blend=%d z=%d reads:%s ps:%s",
+        Log("DLSS5  %2d rt=%s ds=%s caller=0x%08lX set=%lu/%lu vp=%lu,%lu %lux%lu clear=%lu draws=%d prims=%u blend=%d z=%d stencil=%d reads:%s ps:%s",
             i, rt, ds, static_cast<unsigned long>(p.caller), static_cast<unsigned long>(p.target_set), static_cast<unsigned long>(p.layer), p.vp.X, p.vp.Y, p.vp.Width, p.vp.Height,
-            static_cast<unsigned long>(p.clears), p.draws, p.prims, p.blend_draws, p.z_draws, p.reads, p.shaders);
+            static_cast<unsigned long>(p.clears), p.draws, p.prims, p.blend_draws, p.z_draws, p.stencil_draws, p.reads, p.shaders);
     }
 
     // Vertex constants in the scene pass: registers written, how often, and whether the value
@@ -1550,6 +1605,8 @@ void D5FrameEnd(IDirect3DDevice9* device)
     g_d5_post_pass_index = 0;
     g_d5_pass_draws = 0;
     D5ResetViewProjFrame();
+    D5EndSceneTagging(device);   // in case the scene end was never seen this frame
+    D5ResetObjectsFrame();
 
     if (g_d5_trace && g_d5_traces_done < g_d5_trace_count) {
         const DWORD now = GetTickCount();
@@ -1733,6 +1790,28 @@ HRESULT STDMETHODCALLTYPE D5SetRenderState(IDirect3DDevice9* device, D3DRENDERST
         g_d5.blend = value;
     } else if (state == D3DRS_ZENABLE) {
         g_d5.zenable = value;
+    }
+    if (state >= D3DRS_STENCILENABLE && state <= D3DRS_STENCILWRITEMASK) {
+        D5NoteGameStencilState(state, value);
+    }
+    if (state == D3DRS_STENCILENABLE) {
+        g_d5.stencil = value;
+    } else if (state == D3DRS_STENCILFUNC) {
+        g_d5.stencil_state[0] = value;
+    } else if (state == D3DRS_STENCILREF) {
+        g_d5.stencil_state[1] = value;
+    } else if (state == D3DRS_STENCILMASK) {
+        g_d5.stencil_state[2] = value;
+    } else if (state == D3DRS_STENCILWRITEMASK) {
+        g_d5.stencil_state[3] = value;
+    } else if (state == D3DRS_STENCILPASS) {
+        g_d5.stencil_state[4] = value;
+    } else if (state == D3DRS_STENCILZFAIL) {
+        g_d5.stencil_state[5] = value;
+    } else if (state == D3DRS_STENCILFAIL) {
+        g_d5.stencil_state[6] = value;
+    } else if (state == D3DRS_TWOSIDEDSTENCILMODE) {
+        g_d5.stencil_state[7] = value;
     } else if (state == D3DRS_ZWRITEENABLE) {
         g_d5.zwrite = value;
     }
@@ -1834,6 +1913,38 @@ HRESULT STDMETHODCALLTYPE D5DrawIndexedPrimitiveUP(IDirect3DDevice9* device, D3D
     return hr;
 }
 
+// TraceShaders=1: vs_<hash>.asm in TraceDumpDir, the shader's disassembly (D3DDisassemble).
+void D5DumpShader(const DWORD* function, DWORD hash, const char* prefix)
+{
+    using D3DDisassembleFn = HRESULT (WINAPI*)(const void*, SIZE_T, UINT, const char*, ID3DBlob**);
+    static D3DDisassembleFn disassemble = nullptr;
+    if (disassemble == nullptr) {
+        HMODULE compiler = LoadLibraryA("d3dcompiler_47.dll");
+        disassemble = compiler != nullptr ? reinterpret_cast<D3DDisassembleFn>(GetProcAddress(compiler, "D3DDisassemble")) : nullptr;
+        if (disassemble == nullptr) {
+            return;
+        }
+    }
+    size_t tokens = 0;
+    while (tokens < 65536 && function[tokens] != 0x0000FFFF) {
+        ++tokens;
+    }
+    ID3DBlob* text = nullptr;
+    if (FAILED(disassemble(function, (tokens + 1) * sizeof(DWORD), 0, nullptr, &text)) || text == nullptr) {
+        return;
+    }
+    CreateDirectoryA(g_d5_dump_dir, nullptr);
+    char path[MAX_PATH] = {};
+    std::snprintf(path, sizeof(path), "%s\\%s_%08lX.asm", g_d5_dump_dir, prefix, static_cast<unsigned long>(hash));
+    FILE* file = nullptr;
+    fopen_s(&file, path, "wb");
+    if (file != nullptr) {
+        std::fwrite(text->GetBufferPointer(), 1, text->GetBufferSize() > 0 ? text->GetBufferSize() - 1 : 0, file);
+        std::fclose(file);
+    }
+    text->Release();
+}
+
 HRESULT STDMETHODCALLTYPE D5CreateVertexShader(IDirect3DDevice9* device, const DWORD* function, void** out)
 {
     const HRESULT hr = g_d5_create_vertex_shader(device, function, out);
@@ -1842,6 +1953,12 @@ HRESULT STDMETHODCALLTYPE D5CreateVertexShader(IDirect3DDevice9* device, const D
         AcquireSRWLockExclusive(&g_d5_resource_lock);
         g_d5_shader_hash[*out] = hash;
         ReleaseSRWLockExclusive(&g_d5_resource_lock);
+        if (g_d5_trace_shaders) {
+            D5DumpShader(function, hash, "vs");
+        }
+        if (g_d5_helper && g_d5_object_motion) {
+            D5NoteShader(*out, function);
+        }
     }
     return hr;
 }
