@@ -107,13 +107,59 @@ Set `Helper=0` and `Export=0` in `dsf_enhanced.ini`, or delete the two lines you
 
 The helper contains NVIDIA's NGX loader from the NVIDIA DLSS SDK, under the NVIDIA RTX SDKs license (`dlss5\NVIDIA-RTX-SDKs-LICENSE.txt` in the ZIP). NVIDIA, RTX and DLSS are trademarks of NVIDIA Corporation. This project is not sponsored or endorsed by NVIDIA. How it works: [research/dlss5-renderer.md](research/dlss5-renderer.md) and [dlss5/README.md](dlss5/README.md).
 
-## DLAA (in progress)
+## DLAA (experimental)
 
-DLAA is NVIDIA's DLSS anti-aliasing at the game's own resolution, on any RTX GPU. It isn't in yet. The `[DLAA]` section of `dsf_enhanced.ini` has the switches for the parts it needs, all off by default, for testing:
+DLAA is NVIDIA's DLSS anti-aliasing at the game's own resolution (DLSS Super Resolution with no upscaling). The game's own anti-aliasing is a morphological filter on the finished frame. It can't fix what falls between pixels, so power lines, poles, fences, railings and foliage stay jagged and crawl when the camera moves. DLAA combines several frames, each drawn with the 3D scene moved by a different fraction of a pixel, and so it can.
 
-- `Jitter=1` moves the 3D scene by a sub-pixel offset that changes every frame. DLAA needs that, but without DLAA the picture only shimmers. `JitterDebugPixels=48` moves the scene 48 pixels instead, so you can see in a screenshot what moves: the scene should, the HUD, shadows and minimap should not. `JitterPhases` and `MipBias` tune the cycle and the texture sharpness during the scene.
-- `DisableMLAA=1` turns off the game's own anti-aliasing, a morphological AA pass on the finished frame.
-- `DisableSwapChainMSAA=1` drops the 4x MSAA that the game's `AntiAliasing` setting puts on the swap chain. The swap chain only gets a copy of the finished frame, so that MSAA changes nothing visible and costs video memory.
+It runs on any NVIDIA GeForce RTX GPU (20-series and later) and uses the same 64-bit helper as DLSS 5. It is separate from DLSS 5: you don't need DLSS 5, an RTX 50 GPU or the RTX Remix download for it. If you turn both on, DLAA runs first and DLSS 5 works on DLAA's anti-aliased picture. DLAA is off by default.
+
+### Turn it on
+
+1. Copy the release ZIP's `dlss5` folder into the game folder, as for DLSS 5 (step 1 there). You should then have `dlss5\dsf-dlss5-helper.exe` next to `Driver.exe`.
+2. Get `nvngx_dlss.dll`. It isn't in the ZIP; you download it from NVIDIA's DLSS SDK, release v310.9.16:
+   - https://raw.githubusercontent.com/NVIDIA/DLSS/9981c6350dc58c0ce21f024fd65e31e851c31689/lib/Windows_x86_64/rel/nvngx_dlss.dll (59 MB), or the same file from https://github.com/NVIDIA/DLSS/tree/v310.9.16/lib/Windows_x86_64/rel. Take the `rel` copy, not `dev`.
+   - Put it in the game's `dlss5` folder, next to `dsf-dlss5-helper.exe` (and `nvngx_dlssnr.dll`, if you use DLSS 5 too).
+   - It should be 58,956,912 bytes with SHA-256 `d00b5b0ab29c3ca101b70c3a5ecb3a01b7ef33766a3383a28a18623083e6123e`. To check, run this in PowerShell in the game folder: `Get-FileHash dlss5\nvngx_dlss.dll`. The helper refuses any other copy.
+3. Optional but much faster: DXVK 3.1.1's `x32\d3d9.dll` next to `Driver.exe` (DLSS 5, step 3). Without it every frame is copied through the CPU, which costs about 15 ms.
+4. In `dsf_enhanced.ini`, under `[DLAA]`, set:
+
+   ```ini
+   Enable=1
+   ```
+
+5. Start the game. When a level loads, edges get smooth after a second or two while the helper starts.
+
+The `DLSS5 helper:` and `DLAA:` lines in `dsf_enhanced.log`, and `dsf-dlss5-helper.log`, say what happened. If the helper can't start or rejects the DLL, the game runs on with its own anti-aliasing.
+
+### Settings
+
+These keys are in `[DLAA]` in `dsf_enhanced.ini`. Changes need a restart of the game.
+
+- `Enable=1` turns on DLAA, together with what it needs:
+  - the scene jitter (a different sub-pixel offset each frame, which only the 3D scene gets: the HUD, shadows, minimap and mirrors don't move);
+  - `DisableMLAA`: the game's MLAA is skipped on every frame DLAA anti-aliased;
+  - `DisableSwapChainMSAA`: the swap chain drops the 4x MSAA the game's `AntiAliasing` setting asks for, which only costs video memory.
+
+  Set `DisableMLAA=0` or `DisableSwapChainMSAA=0` to keep either.
+- `Preset` is the DLAA model: `K` (the default, NVIDIA's default for DLAA) or `L` (sharper and steadier, with less ghosting, at about twice the cost).
+- `MipBias` (default `-1`) sharpens textures in the 3D scene while it is jittered, as NVIDIA recommends. Use `0` if fine textures shimmer.
+- `JitterPhases` (default 16) is the length of the jitter cycle.
+- The helper keys in `[DLSS5]` apply to DLAA too: `HelperPath`, `HelperRuntime`, `HelperLog`, `HelperTransport`, `FrameTimeLog`, `ObjectMotion` and `CockpitDepth`.
+- `Jitter=1` and `JitterDebugPixels` are for testing, without `Enable`. Jitter alone only makes the picture shimmer.
+
+To turn it off, set `Enable=0` (or delete the line). `nvngx_dlss.dll` can stay in the folder.
+
+### Cost
+
+Estimated, not yet measured in game. At 3440x1440 on an RTX 5070 Ti, preset K takes about 1.3-2 ms of GPU time and `L` about 2.5-3.5 ms. The frame is handed to the helper and back while the game waits, which adds about 1.5-2 ms with DXVK. All told, DLAA adds about 3-4 ms a frame with DXVK. Without DXVK the CPU copy adds about 15 ms. With DLSS 5 on too, each runs its own round trip. DLAA uses about 150-200 MB of video memory and saves the game's MLAA passes and the 4x MSAA swap chain (about 80 MB). `[DLSS5] FrameTimeLog=1` logs the measured costs.
+
+### Known limitations
+
+- Experimental and not yet tested in game: only the offline parts are tested (the jitter, the helper and the protocol).
+- If DLAA stops working (no helper, a rejected DLL, a stalled or killed helper), the jitter stops and the game's MLAA comes back by the next frame. The frame on which DLAA fails is shown jittered without DLAA.
+- Split screen keeps the game's MLAA: when the scene is drawn in more than one view, DLAA, the jitter and the MLAA skip stay off.
+- Motion vectors are as for DLSS 5: cars have their own; pedestrians, wheel spin, sparks, smoke and scrolling textures use camera motion and can leave short trails.
+- Only NVIDIA's signed `nvngx_dlss.dll` 310.9.16.0 is accepted.
 
 How it works: [research/dlaa.md](research/dlaa.md).
 

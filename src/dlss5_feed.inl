@@ -54,10 +54,17 @@ D5SetShaderFn g_d5_set_pixel_shader = nullptr;
 D5SetConstantFFn g_d5_set_vs_constant_f = nullptr;
 
 bool g_d5_trace = false;
-bool g_d5_helper = false;      // [DLSS5] Helper: run DLSS 5 through dsf-dlss5-helper (dlss5_bridge.inl)
+bool g_d5_helper = false;      // the helper bridge (dlss5_bridge.inl): [DLSS5] Helper, or [DLAA] Enable
+bool g_d5_nr = false;          // [DLSS5] Helper: DLSS 5 through the helper
 thread_local bool g_d5_internal = false;   // DSF Enhanced's own D3D9 calls on this thread: the hooks pass them through
 void LoadDlss5BridgeConfig(const char* ini_path);
-void D5BridgeFrame(IDirect3DDevice9* device, bool hdr);
+enum D5Run : int
+{
+    D5_RUN_NR_PRE_HUD = 0,   // DLSS 5, Input=0: the pre-HUD frame
+    D5_RUN_NR_HDR = 1,       // DLSS 5, Input=1: the HDR scene target at the scene end
+    D5_RUN_DLAA = 2,         // DLAA: the HDR scene target at the scene end, before DLSS 5
+};
+bool D5BridgeFrame(IDirect3DDevice9* device, D5Run run);
 extern int g_d5_input;
 bool D5CreateIntzDepth(IDirect3DDevice9* device, UINT w, UINT h, IDirect3DSurface9** out);
 void D5FrameTimeTick();
@@ -69,8 +76,11 @@ void D5FinishObjects();
 void D5ResetObjectsFrame();
 extern bool g_d5_object_motion;
 // [DLAA] (dlaa.inl)
+extern bool g_dlaa_enable;
 extern bool g_dlaa_disable_mlaa;
 extern bool g_dlaa_skip_pass;
+void DlaaNoteViewport(const D3DVIEWPORT9* vp);
+void DlaaNoteSceneEnd(IDirect3DDevice9* device, bool dlaa_ran);
 bool DlaaWantsDeviceHooks();
 void DlaaBeforeDraw(IDirect3DDevice9* device);
 void DlaaFrameEnd(IDirect3DDevice9* device);
@@ -113,8 +123,9 @@ void LoadDlss5Config(const char* ini_path)
     g_d5_trace_shaders = GetPrivateProfileIntA("DLSS5", "TraceShaders", 0, ini_path) != 0;
     g_d5_export = GetPrivateProfileIntA("DLSS5", "Export", 0, ini_path) != 0;
     // SelfTest runs the game side of the helper path without the helper (dlss5_bridge.inl).
-    g_d5_helper = g_d5_export && (GetPrivateProfileIntA("DLSS5", "Helper", 0, ini_path) != 0 ||
+    g_d5_nr = g_d5_export && (GetPrivateProfileIntA("DLSS5", "Helper", 0, ini_path) != 0 ||
         GetPrivateProfileIntA("DLSS5", "SelfTest", 0, ini_path) != 0);
+    g_d5_helper = g_d5_nr;   // [DLAA] Enable turns it on too (LoadDlaaConfig)
     LoadDlss5BridgeConfig(ini_path);
     g_d5_trace_start_seconds = ClampInt(GetPrivateProfileIntA("DLSS5", "TraceStartSeconds", 60, ini_path), 0, 3600);
     g_d5_trace_interval_seconds = ClampInt(GetPrivateProfileIntA("DLSS5", "TraceIntervalSeconds", 20, ini_path), 1, 3600);
@@ -1335,11 +1346,13 @@ void D5BeforeDraw(IDirect3DDevice9* device, UINT prims, UINT vertices)
         }
         if (g_d5_export) {
             D5Publish(device, DSFE5_POINT_PRE_HUD);
-            if (g_d5_input == 0) {
-                D5BridgeFrame(device, false);
-            }
-            if (g_d5_trace_frame != nullptr && g_d5_trace_dump && g_d5_trace_pair_step != 0 && g_d5_helper) {
-                D5DumpSurface(device, g_d5.rt0, "pre-hud-dlss5");
+            // Input=0: downstream of the scene end, so with DLAA on DLSS 5 sees its anti-aliased
+            // scene (through the game's post chain).
+            if (g_d5_nr && g_d5_input == 0) {
+                D5BridgeFrame(device, D5_RUN_NR_PRE_HUD);
+                if (g_d5_trace_frame != nullptr && g_d5_trace_dump && g_d5_trace_pair_step != 0) {
+                    D5DumpSurface(device, g_d5.rt0, "pre-hud-dlss5");
+                }
             }
         }
     }
@@ -1525,16 +1538,26 @@ void D5LeavePass(IDirect3DDevice9* device)
         if (g_d5_helper && g_d5_object_motion) {
             D5FinishObjects();
         }
-        if (t != nullptr && g_d5_trace_dump && g_d5_trace_pair_step == 1) {
+        // With DLAA, both frames of a traced pair: consecutive jittered scenes and their DLAA output.
+        if (t != nullptr && g_d5_trace_dump && (g_d5_trace_pair_step == 1 || (g_dlaa_enable && g_d5_trace_pair_step == 2))) {
             D5DumpSurface(device, g_d5_scene_rt, "scene-end");
         }
         if (g_d5_export) {
             D5Publish(device, DSFE5_POINT_SCENE_END);
         }
-        // Input=1: DLSS 5 on the HDR scene target, here, after the scene's opaque and blended draws
-        // (glass, skid marks, full-size particles) and before the first post pass reads it.
-        if (g_d5_helper && g_d5_input == 1) {
-            D5BridgeFrame(device, true);
+        // DLAA on the HDR scene target, here, after the scene's opaque and blended draws (glass,
+        // skid marks, full-size particles) and before the first post pass reads it. Its output
+        // goes back into the scene target, so everything after (DLSS 5 and the post chain) sees it.
+        if (g_dlaa_enable) {
+            const bool dlaa_ran = D5BridgeFrame(device, D5_RUN_DLAA);
+            DlaaNoteSceneEnd(device, dlaa_ran);
+            if (t != nullptr && g_d5_trace_dump && g_d5_trace_pair_step != 0) {
+                D5DumpSurface(device, g_d5_scene_rt, "scene-end-dlaa");
+            }
+        }
+        // Input=1: DLSS 5 on the HDR scene target, on DLAA's output when DLAA is on.
+        if (g_d5_nr && g_d5_input == 1) {
+            D5BridgeFrame(device, D5_RUN_NR_HDR);
             if (t != nullptr && g_d5_trace_dump && g_d5_trace_pair_step == 1) {
                 D5DumpSurface(device, g_d5_scene_rt, "scene-end-dlss5");
             }
@@ -1868,6 +1891,9 @@ HRESULT STDMETHODCALLTYPE D5SetRenderTarget(IDirect3DDevice9* device, DWORD inde
         if (g_dlaa_disable_mlaa) {
             DlaaNotePass(surface, g_d5_pass_target_set);
         }
+        if (g_dlaa_enable) {
+            DlaaNoteViewport(nullptr);   // SetRenderTarget(0) resets the viewport to the whole target
+        }
     }
     if (index == 0 && surface != g_d5.rt0) {
         D5LeavePass(device);
@@ -1912,6 +1938,9 @@ HRESULT STDMETHODCALLTYPE D5SetViewport(IDirect3DDevice9* device, const D3DVIEWP
     D5Pass* pass = D5CurrentPass();
     if (pass != nullptr && vp != nullptr) {
         pass->vp = *vp;
+    }
+    if (g_dlaa_enable) {
+        DlaaNoteViewport(vp);
     }
     return g_d5_set_viewport(device, vp);
 }
@@ -2254,9 +2283,9 @@ void InstallDlss5Hooks(IDirect3DDevice9* device)
         Log("DLSS5: back buffer %s", text);
         back->Release();
     }
-    Log("DLSS5: hooks installed trace=%d dump=%d export=%d wvp=c%d world=c%d pre_hud_set=%d dlaa_jitter=%d dlaa_disable_mlaa=%d",
+    Log("DLSS5: hooks installed trace=%d dump=%d export=%d wvp=c%d world=c%d pre_hud_set=%d dlaa=%d dlaa_jitter=%d dlaa_disable_mlaa=%d",
         g_d5_trace ? 1 : 0, g_d5_trace_dump ? 1 : 0, g_d5_export ? 1 : 0, g_d5_wvp_register, g_d5_world_register,
-        g_d5_pre_hud_target_set, g_dlaa_jitter ? 1 : 0, g_dlaa_disable_mlaa ? 1 : 0);
+        g_d5_pre_hud_target_set, g_dlaa_enable ? 1 : 0, g_dlaa_jitter ? 1 : 0, g_dlaa_disable_mlaa ? 1 : 0);
 }
 
 } // namespace

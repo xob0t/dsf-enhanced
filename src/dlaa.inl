@@ -1,18 +1,28 @@
 // DLAA, game side (research/dlaa.md). Everything here is off unless [DLAA] in dsf_enhanced.ini
 // turns it on:
+//  - Enable: DLAA (DLSS Super Resolution at the render size) through the helper, at the scene
+//    end (dlss5_bridge.inl), with the three parts below. DisableMLAA and DisableSwapChainMSAA
+//    follow it unless set.
 //  - Jitter: moves the scene pass by a sub-pixel Halton (2,3) offset each frame, through vertex
 //    shaders patched at creation (vs_jitter_patch.h). The constant J (c255) holds the clip-space
 //    offset and is zero outside the scene pass, so shadows, the minimap, post and the HUD stay put,
 //    and the game's own constants (the view-projection solve, motion vectors) stay unjittered. The
-//    scene's texture LOD bias goes down by MipBias meanwhile. Without DLAA (not yet) the picture
-//    only shimmers: a debug switch for now.
+//    scene's texture LOD bias goes down by MipBias meanwhile. On its own (Jitter=1 without Enable)
+//    the picture only shimmers: a debug switch. With Enable the scene is jittered only on frames
+//    that follow a frame DLAA anti-aliased, so a failed, stalled or killed helper stops it at once.
 //  - DisableMLAA: skips the game's MLAA, the edge pass (target set 24) and the blend-weight pass
 //    (set 25), and clears the weights to 0, so the composite's blend copies the frame unchanged.
+//    With Enable only on frames DLAA anti-aliased: on any other frame the game's MLAA runs.
 //  - DisableSwapChainMSAA: creates the swap chain without the 4x MSAA AntiAliasing=1 asks for, which
 //    only holds a StretchRect of the finished frame.
-// Jitter and DisableMLAA need the DLSS 5 hooks (dlss5_feed.inl); they install them without Export.
+// Split screen (more than one viewport or pass in the scene) falls back to the game's MLAA.
+// Every switch needs the DLSS 5 hooks (dlss5_feed.inl); they install them without Export.
 
-bool g_dlaa_jitter = false;
+bool g_dlaa_enable = false;          // Enable: DLAA through the helper
+int g_dlaa_preset = 11;              // DLSS.Hint.Render.Preset.DLAA: K (11) or L (12)
+bool g_dlaa_jitter = false;          // the vertex shaders are patched (Jitter, or Enable)
+bool g_dlaa_jitter_frame = false;    // this frame's scene is jittered
+bool g_dlaa_output_frame = false;    // DLAA's output went back into the scene this frame
 int g_dlaa_jitter_phases = 16;
 float g_dlaa_jitter_debug_pixels = 0.0f;   // JitterDebugPixels: a constant offset instead of Halton
 float g_dlaa_mip_bias = -1.0f;
@@ -37,22 +47,71 @@ DWORD g_dlaa_game_lod_bias[16] = {}; // MIPMAPLODBIAS as last set outside the sc
 // MLAA skip, per pass (set at SetRenderTarget).
 bool g_dlaa_skip_pass = false;
 bool g_dlaa_clear_pending = false;
+bool g_dlaa_mlaa_skipped_last = false;   // for the log: MLAA was skipped in the last MLAA pass
 
+// Split screen: a scene draw under a viewport smaller than the render size, or the scene target
+// drawn into again after the scene end, means more than one view. DLAA then stays off (and the
+// jitter, and MLAA stays on) until kDlaaSplitHoldFrames frames went by without either.
+constexpr int kDlaaSplitHoldFrames = 60;
+constexpr int kDlaaSecondPassDraws = 50;   // draws into the scene target after its end that make a second view
+bool g_dlaa_viewport_full = true;
+D3DVIEWPORT9 g_dlaa_viewport = {};
+bool g_dlaa_split_frame = false;
+int g_dlaa_second_pass_draws = 0;
+int g_dlaa_split_hold = 0;
+
+bool D5DlaaProducing(UINT w, UINT h);
+
+// A [DLAA] switch that Enable sets unless the ini says otherwise: -1 when missing, empty or "auto".
+int DlaaReadSwitch(const char* key, const char* ini_path)
+{
+    char value[16] = {};
+    GetPrivateProfileStringA("DLAA", key, "", value, sizeof(value), ini_path);
+    if (value[0] == '\0' || _stricmp(value, "auto") == 0) {
+        return -1;
+    }
+    return std::atoi(value) != 0 ? 1 : 0;
+}
+
+// Preset: K or L, or NGX's numbers 11 and 12. Anything else is K.
+int DlaaReadPreset(const char* ini_path)
+{
+    char value[16] = {};
+    GetPrivateProfileStringA("DLAA", "Preset", "K", value, sizeof(value), ini_path);
+    if (_stricmp(value, "L") == 0 || std::atoi(value) == 12) {
+        return 12;
+    }
+    if (_stricmp(value, "K") != 0 && std::atoi(value) != 11) {
+        Log("DLAA: Preset=%s is not K or L; K is used", value);
+    }
+    return 11;
+}
+
+// After LoadDlss5Config: Enable turns the helper bridge on (g_d5_helper) without [DLSS5].
 void LoadDlaaConfig(const char* ini_path)
 {
-    g_dlaa_jitter = GetPrivateProfileIntA("DLAA", "Jitter", 0, ini_path) != 0;
+    g_dlaa_enable = GetPrivateProfileIntA("DLAA", "Enable", 0, ini_path) != 0;
+    g_dlaa_preset = DlaaReadPreset(ini_path);
+    g_dlaa_jitter = g_dlaa_enable || GetPrivateProfileIntA("DLAA", "Jitter", 0, ini_path) != 0;
+    g_dlaa_jitter_frame = !g_dlaa_enable && g_dlaa_jitter;   // Jitter=1 alone: every frame
     g_dlaa_jitter_phases = ClampInt(GetPrivateProfileIntA("DLAA", "JitterPhases", 16, ini_path), 1, 64);
     g_dlaa_jitter_debug_pixels = std::max(-256.0f, std::min(ReadProfileFloat("DLAA", "JitterDebugPixels", 0.0f, ini_path), 256.0f));
     g_dlaa_mip_bias = std::max(-3.0f, std::min(ReadProfileFloat("DLAA", "MipBias", -1.0f, ini_path), 3.0f));
-    g_dlaa_disable_mlaa = GetPrivateProfileIntA("DLAA", "DisableMLAA", 0, ini_path) != 0;
-    g_dlaa_disable_swapchain_msaa = GetPrivateProfileIntA("DLAA", "DisableSwapChainMSAA", 0, ini_path) != 0;
+    const int mlaa = DlaaReadSwitch("DisableMLAA", ini_path);
+    const int msaa = DlaaReadSwitch("DisableSwapChainMSAA", ini_path);
+    g_dlaa_disable_mlaa = mlaa < 0 ? g_dlaa_enable : mlaa == 1;
+    g_dlaa_disable_swapchain_msaa = msaa < 0 ? g_dlaa_enable : msaa == 1;
     for (DWORD& bias : g_dlaa_game_lod_bias) {
         bias = FloatBits(g_texture_lod_bias);
     }
-    if (g_dlaa_jitter || g_dlaa_disable_mlaa || g_dlaa_disable_swapchain_msaa) {
-        Log("DLAA: Jitter=%d JitterPhases=%d JitterDebugPixels=%.2f MipBias=%.2f DisableMLAA=%d DisableSwapChainMSAA=%d",
-            g_dlaa_jitter ? 1 : 0, g_dlaa_jitter_phases, static_cast<double>(g_dlaa_jitter_debug_pixels),
-            static_cast<double>(g_dlaa_mip_bias), g_dlaa_disable_mlaa ? 1 : 0, g_dlaa_disable_swapchain_msaa ? 1 : 0);
+    if (g_dlaa_enable) {
+        g_d5_helper = true;
+    }
+    if (g_dlaa_enable || g_dlaa_jitter || g_dlaa_disable_mlaa || g_dlaa_disable_swapchain_msaa) {
+        Log("DLAA: Enable=%d Preset=%c Jitter=%d JitterPhases=%d JitterDebugPixels=%.2f MipBias=%.2f DisableMLAA=%d DisableSwapChainMSAA=%d",
+            g_dlaa_enable ? 1 : 0, g_dlaa_preset == 12 ? 'L' : 'K', g_dlaa_jitter ? 1 : 0, g_dlaa_jitter_phases,
+            static_cast<double>(g_dlaa_jitter_debug_pixels), static_cast<double>(g_dlaa_mip_bias), g_dlaa_disable_mlaa ? 1 : 0,
+            g_dlaa_disable_swapchain_msaa ? 1 : 0);
     }
 }
 
@@ -80,9 +139,17 @@ void DlaaOnReset()
     for (DWORD& bias : g_dlaa_game_lod_bias) {
         bias = FloatBits(g_texture_lod_bias);
     }
-    g_dlaa_frame = 0;
+    g_dlaa_frame = 0;   // the Halton cycle starts again
     g_dlaa_skip_pass = false;
     g_dlaa_clear_pending = false;
+    if (g_dlaa_enable) {
+        // No jitter until DLAA has anti-aliased a frame at the new size.
+        g_dlaa_jitter_frame = false;
+        g_dlaa_output_frame = false;
+    }
+    g_dlaa_viewport_full = true;
+    g_dlaa_split_frame = false;
+    g_dlaa_second_pass_draws = 0;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -245,6 +312,32 @@ DWORD DlaaSamplerLodBias(DWORD sampler, DWORD value)
     return g_dlaa_scene_bias_active ? FloatBits(DlaaBitsFloat(value) + g_dlaa_mip_bias) : value;
 }
 
+// Enable, at the frame end: split-screen bookkeeping, and whether the next frame is jittered.
+void DlaaDecideNextFrame()
+{
+    if (g_dlaa_second_pass_draws >= kDlaaSecondPassDraws) {
+        static bool said = false;
+        if (!said) {
+            said = true;
+            Log("DLAA: the scene target got %d more draws after the scene end (a second view?): DLAA off, MLAA on, for now",
+                g_dlaa_second_pass_draws);
+        }
+        g_dlaa_split_frame = true;
+    }
+    g_dlaa_split_hold = g_dlaa_split_frame ? kDlaaSplitHoldFrames : std::max(0, g_dlaa_split_hold - 1);
+    const bool jitter = g_dlaa_split_hold == 0 && D5DlaaProducing(D5RenderWidth(), D5RenderHeight());
+    static int changes = 0;
+    if (jitter != g_dlaa_jitter_frame && changes < 20) {
+        ++changes;
+        Log("DLAA: jitter %s from frame %ld%s", jitter ? "on" : "off", static_cast<long>(g_d5_frame_index + 1),
+            jitter ? "" : g_dlaa_split_hold > 0 ? " (split screen)" : " (DLAA had no output this frame)");
+    }
+    g_dlaa_jitter_frame = jitter;
+    g_dlaa_output_frame = false;
+    g_dlaa_split_frame = false;
+    g_dlaa_second_pass_draws = 0;
+}
+
 // Frame end: the next frame's jitter, Halton (2,3) indices 1..JitterPhases, minus 0.5.
 void DlaaFrameEnd(IDirect3DDevice9* device)
 {
@@ -252,6 +345,9 @@ void DlaaFrameEnd(IDirect3DDevice9* device)
         return;
     }
     DlaaEndSceneBias(device);
+    if (g_dlaa_enable) {
+        DlaaDecideNextFrame();
+    }
     if (g_dlaa_jitter_debug_pixels != 0.0f) {
         g_dlaa_jx = g_dlaa_jy = g_dlaa_jitter_debug_pixels;
         return;
@@ -261,20 +357,47 @@ void DlaaFrameEnd(IDirect3DDevice9* device)
     g_dlaa_jy = DlaaHalton(phase, 3) - 0.5f;
 }
 
+// Every viewport the game sets (Enable), and SetRenderTarget(0) with nullptr: D3D9 then sets
+// the whole target.
+void DlaaNoteViewport(const D3DVIEWPORT9* vp)
+{
+    if (vp == nullptr) {
+        g_dlaa_viewport_full = true;
+        return;
+    }
+    g_dlaa_viewport = *vp;
+    g_dlaa_viewport_full = vp->X == 0 && vp->Y == 0 && vp->Width >= D5RenderWidth() && vp->Height >= D5RenderHeight();
+}
+
 // Every draw the hooks see (not DSF Enhanced's own): J for the bound vertex shader, the jitter in
 // the scene pass and zero elsewhere. One constant upload when the value changes.
 void DlaaBeforeDraw(IDirect3DDevice9* device)
 {
     // The scene pass: its target, under the render queue's scene target set, before its end.
-    const bool scene = D5IsScenePass() && !g_d5_scene_done && D5IsSceneTargetSet(g_d5_pass_target_set);
-    if (scene) {
+    const bool scene_target = D5IsScenePass() && D5IsSceneTargetSet(g_d5_pass_target_set);
+    const bool scene = scene_target && !g_d5_scene_done;
+    if (g_dlaa_enable) {
+        if (scene && !g_dlaa_viewport_full && !g_dlaa_split_frame) {
+            g_dlaa_split_frame = true;
+            static bool said = false;
+            if (!said) {
+                said = true;
+                Log("DLAA: scene draw under viewport %lu,%lu %lux%lu, not the whole %ux%u (split screen?): DLAA off, MLAA on, for now",
+                    g_dlaa_viewport.X, g_dlaa_viewport.Y, g_dlaa_viewport.Width, g_dlaa_viewport.Height, D5RenderWidth(), D5RenderHeight());
+            }
+        } else if (scene_target && g_d5_scene_done) {
+            ++g_dlaa_second_pass_draws;
+        }
+    }
+    const bool jitter = scene && g_dlaa_jitter_frame;
+    if (jitter) {
         DlaaBeginSceneBias(device);
     }
     if (g_dlaa_vs_j < 0) {
         return;
     }
     float j[4] = {};
-    if (scene) {
+    if (jitter) {
         j[0] = 2.0f * g_dlaa_jx / static_cast<float>(D5RenderWidth());
         j[1] = -2.0f * g_dlaa_jy / static_cast<float>(D5RenderHeight());
     }
@@ -292,12 +415,44 @@ void DlaaBeforeDraw(IDirect3DDevice9* device)
 // (R5G6B5, pixel shader 3405C219), set 25 the blend weights (A8R8G8B8, AECA6459), both at the
 // render size. With the weights cleared to 0 the composite's blend copies the tone-mapped frame.
 
+// The scene end, after DLAA's pass: dlaa_ran says whether its output went back into the scene.
+// Split-screen frames are not given to DLAA at all.
+void DlaaNoteSceneEnd(IDirect3DDevice9* device, bool dlaa_ran)
+{
+    (void)device;
+    g_dlaa_output_frame = dlaa_ran;
+    if (g_d5_trace_frame != nullptr) {
+        Log("DLAA  frame %ld: output %d, jitter %d (%.4f, %.4f) px, phase %ld of %d", static_cast<long>(g_d5_frame_index), dlaa_ran ? 1 : 0,
+            g_dlaa_jitter_frame ? 1 : 0, static_cast<double>(g_dlaa_jitter_frame ? g_dlaa_jx : 0.0f),
+            static_cast<double>(g_dlaa_jitter_frame ? g_dlaa_jy : 0.0f), static_cast<long>(g_dlaa_frame % g_dlaa_jitter_phases) + 1,
+            g_dlaa_jitter_phases);
+    }
+}
+
+// Whether DLAA may run on this frame's scene (the bridge asks at the scene end).
+bool DlaaSceneUsable()
+{
+    return !g_dlaa_split_frame && g_dlaa_split_hold == 0;
+}
+
 // SetRenderTarget(0): whether this pass is an MLAA pass to skip.
 void DlaaNotePass(const void* surface, DWORD target_set)
 {
     g_dlaa_skip_pass = false;
     g_dlaa_clear_pending = false;
     if (target_set != 24 && target_set != 25) {
+        return;
+    }
+    // Enable: MLAA goes only on frames DLAA anti-aliased. It can come back on any frame: the game
+    // draws both passes every frame, so skipping or not is decided pass by pass.
+    if (g_dlaa_enable && !g_dlaa_output_frame) {
+        if (g_dlaa_mlaa_skipped_last) {
+            g_dlaa_mlaa_skipped_last = false;
+            static int said = 0;
+            if (said++ < 10) {
+                Log("DLAA: no DLAA output in frame %ld, the game's MLAA runs", static_cast<long>(g_d5_frame_index));
+            }
+        }
         return;
     }
     D3DSURFACE_DESC desc = {};
@@ -316,6 +471,7 @@ void DlaaNotePass(const void* surface, DWORD target_set)
     }
     g_dlaa_skip_pass = true;
     g_dlaa_clear_pending = target_set == 25;
+    g_dlaa_mlaa_skipped_last = true;
 }
 
 // A draw in a skipped MLAA pass: dropped. The first one of the weight pass clears its target.

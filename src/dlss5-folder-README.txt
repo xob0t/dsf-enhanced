@@ -1,12 +1,15 @@
-DSF Enhanced: the DLSS 5 folder (experimental)
+DSF Enhanced: the DLSS 5 and DLAA folder (experimental)
 
 This folder goes next to Driver.exe, as "dlss5". DSF Enhanced finds the helper and NVIDIA's
-runtime here (HelperPath and HelperRuntime in dsf_enhanced.ini).
+runtimes here (HelperPath and HelperRuntime in dsf_enhanced.ini).
 
-  dsf-dlss5-helper.exe            the 64-bit helper that runs DLSS 5 for the 32-bit game
+  dsf-dlss5-helper.exe            the 64-bit helper that runs DLSS 5 and DLAA for the 32-bit game
   NVIDIA-RTX-SDKs-LICENSE.txt     NVIDIA's license for the part of the helper it covers (below)
-  nvngx_dlssnr.dll                NOT included: you put it here yourself
-  nvngx_dlss.dll                  NOT included, and not used yet: DLAA, which is in progress
+  nvngx_dlssnr.dll                NOT included: you put it here yourself, for DLSS 5 ([DLSS5])
+  nvngx_dlss.dll                  NOT included: you put it here yourself, for DLAA ([DLAA] Enable=1)
+
+Either DLL works without the other: DLAA needs only nvngx_dlss.dll (any RTX GPU), DLSS 5 only
+nvngx_dlssnr.dll (an RTX 50 GPU).
 
 nvngx_dlssnr.dll comes from NVIDIA's RTX Remix 1.6.1 release:
 
@@ -15,8 +18,7 @@ nvngx_dlssnr.dll comes from NVIDIA's RTX Remix 1.6.1 release:
   inside:  nvngx_dlssnr.dll, at the top level of the zip (version 310.9.16.0, 266,424,944 bytes)
   SHA-256: 2bc19bc09a7b89dd44f73e2ac0108fcc586e2154bdd0830f242f4f040e28789f
 
-nvngx_dlss.dll (for DLAA, which DSF Enhanced does not use yet) comes from NVIDIA's DLSS SDK,
-release v310.9.16:
+nvngx_dlss.dll (for DLAA) comes from NVIDIA's DLSS SDK, release v310.9.16 (use "rel", not "dev"):
 
   https://github.com/NVIDIA/DLSS/tree/v310.9.16/lib/Windows_x86_64/rel
   file:    nvngx_dlss.dll (version 310.9.16.0, 58,956,912 bytes)
@@ -25,7 +27,8 @@ release v310.9.16:
 The helper refuses any other copy of either file: it checks the SHA-256, the NVIDIA Corporation
 signature and the version before it loads it.
 
-Turning DLSS 5 on and off, requirements and known limitations: README.md, "DLSS 5 (experimental)".
+Turning DLSS 5 and DLAA on and off, requirements and known limitations: README.md, "DLSS 5
+(experimental)" and "DLAA (experimental)".
 
 Licenses
 
