@@ -95,6 +95,22 @@ These keys are in `[DLSS5]` in `dsf_enhanced.ini`. Changes need a restart of the
 
 Set `Helper=0` and `Export=0` in `dsf_enhanced.ini`, or delete the two lines you changed; they default to off. To remove it entirely, also delete the `dlss5` folder and DXVK's `d3d9.dll`.
 
+### Turn it off and on while playing
+
+F10 turns DLSS 5 off and back on, so you can compare the two pictures (`[DLSS5] ToggleKey`). F11 does the same for DLAA (`[DLAA] ToggleKey`). The keys work only for what was on when the game started, and only while the game's window is in front.
+
+Off, the next frame is the game's own. The helper keeps running, so turning DLSS 5 back on is instant; it starts from a fresh history, which can show in the first frame or two.
+
+After each press, "DLSS 5 ON" or "DLSS 5 OFF" shows in the top left corner for 2 seconds, over the HUD:
+
+- green: on;
+- red: off;
+- yellow: on, but not running this session (the helper or DLSS 5 stopped; `dsf_enhanced.log` says why).
+
+`ToggleIndicator=0` hides it. Every press is also logged in `dsf_enhanced.log`, on a `Toggle:` line.
+
+`ToggleKey` takes a key name (F1-F24, A-Z, 0-9, Insert, Delete, Home, End, PageUp, PageDown, Pause, ScrollLock) or a Windows virtual-key code (`0x79` is F10). Empty or `0` means no key.
+
 ### Known limitations
 
 - Experimental. Tested in single-player driving on one RTX 5070 Ti: the chase, cockpit and side views, the Shift zoom and the pause menu. The game ran at 1280x720, also in borderless mode on a 3440x1440 desktop. Other game resolutions, split screen and other GPUs are untested.
@@ -144,7 +160,8 @@ These keys are in `[DLAA]` in `dsf_enhanced.ini`. Changes need a restart of the 
 - `Preset` is the DLAA model: `K` (the default, NVIDIA's default for DLAA) or `L` (sharper and steadier, with less ghosting, at about twice the cost).
 - `MipBias` (default `-1`) sharpens textures in the 3D scene while it is jittered, as NVIDIA recommends. Use `0` if fine textures shimmer.
 - `JitterPhases` (default 16) is the length of the jitter cycle.
-- The helper keys in `[DLSS5]` apply to DLAA too: `HelperPath`, `HelperRuntime`, `HelperLog`, `HelperTransport`, `FrameTimeLog`, `ObjectMotion` and `CockpitDepth`.
+- `ToggleKey` (default F11) turns DLAA off and back on while playing, with the same indicator as DLSS 5 ("Turn it off and on while playing" above). Off, the scene stops being jittered from the next frame and the game's MLAA comes back. Back on, DLAA starts a fresh history on one unjittered frame, and the jitter resumes after it.
+- The helper keys in `[DLSS5]` apply to DLAA too: `HelperPath`, `HelperRuntime`, `HelperLog`, `HelperTransport`, `FrameTimeLog`, `ObjectMotion`, `CockpitDepth` and `ToggleIndicator`.
 - `Jitter=1` and `JitterDebugPixels` are for testing, without `Enable`. Jitter alone only makes the picture shimmer.
 
 To turn it off, set `Enable=0` (or delete the line). `nvngx_dlss.dll` can stay in the folder.

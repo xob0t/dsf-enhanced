@@ -374,6 +374,7 @@ void Dlss5OnReset();
 // [DLAA] (dlaa.inl)
 extern bool g_dlaa_jitter;
 void LoadDlaaConfig(const char* ini_path);
+void LoadToggleConfig(const char* ini_path);
 void DlaaApplyPresentation(D3DPRESENT_PARAMETERS* pp, const char* source);
 DWORD DlaaSamplerLodBias(DWORD sampler, DWORD value);
 void Dlss5Shutdown();
@@ -551,6 +552,7 @@ void LoadConfig()
     LoadFlareConfig(ini_path);
     LoadDlss5Config(ini_path);
     LoadDlaaConfig(ini_path);
+    LoadToggleConfig(ini_path);
 }
 
 bool WriteMemory(void* address, const void* data, size_t size)
@@ -2212,6 +2214,7 @@ HRESULT STDMETHODCALLTYPE ProxyReset(IDirect3DDevice9* device, D3DPRESENT_PARAME
 #include "dlss5_objects.inl"
 #include "dlss5_bridge.inl"
 #include "dlaa.inl"
+#include "toggles.inl"
 
 bool HookDeviceVTable(void** vtable, size_t index, void* replacement, void** original, const char* name)
 {
