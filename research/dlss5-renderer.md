@@ -226,7 +226,7 @@ the helper whose parent is the run's own `Driver.exe`):
 **A crash, found and fixed.** The first Vulkan builds crashed in about 1 run of 4: 6 crashes in
 about 20 runs (`host-20261029-114455`, `-162404`, `-163039`, `-163245`, `-164447`, `-164643`).
 Each ended in DriverNGHook's "We got an fatal error" dialog, 25-50 s into DLSS 5. A vectored
-exception handler registered ahead of DriverNGHook's (`D5LogException`, on while `Helper=1`)
+exception handler registered ahead of DriverNGHook's (now `D5OnFault`, behind `CrashDump=1`)
 caught it: an access violation reading 0x4 at DXVK's `d3d9.dll`+0x24696, on the game's main
 thread, while the render thread was in the bridge's `FlushRenderingCommands`. The handler's
 minidump (`dsf_dlss5_crash_<pid>.dmp`, `host-20261029-165651`) shows the main thread at
@@ -296,9 +296,12 @@ None of it is started.
   the memory scan for the solved VP, which stalls that frame for seconds. `TraceDump=1` writes BMPs
   (scene end, pre-HUD, the HUD pass after draws 1 to 48, and the helper's depth and motion).
 - `FrameTimeLog=1` logs frame times every 600 frames.
-- With `Helper=1` a vectored exception handler logs exceptions and writes the first non-routine
-  one to `dsf_dlss5_crash_<pid>.dmp` beside `Driver.exe`. The harness copies it into the run
-  folder.
+- `CrashDump=1` (with `Helper=1`) installs a vectored exception handler ahead of
+  DriverNGHook's. It logs the first hardware fault and writes it to `dsf_dlss5_crash_<pid>.dmp`
+  beside `Driver.exe`, which the harness copies into the run folder. A thread started beforehand
+  does the logging and the dump, so the handler itself does no heap or loader work. It ignores
+  stack overflows and C++ exceptions, and it is removed when the bridge fails and at process
+  exit.
 - `tests/vk_min_check.cpp` checks `src/vk_min.h` against the Khronos Vulkan headers when
   `build.ps1` runs with `VULKAN_HEADERS_INCLUDE` set. It passes against Vulkan-Headers
   `vulkan-sdk-1.4.363.0`.
