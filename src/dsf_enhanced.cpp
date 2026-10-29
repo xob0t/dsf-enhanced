@@ -44,6 +44,7 @@ float g_traffic_spawn_interval_scale = 1.0f;
 bool g_skip_legal_screen = true;
 bool g_suppress_ubisoft_server_lost_prompt = true;
 bool g_updown_switches_maker = true;
+bool g_cockpit_passengers = true;
 float g_target_aspect = 0.0f;
 float g_fov_scalar = 0.0f;
 float g_current_aspect = 16.0f / 9.0f;
@@ -496,6 +497,7 @@ void LoadConfig()
     g_skip_legal_screen = GetPrivateProfileIntA("Startup", "SkipLegalScreen", 1, ini_path) != 0;
     g_suppress_ubisoft_server_lost_prompt = GetPrivateProfileIntA("Startup", "SuppressUbisoftServerLostPrompt", 1, ini_path) != 0;
     g_updown_switches_maker = GetPrivateProfileIntA("Garage", "UpDownSwitchesMaker", 1, ini_path) != 0;
+    g_cockpit_passengers = GetPrivateProfileIntA("Quality", "CockpitPassengers", 1, ini_path) != 0;
     g_resource_arena_extra_nodes =
         ClampInt(GetPrivateProfileIntA("Limits", "ResourceArenaExtraNodes", 135000, ini_path), 0, 2000000);
     g_resource_arena_stock_nodes =
@@ -3892,6 +3894,68 @@ void ApplyGarageMakerSwitchPatch(const ModuleRange& range)
     }
 }
 
+// Vehicle occupants (pool in the character manager, set up by FUN_00567E60: vehicle at +0x360,
+// seat at +0x364, 0 the driver) are drawn by FUN_00568590. It returns early for every occupant of
+// the local player's vehicle while the camera mode (FUN_005AB6D0) is 3 or 4, the in-car cameras,
+// where the cockpit arms (vtable 0xDE3D38) stand in for the driver. That also hides the passengers
+// of a car the player has Shifted into. The patch keeps the early return for seat 0 only.
+constexpr DWORD kOccupantPlayerVehicleCheckRva = 0x00168637;  // cmp edx,[esi+0x360]; jne 0x568687
+constexpr DWORD kOccupantCameraCheckRva = 0x0016863F;         // reads the camera mode, returns on 3 or 4
+constexpr DWORD kOccupantDrawRva = 0x00168687;                // draws the occupant
+std::uint8_t* g_occupant_camera_check = nullptr;
+std::uint8_t* g_occupant_draw = nullptr;
+
+__declspec(naked) void ProxyOccupantPlayerVehicleCheck()
+{
+    __asm {
+        cmp edx, dword ptr [esi + 0x360]
+        jne draw
+        cmp dword ptr [esi + 0x364], 0
+        jne draw
+        jmp dword ptr [g_occupant_camera_check]
+
+    draw:
+        jmp dword ptr [g_occupant_draw]
+    }
+}
+
+void ApplyCockpitPassengersPatch(const ModuleRange& range)
+{
+    if (!g_cockpit_passengers) {
+        return;
+    }
+    constexpr size_t patch_size = 8;
+    constexpr std::uint8_t expected[patch_size] = {
+        0x3B, 0x96, 0x60, 0x03, 0x00, 0x00,  // cmp edx, [esi+0x360]
+        0x75, 0x48                           // jne 0x568687
+    };
+    if (!IsRvaInRange(range, kOccupantPlayerVehicleCheckRva, patch_size) || !IsRvaInRange(range, kOccupantDrawRva, 1)) {
+        Log("CockpitPassengers: patch site outside the loaded image");
+        return;
+    }
+    auto* target = range.base + kOccupantPlayerVehicleCheckRva;
+    if (std::memcmp(target, expected, patch_size) != 0) {
+        Log("CockpitPassengers: unexpected bytes at RVA 0x%08lX; not patched",
+            static_cast<unsigned long>(kOccupantPlayerVehicleCheckRva));
+        return;
+    }
+    g_occupant_camera_check = range.base + kOccupantCameraCheckRva;
+    g_occupant_draw = range.base + kOccupantDrawRva;
+
+    std::uint8_t patch[patch_size];
+    std::memset(patch, 0x90, sizeof(patch));
+    patch[0] = 0xE9;
+    const auto relative = static_cast<std::int32_t>(
+        reinterpret_cast<std::uint8_t*>(&ProxyOccupantPlayerVehicleCheck) - (target + 5)
+    );
+    std::memcpy(&patch[1], &relative, sizeof(relative));
+    if (!WriteMemory(target, patch, sizeof(patch))) {
+        Log("CockpitPassengers: failed to patch RVA 0x%08lX", static_cast<unsigned long>(kOccupantPlayerVehicleCheckRva));
+        return;
+    }
+    Log("CockpitPassengers: the player car's passengers are drawn in the in-car cameras");
+}
+
 void ApplyPatches()
 {
     const ModuleRange exe = GetExeRange();
@@ -3931,12 +3995,13 @@ void ApplyPatches()
     ApplyStartupPatches(exe);
     ApplyUbisoftServerLostPromptPatch(exe);
     ApplyGarageMakerSwitchPatch(exe);
+    ApplyCockpitPassengersPatch(exe);
     ApplyMovieDrawPatch(exe);
     ApplyAspectConstantPatch(exe, "Init");
     ApplyGlobalFovScalarPatch(exe, "Init");
     ApplyTrafficRadiusPatch(exe);
     Log(
-        "Config: MapDetailLODThresholdScale=%.3f VehicleLODThresholdScale=%.3f VehicleFullDetail=%d VehicleDrawDistance=%.0f TrafficSpawnRadius=%.0f TrafficDiagnostics=%d DRLFlares=%d/%d/%d",
+        "Config: MapDetailLODThresholdScale=%.3f VehicleLODThresholdScale=%.3f VehicleFullDetail=%d VehicleDrawDistance=%.0f TrafficSpawnRadius=%.0f TrafficDiagnostics=%d DRLFlares=%d/%d/%d CockpitPassengers=%d",
         static_cast<double>(g_map_detail_lod_threshold_scale),
         static_cast<double>(g_vehicle_lod_threshold_scale),
         g_vehicle_full_detail ? 1 : 0,
@@ -3945,7 +4010,8 @@ void ApplyPatches()
         g_traffic_diagnostics ? 1 : 0,
         g_drl_flare_curves[0].enabled ? 1 : 0,
         g_drl_flare_curves[1].enabled ? 1 : 0,
-        g_drl_flare_curves[2].enabled ? 1 : 0
+        g_drl_flare_curves[2].enabled ? 1 : 0,
+        g_cockpit_passengers ? 1 : 0
     );
 }
 
