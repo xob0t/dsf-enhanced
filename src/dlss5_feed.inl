@@ -1045,6 +1045,82 @@ void D5AnalyseObjectMotion()
     g_d5_object_draws.clear();
 }
 
+double D5NowMs();
+
+// Camera position, unit view direction and horizontal projection scale of a view-projection
+// (rows as uploaded). Row 3 is the view direction times the projection's w scale; rows 0, 1 and
+// 3 vanish at the camera, so the camera solves R * c = -(r0.w, r1.w, r3.w).
+bool D5CameraOf(const float* vp, double* position, double* direction, double* scale_x)
+{
+    const double m[12] = {vp[0], vp[1], vp[2], vp[3], vp[4], vp[5], vp[6], vp[7], vp[12], vp[13], vp[14], vp[15]};
+    const double a = m[0], b = m[1], c = m[2], d = m[4], e = m[5], f = m[6], g = m[8], h = m[9], k = m[10];
+    const double det = a * (e * k - f * h) - b * (d * k - f * g) + c * (d * h - e * g);
+    const double length = std::sqrt(m[8] * m[8] + m[9] * m[9] + m[10] * m[10]);
+    if (!std::isfinite(det) || std::fabs(det) < 1e-12 || !(length > 1e-9)) {
+        return false;
+    }
+    const double r[9] = {(e * k - f * h) / det, (c * h - b * k) / det, (b * f - c * e) / det, (f * g - d * k) / det, (a * k - c * g) / det,
+        (c * d - a * f) / det, (d * h - e * g) / det, (b * g - a * h) / det, (a * e - b * d) / det};
+    const double rhs[3] = {-m[3], -m[7], -m[11]};
+    for (int i = 0; i < 3; ++i) {
+        position[i] = r[i * 3 + 0] * rhs[0] + r[i * 3 + 1] * rhs[1] + r[i * 3 + 2] * rhs[2];
+        direction[i] = m[8 + i] / length;
+    }
+    *scale_x = std::sqrt(m[0] * m[0] + m[1] * m[1] + m[2] * m[2]) / length;
+    return true;
+}
+
+// Camera cuts: view switches, replays, the Shift zoom starting or ending. Not a fixed distance a
+// frame, because the camera's speed varies (the Shift zoom moves 20-48 m a frame) and so does
+// the frame time (a hitch). A move is fine if it is within max(4 m, 90 m/s * dt) of standing
+// still, or within max(4 m, 90 m/s * dt, half of it) of the previous move scaled to this
+// frame's time. A cut is a move that is neither; a turn of more than max(20 degrees,
+// 360 degrees/s * dt); or a change of the field of view by more than 5 % in one frame. The move
+// is kept even across a cut, so a camera that keeps flying (the zoom) cuts once, and one that
+// jumped and stops (a view switch) does too.
+struct D5CameraTrack
+{
+    double time_ms = 0.0;
+    double dt_ms = 0.0;
+    double move[3] = {};
+    bool move_valid = false;
+};
+D5CameraTrack g_d5_camera_track;
+float g_d5_scene_dt_ms = 0.0f;   // time between the last two scene ends (0: unknown)
+
+bool D5IsCameraCut(const float* previous, const float* current, double dt_ms, char* why, size_t why_size)
+{
+    double p0[3] = {}, d0[3] = {}, p1[3] = {}, d1[3] = {}, s0 = 0.0, s1 = 0.0;
+    if (!D5CameraOf(previous, p0, d0, &s0) || !D5CameraOf(current, p1, d1, &s1)) {
+        std::snprintf(why, why_size, "no camera");
+        return true;
+    }
+    const double dt = std::max(dt_ms, 1.0) / 1000.0;
+    double move[3] = {p1[0] - p0[0], p1[1] - p0[1], p1[2] - p0[2]};
+    double expected[3] = {};
+    if (g_d5_camera_track.move_valid && g_d5_camera_track.dt_ms > 0.0) {
+        const double ratio = std::min(std::max(dt_ms, 1.0) / g_d5_camera_track.dt_ms, 4.0);
+        for (int i = 0; i < 3; ++i) {
+            expected[i] = g_d5_camera_track.move[i] * ratio;
+        }
+    }
+    const double off_expected = std::sqrt((move[0] - expected[0]) * (move[0] - expected[0]) + (move[1] - expected[1]) * (move[1] - expected[1]) +
+        (move[2] - expected[2]) * (move[2] - expected[2]));
+    const double expected_length = std::sqrt(expected[0] * expected[0] + expected[1] * expected[1] + expected[2] * expected[2]);
+    const double distance = std::sqrt(move[0] * move[0] + move[1] * move[1] + move[2] * move[2]);
+    const double still_limit = std::max(4.0, 90.0 * dt);
+    const double move_limit = std::max(still_limit, 0.5 * expected_length);
+    const bool move_ok = distance <= still_limit || off_expected <= move_limit;
+    const double cosine = d0[0] * d1[0] + d0[1] * d1[1] + d0[2] * d1[2];
+    const double turn_limit = std::min(std::max(20.0, 360.0 * dt), 90.0) * 3.14159265358979 / 180.0;
+    const double fov_change = s0 > 0.0 ? std::fabs(s1 / s0 - 1.0) : 0.0;
+    std::snprintf(why, why_size, "moved %.2f m (%.2f m off the expected move, limits %.2f/%.2f), direction cosine %.3f, fov change %.1f %%, dt %.1f ms",
+        distance, off_expected, still_limit, move_limit, cosine, fov_change * 100.0, dt_ms);
+    std::memcpy(g_d5_camera_track.move, move, sizeof(move));
+    g_d5_camera_track.move_valid = true;
+    return !move_ok || cosine < std::cos(turn_limit) || fov_change > 0.05;
+}
+
 // Called once per frame at the scene end: the best bucket becomes this frame's VP.
 void D5FinishViewProj()
 {
@@ -1063,11 +1139,28 @@ void D5FinishViewProj()
     if (g_d5_vp_valid) {
         std::memcpy(g_d5_vp_previous, g_d5_vp_current, sizeof(g_d5_vp_previous));
     }
+    const double now_ms = D5NowMs();
+    const double dt_ms = g_d5_camera_track.time_ms > 0.0 ? now_ms - g_d5_camera_track.time_ms : 0.0;
+    g_d5_scene_dt_ms = g_d5_vp_frame == g_d5_frame_index - 1 ? static_cast<float>(dt_ms) : 0.0f;
+    g_d5_camera_track.time_ms = now_ms;
     if (best >= 0 && g_d5_vp_buckets[best].count >= 3) {
         std::memcpy(g_d5_vp_current, g_d5_vp_buckets[best].vp, sizeof(g_d5_vp_current));
         g_d5_vp_valid = true;
+        char why[192] = {};
+        if (!g_d5_vp_previous_valid) {
+            g_d5_camera_track.move_valid = false;
+        } else if (D5IsCameraCut(g_d5_vp_previous, g_d5_vp_current, dt_ms, why, sizeof(why))) {
+            g_d5_vp_previous_valid = false;   // no history across a cut: zero motion and RESET
+            if (g_d5_trace_frame != nullptr) {
+                Log("DLSS5  camera cut at frame %ld: %s", static_cast<long>(g_d5_frame_index), why);
+            }
+        } else if (g_d5_trace_frame != nullptr) {
+            Log("DLSS5  camera frame %ld: %s", static_cast<long>(g_d5_frame_index), why);
+        }
+        g_d5_camera_track.dt_ms = dt_ms;
     } else {
         g_d5_vp_valid = false;
+        g_d5_camera_track.move_valid = false;
     }
     g_d5_vp_frame = g_d5_frame_index;
     if (g_d5_trace_frame != nullptr) {

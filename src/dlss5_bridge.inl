@@ -1038,9 +1038,9 @@ bool g_d5_shaders_failed = false;
 
 const char kD5ShaderSource[] = R"(
 sampler2D tex0 : register(s0);
-float4 invVp[4] : register(c0);    // rows of inverse(view-proj of this frame)
-float4 prevVp[4] : register(c4);   // rows of the previous frame's view-proj
-float4 size : register(c8);        // width, height, cockpit depth (m), 0
+float4 reproject[4] : register(c0);   // rows of VP_prev * inverse(VP_cur), built in double on the CPU
+float4 worldW : register(c4);         // row 3 of inverse(VP_cur): the world point's homogeneous w
+float4 size : register(c8);           // width, height, cockpit depth (m), 0
 
 float4 DepthPS(float2 uv : TEXCOORD0) : COLOR0
 {
@@ -1049,16 +1049,17 @@ float4 DepthPS(float2 uv : TEXCOORD0) : COLOR0
 
 float4 MotionPS(float2 uv : TEXCOORD0) : COLOR0
 {
+    // No world position in between: one at 2 km from the origin has about 0.1 mm of fp32
+    // resolution, which is pixels of noise close to the camera.
     float z = tex2D(tex0, uv).r;
     float4 ndc = float4(uv.x * 2 - 1, 1 - uv.y * 2, z, 1);
-    float4 world = float4(dot(invVp[0], ndc), dot(invVp[1], ndc), dot(invVp[2], ndc), dot(invVp[3], ndc));
-    world /= world.w;
-    float4 prev = float4(dot(prevVp[0], world), dot(prevVp[1], world), dot(prevVp[2], world), dot(prevVp[3], world));
+    float4 prev = float4(dot(reproject[0], ndc), dot(reproject[1], ndc), dot(reproject[2], ndc), dot(reproject[3], ndc));
+    float w = dot(worldW, ndc);   // > 0 in front of the camera
     float2 prevUv = float2(prev.x / prev.w * 0.5 + 0.5, 0.5 - prev.y / prev.w * 0.5);
     float2 motion = (prevUv - uv) * size.xy;
-    // Clip-space w is the view depth. Nearer than the cockpit depth: the car interior, which
-    // moves with the camera. Behind the camera last frame: no usable history either.
-    if (prev.w < size.z) motion = 0;
+    // prev.w / w is last frame's view depth. Nearer than the cockpit depth: the car interior,
+    // which moves with the camera. Behind the camera last frame: no usable history either.
+    if (prev.w < size.z * w) motion = 0;
     return float4(motion, 0, 1);
 }
 
@@ -1206,7 +1207,7 @@ void D5DrawQuad(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect3DPi
     device->DrawPrimitiveUP(D3DPT_TRIANGLESTRIP, 2, quad, sizeof(D5Vertex));
 }
 
-bool D5Invert4x4(const float* m, float* out)
+bool D5Invert4x4(const double* m, double* out)
 {
     // Gauss-Jordan on a row-major 4x4.
     double a[4][8] = {};
@@ -1244,25 +1245,45 @@ bool D5Invert4x4(const float* m, float* out)
     }
     for (int r = 0; r < 4; ++r) {
         for (int c = 0; c < 4; ++c) {
-            out[r * 4 + c] = static_cast<float>(a[r][4 + c]);
+            out[r * 4 + c] = a[r][4 + c];
         }
     }
     return true;
 }
 
+// Row-major 4x4 product a * b.
+void D5Multiply4x4(const double* a, const double* b, double* out)
+{
+    for (int r = 0; r < 4; ++r) {
+        for (int c = 0; c < 4; ++c) {
+            out[r * 4 + c] = a[r * 4 + 0] * b[0 * 4 + c] + a[r * 4 + 1] * b[1 * 4 + c] + a[r * 4 + 2] * b[2 * 4 + c] + a[r * 4 + 3] * b[3 * 4 + c];
+        }
+    }
+}
+
 // Depth and motion into our render targets; the device's state comes back as it was.
 bool D5RenderInputs(IDirect3DDevice9* device, IDirect3DSurface9* target, IDirect3DTexture9* depth, UINT w, UINT h)
 {
-    float inv_vp[16] = {};
-    const bool have_motion = g_d5_vp_valid && g_d5_vp_previous_valid && D5Invert4x4(g_d5_vp_current, inv_vp);
+    // VP_prev * inverse(VP_cur) in double: NDC of this frame -> clip space of the last.
+    double current[16] = {}, previous[16] = {}, inv_vp[16] = {}, reproject[16] = {};
+    for (int i = 0; i < 16; ++i) {
+        current[i] = g_d5_vp_current[i];
+        previous[i] = g_d5_vp_previous[i];
+    }
+    const bool have_motion = g_d5_vp_valid && g_d5_vp_previous_valid && D5Invert4x4(current, inv_vp);
+    D5Multiply4x4(previous, inv_vp, reproject);
     IDirect3DSurface9* saved_ds = nullptr;
     device->GetDepthStencilSurface(&saved_ds);
     g_d5_state->Capture();
     device->SetDepthStencilSurface(nullptr);
     D5DrawQuad(device, g_d5_rt_depth, g_d5_ps_depth, depth);
     float constants[9 * 4] = {};
-    std::memcpy(constants, inv_vp, sizeof(inv_vp));
-    std::memcpy(constants + 16, have_motion ? g_d5_vp_previous : g_d5_vp_current, sizeof(float) * 16);
+    for (int i = 0; i < 16; ++i) {
+        constants[i] = static_cast<float>(reproject[i]);
+    }
+    for (int i = 0; i < 4; ++i) {
+        constants[16 + i] = static_cast<float>(inv_vp[12 + i]);
+    }
     constants[32] = static_cast<float>(w);
     constants[33] = static_cast<float>(h);
     constants[34] = g_d5_cockpit_depth;

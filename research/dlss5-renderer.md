@@ -151,9 +151,16 @@ protocol rework and the frame times.
 1. The back-buffer-sized `D24S8` depth surfaces are created as the top level of an `INTZ`
    texture, so the scene depth can be sampled (logged as "created as INTZ").
 2. At the pre-HUD point two D3D9 quads write depth (`R32F`, z/w) and motion (`G16R16F`, previous
-   minus current position in pixels, +y down). Motion reprojects each pixel through the inverse
-   of this frame's VP and last frame's VP. Pixels nearer than `CockpitDepth` (1.5 m) get zero
+   minus current position in pixels, +y down). Motion reprojects each pixel through
+   `VP_prev · VP_cur⁻¹`, which DSF Enhanced builds in double precision. The shader never forms a
+   world position, because 2 km from the origin fp32 only resolves about 0.1 mm, which is
+   pixels of noise close to the camera. Pixels nearer than `CockpitDepth` (1.5 m) get zero
    motion, because the car interior moves with the camera.
+   A camera cut drops the history (zero motion and a RESET to the helper). That is a move
+   that matches neither a still camera nor the camera's previous move, scaled to the frame
+   time, within max(4 m, 90 m/s · dt, half that move); a turn of more than max(20°, 360°/s · dt);
+   or a field of view that changes by more than 5 % in a frame. View switches cut; the Shift
+   zoom, which flies 20 to 48 m a frame, cuts only when it starts.
 3. Colour (`T#1` after the composite, `B8G8R8A8`), depth and motion are read back and uploaded
    into D3D11 textures DSF Enhanced shares with the helper (`CLIENT_CREATES`). Then
    `fence_in = n`, FRAME, FRAME_ACK, wait `fence_out = n`.
