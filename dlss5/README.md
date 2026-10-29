@@ -2,7 +2,7 @@
 
 An open-source runner for NVIDIA DLSS 5 ("DLSS 3D-Guided Neural Rendering", NGX feature DLSSNR) and DLAA (DLSS Super Resolution at the game's own resolution, NGX feature SuperSampling) for Driver: San Francisco. NGX is 64-bit only and the game is 32-bit, so the passes run in a separate 64-bit process, `dsf-dlss5-helper.exe`. The game side shares its frame with the helper as GPU textures and gets the result back the same way.
 
-Protocol version 2 runs both features over one pipe and one NGX initialization. Each feature has its own textures, fences and frame numbers. DLAA is in the helper and its tests only; DSF Enhanced does not send DLAA frames yet ([`research/dlaa.md`](../research/dlaa.md)).
+Protocol version 2 runs both features over one pipe and one NGX initialization. Each feature has its own textures, fences and frame numbers. DSF Enhanced sends DLAA frames with `[DLAA] Enable=1`: the HDR scene target at the scene end, DLAA first and DLSS 5 (with `Input=1`) on its output in a second round trip ([`research/dlaa.md`](../research/dlaa.md), "PR 3 as built").
 
 Status: phase 0. The helper, the protocol and both tests run on an RTX 5070 Ti with the signed `nvngx_dlssnr.dll` from RTX Remix 1.6.1. DSF Enhanced does not talk to the helper yet. That needs the game-side capture (pre-HUD colour, depth, motion vectors), which is separate work.
 

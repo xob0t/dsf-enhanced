@@ -2,8 +2,9 @@
 
 Status 2026-10-30: PR 1 (game-side jitter and the AA switches, `feat/dlaa-jitter`) is built and tested
 offline; see "PR 1 as built". PR 2 (the helper: protocol v2 and the DLAA pass, `feat/dlaa-helper`) is
-built and tested offline, including the jitter sign test; see "PR 2 as built". Game-side DLAA (PR 3) is not
-started. The design below is from 2026-10-29. DLAA here is NVIDIA DLSS Super Resolution (NGX feature
+built and tested offline, including the jitter sign test; see "PR 2 as built". PR 3 (game-side DLAA,
+`feat/dlaa-game`) is built; only its offline parts are tested, see "PR 3 as built". The design below is
+from 2026-10-29. DLAA here is NVIDIA DLSS Super Resolution (NGX feature
 `NVSDK_NGX_Feature_SuperSampling`) at a render scale of 1.0, run by the existing 64-bit helper on the
 game's HDR scene target, the same point the parallel `feat/dlss5-hdr-input` work uses for DLSS 5.
 
@@ -708,6 +709,92 @@ is set 35 with a target of exactly the render size, not the busiest pass. Files:
 - `README.md` gets a DLAA section: requirements, download, hash, ini, limitations.
 - `research/dlaa.md`: results.
 
+**PR 3 as built** (`feat/dlaa-game`, 2026-10-30):
+
+- **Files.** `src/dlss5_bridge.inl` (per-feature state and the DLAA pass), `src/dlaa.inl` (the ini, the
+  jitter gate, the MLAA follow and split screen), hooks in `src/dlss5_feed.inl`. The helper and the
+  protocol are unchanged from PR 2.
+- **Ini.** `[DLAA] Enable=1` and `Preset=K|L` (or 11/12; anything else is K, logged).
+  - Enable patches the vertex shaders as `Jitter=1` does and starts the helper bridge without
+    `[DLSS5] Export` or `Helper`. The bridge flag `g_d5_helper` now means "DLSS 5 or DLAA"; DLSS 5 alone
+    is `g_d5_nr`. INTZ depth, the object-motion tagging and the motion pass therefore run for DLAA alone
+    too.
+  - `DisableMLAA` and `DisableSwapChainMSAA` are empty in the shipped ini: empty, missing or `auto`
+    follows Enable, `0` and `1` are kept as set. With Enable, `DisableMLAA=1` still only skips MLAA on
+    frames DLAA anti-aliased.
+  - The `[DLSS5]` helper keys (paths, `HelperTransport`, `FrameTimeLog`, `CrashDump`, `SelfTest`,
+    `ObjectMotion`, `CockpitDepth`) apply to DLAA as well. `HelperBypass` stays DLSS 5 only: a bypassed
+    DLAA would show the jitter.
+- **Per-feature state in the bridge.** Each feature has its own state (off, idle, configuring, running),
+  its own D3D11 textures and fences or Vulkan imports, its own frame numbers (from 1 after each
+  CONFIGURE), configure attempts, composite texture and colour input. The connection keeps one state.
+  - **The pipe.** The worker owns it while the bridge starts or any feature is configuring. Only the
+    render thread asks for a CONFIGURE, so when it sees no feature configuring, the worker is off the
+    pipe, and it may send FRAME. A feature that would send while the other is being configured skips
+    the frame. The worker configures every requested feature in turn.
+  - **HELLO.** A wanted feature that HELLO_ACK doesn't offer is off for the session, with the reason
+    logged; the bridge fails only if no wanted feature is left. A feature that fails CONFIGURE or its
+    frames three times in a row is off for the session; the helper is shut down when no feature is left.
+  - **Depth and motion** are drawn once per frame, for whichever feature runs first; the CPU transport
+    also reads them back once. DLSS 5 at the pre-HUD point (`Input=0`) now reuses the scene end's.
+  - **RESET** on the first frame after CONFIGURE, on camera cuts and stale VPs (as before), and when the
+    feature skipped the frame before (its history would be two frames old).
+- **The DLAA pass**, at the scene end (`D5LeavePass`), after the VP solve and the car matching, before
+  the `Input=1` DLSS 5 pass:
+  1. `HdrSanitizePS` reads `T#3` through its texture (no copy) and writes its colour, without NaNs or
+     negatives, into an f16 colour input. A scene target that isn't a texture skips DLAA (logged once).
+  2. The colour input, depth and motion go to DLAA's slots over either transport. FRAME carries the
+     feature, the jitter this frame's scene was drawn with (zero if it wasn't), `mv_scale` 1 and RESET.
+     No exposure: the feature is created with AutoExposure.
+  3. After an OK FRAME_ACK, the output comes back into the composite texture (Vulkan copy after the
+     fence wait, or the CPU copy), and `HdrSanitizePS` draws it into `T#3` with colour writes only, so
+     the scene keeps its alpha.
+
+  The device state is saved and restored around it as for DLSS 5 (state block, render targets 0-3,
+  depth), and read back and compared on the first frames, traced frames and SelfTest frames.
+  `[DLSS5] SelfTest=1` with Enable runs this side with the helper replaced by a copy.
+- **With DLSS 5.** `Input=1`: the second round trip reads `T#3` after DLAA's write-back, so it tone-maps
+  and denoises DLAA's output (Stage A). `Input=0`: DLSS 5 reads the pre-HUD frame, which the post chain
+  made from the written-back `T#3`, so it sees the anti-aliased scene too.
+- **The jitter gate.** At each frame end, the next frame is jittered only if DLAA's output went back
+  this frame, at the render size, with DLAA running and nothing being configured (`D5DlaaProducing`),
+  and no split screen in the last 60 frames.
+  - So the first frame after a CONFIGURE runs DLAA unjittered, and jitter starts with the next.
+  - A failed, refused or timed-out FRAME, a dead helper (the pipe breaks or a read times out after 3 s),
+    a Reset or a resize turn it off for the next frame. The frame on which DLAA fails was already drawn
+    jittered and is shown without DLAA: one frame, unavoidable without a frame of lag.
+  - The scene's LOD bias follows the jitter.
+- **MLAA comes back mid-session.** The game draws both MLAA passes every frame, and the skip is decided
+  pass by pass at `SetRenderTarget`. With Enable, sets 24 and 25 are skipped only if DLAA's output went
+  into `T#3` earlier in the same frame. On any other frame (DLAA failed, skipped, still starting, off,
+  split screen) the game's passes run and write `T#28`/`T#29` as usual, so a frame never lacks
+  anti-aliasing. The first frames of each change are logged.
+- **Split screen** (not seen in a trace yet; V6). Two signs of a second view:
+  - a scene draw under a viewport that doesn't cover the render size (the viewport is tracked from
+    `SetViewport` and reset at `SetRenderTarget(0)`);
+  - 50 or more draws into `T#3` under set 35/30 after the scene end.
+
+  Either one keeps DLAA, the jitter and the MLAA skip off for 60 frames, and is logged once with the
+  viewport or the draw count. A letterboxed cutscene that narrows the viewport would also trigger it
+  (to check, V8).
+- **Robustness.** FRAME and FRAME_ACK keep their timeouts (3 s), the ACK's status, frame and feature are
+  checked before any wait on fence_out, frame numbers are per feature, and Reset releases every
+  default-pool texture of both features (the shared imports stay; a size change reconfigures).
+- **Traces.** With Enable and `TraceDump=1`, both frames of a traced pair dump `scene-end` (the jittered
+  HDR scene, PFM) and `scene-end-dlaa` (DLAA's output), and each traced frame logs its jitter and phase
+  (`DLAA  frame N: ...`). `FrameTimeLog=1` adds a DLAA line (frames, bridge and evaluate times).
+- **Tests run (offline, 2026-10-30).**
+  - `.\build.ps1`: plugin, helper, offscreen and client tests; the cinematic fit and `vs_jitter_test`
+    self-tests pass.
+  - The bridge's pixel shaders, with the new `HdrSanitizePS`, compile as `ps_2_0` with
+    `d3dcompiler_47` (`HdrSanitizePS` 256 bytes).
+  - `dsf-dlss5-client-test --feature both --robustness` with this branch's helper, both DLLs (hashes
+    checked): features 0x3, 48/48 frames, every robustness check passes. `--feature dlaa --host-creates`
+    (the Vulkan direction): 24/24 frames. The game side's own code is not exercised offline.
+- **Not tested yet** (no game or VM run was possible): everything in game. The checks are V6-V10 below.
+- **Open.** One round trip for both features (PR 4); a frame-lagged mode that would also avoid the
+  jittered frame on a failure; DLAA and the split-screen signs in cutscenes.
+
 **PR 4 (optional).** One FRAME for DLAA, then the tone map, NR and the inverse in the helper. A
 frame-lagged composite.
 
@@ -749,7 +836,11 @@ Host A/B shots, when the user allows a host run:
 | V3 | The patcher over the real shader set | PR 1 build, `Jitter=1 [DLSS5] Trace=1`: count of patched and rejected vertex shaders over a drive and a cutscene (the offline scan expects 0 rejected); no D3D errors; no "game writes vertex constant c255" line |
 | V4 | MLAA skip and the forced non-MSAA swap chain | `DisableMLAA=1`: the log names sets 24 and 25 skipped with `3405C219`/`AECA6459`, `T#29` cleared, and the composite otherwise unchanged (edges visibly aliased). `DisableSwapChainMSAA=1`: `CreateDevice` logs `MultiSampleType` 4 requested, forced to none |
 | V5 | What the game requests today | the `MultiSampleType` log line from V4 with `AntiAliasing = 1`, confirming the static reading at runtime |
-| V6 | Split screen | two viewports in set 35: does the plugin detect them and keep DLAA off? |
+| V6 | Split screen | two viewports in set 35: does the plugin detect them and keep DLAA off? With Enable: the `DLAA: scene draw under viewport` or `more draws after the scene end` line, MLAA on, no jitter |
+| V7 | DLAA alone, in game (host, DXVK) | `[DLAA] Enable=1`, `FrameTimeLog=1`: `CONFIGURE DLAA ... status=0`, `jitter on`, `MLAA pass skipped`, the state check lines, the DLAA frametime line; no `split screen` line in single-player driving |
+| V8 | DLAA in cutscenes and the Shift zoom | Does DLAA stay on (no split-screen line), and do cuts send RESET? |
+| V9 | DLAA with DLSS 5 | `Input=1` and `Input=0`: both features configured, two round trips with `Input=1`, DLSS 5's input anti-aliased |
+| V10 | A killed or stalled helper | `jitter off`, `the game's MLAA runs`, the game goes on; also a Reset (alt-tab, resolution change) |
 
 ## Sources
 
