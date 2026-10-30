@@ -2019,7 +2019,10 @@ HRESULT STDMETHODCALLTYPE D5SetTexture(IDirect3DDevice9* device, DWORD stage, ID
 // (A8R8G8B8, set 60) passed a "covers half the screen" test and draws about as much as the scene,
 // so the scene target flipped between the two (research/dlaa.md, "Which draws"). The scene runs
 // under set 35, and under set 30 in some frames (host-20261029-103023 frames 2954-2955,
-// host-20261029-202625 frames 3010-3011).
+// host-20261029-202625 frames 3010-3011). Film Director's replay playback draws the scene under
+// set 36 (the user's host sessions of 2026-10-30, 04:39, 05:21 and 06:59; set 36 never appeared
+// with the scene target in normal play); without it DLSS 5 and DLAA never start in a replay that
+// is opened straight from the main menu.
 const void* g_d5_counting_rt = nullptr;
 int g_d5_counting_draws = 0;
 LONG g_d5_counting_frame = -1;
@@ -2027,7 +2030,7 @@ bool g_d5_counting_full = false;
 
 bool D5IsSceneTargetSet(DWORD set)
 {
-    return set == 35 || set == 30;
+    return set == 35 || set == 30 || set == 36;
 }
 
 void D5NoteBusiestPass()
