@@ -20,6 +20,7 @@ Each release has a ZIP for each:
 - Shrinks the distant brake and position lamp flares to small dots.
 - Draws the passengers of the car you drive in the in-car camera. The game hides everyone in your car in that view, so after a Shift into a traffic car its passengers vanish from the cockpit view but show in the chase view (`[Quality] CockpitPassengers`).
 - In the garage's vehicles screen, Up/Down switch to the previous or next maker while a maker's cars are open, so every maker's cars can be browsed without going back to the maker list.
+- Plays Film Director replays back without the "old film" look (a grey-green tint, scratches, dust and hairs), so a replay looks like the game itself, with its own colour grade (`[Replay] DisableFilmEffect`). X during playback hides Film Director's menu; that is the game's own key.
 - Skips the legal-screen wait and dismisses the prompt about Ubisoft's servers, which no longer exist.
 - Lifts four engine limits that bigger world or car archives run into and crash on: 45,000 resources loaded at once (`[Limits] ResourceArenaExtraNodes`, 135,000 more by default, about 3 MB), 16,384 resource references waiting to be resolved (`[Limits] PendingResourceReferences`, 131,072 by default, 1.5 MB), 32,768 resources released at once, as when a replay starts in worldlod's map (`[Limits] ResourceReleaseListEntries`, 262,144 by default, 1 MB), and 15,000 submodels loaded at once (`[Limits] SubmodelTableExtraNodes`, 60,000 more by default, about 1.4 MB).
 - Raises the engine's limits of 16,384 draws per frame and 4 MB of draw data per frame, which a heavy frame (worldlod's map, a wide screen, full-detail traffic) can pass and crash on (`[Limits] DrawQueueEntries`, 65,536 by default, about 50 MB with the draw data). If a frame still has more draws, the extra ones are dropped and logged rather than crashing the game.
@@ -39,6 +40,7 @@ Settings live in `dsf_enhanced.ini`. The defaults turn on borderless mode, 16x a
 - `LODEngineThresholdScale` (terrain, pedestrians, drivers) and `MapDetailLODThresholdScale` at `1.0` restore the native LOD thresholds.
 - Clear `DRLFlareScale` and `DRLFlareBrightness` in `[Lights]` to keep the game's lamp flares.
 - `CockpitPassengers=0` hides your car's passengers in the in-car camera again, as the game does.
+- `[Replay] DisableFilmEffect=0` keeps Film Director's old-film look on replays.
 - `[Shadows] ShadowMapSize=4096` sharpens shadows a little more for 268 MB of video memory; `0` keeps the preset's size.
 - `[General] Log=0` stops the plugin from writing `dsf_enhanced.log`.
 
