@@ -133,6 +133,18 @@ constexpr ReleaseAppendSite kReleaseAppendSites[] = {
 // The drain: lea esi,[ebp+0x15E090] and mov ecx,[esi+0x20000] (the count, from the list's start).
 constexpr DWORD kReleaseDrainListRva = 0x007AE6D3;   // disp32 at +2
 constexpr DWORD kReleaseDrainCountRva = 0x007AE6E4;  // disp32 at +2
+// Two more fixed tables in the manager, only logged. Reference slots: 131,072 of 8 bytes at
+// +0x17E094 (0x18B0C84), free-list head at +0x27E094, linked through each free slot's first dword
+// (0 in the last); a used slot's first dword is 0 or the referencing location, never an address in
+// the table. Resolving a pending reference (0xBAE790) takes one; with none free (0xBAE83F) the
+// reference stays pending. Transient IDs (key 0x7FFFF001'00000000 + n, n up to 13,023): a stack
+// of 16-bit links at +0x157ACC (0x188A6BC), head at +0x15E08C. 0xBAE610 pops one with no check and
+// marks it 0xFFFE; the release (0xBAED5E) pushes it back. With all 13,024 taken the pop reads link
+// 0xFFFF, writes past the stack, and the next IDs come from garbage.
+constexpr DWORD kReferenceSlotsRva = 0x014B0C84;
+constexpr DWORD kReferenceSlotCount = 0x20000;
+constexpr DWORD kTransientIdLinksRva = 0x0148A6BC;
+constexpr DWORD kTransientIdCount = 13024;
 // The submodel table (owner pointer at 0x19BBA74, table at owner+0x30): SBMC UID -> submodel, filled
 // by the SBMC loader (0xBBB6C5 -> 0xBBBE40) and emptied as submodels are released (0xBBBCA0). Its
 // nodes come from a pool of 15,000 24-byte nodes at table+0x10..table+0x57E50, taken by
@@ -3031,6 +3043,48 @@ void LogReleaseListPeak()
     }
 }
 
+// The reference slots and transient IDs in use, counted from the tables (the game changes them
+// meanwhile, so the counts are close, not exact), logged when they pass their last logged value
+// by 4,096 and 512.
+DWORD g_reference_slots_logged = 0;
+DWORD g_transient_ids_logged = 0;
+
+void LogResourceManagerTables(const ModuleRange& range)
+{
+    if (!IsRvaInRange(range, kReferenceSlotsRva, kReferenceSlotCount * 8) ||
+        !IsRvaInRange(range, kTransientIdLinksRva, kTransientIdCount * 2)) {
+        return;
+    }
+    const auto* links = reinterpret_cast<const volatile WORD*>(range.base + kTransientIdLinksRva);
+    if (links[0] == 0) {
+        return;  // the manager's reset (0xBAE930) hasn't run; after it this link is never 0
+    }
+    const auto* slots = reinterpret_cast<const volatile DWORD*>(range.base + kReferenceSlotsRva);
+    const auto begin = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(slots));
+    const DWORD end = begin + kReferenceSlotCount * 8;
+    DWORD free_slots = 0;
+    for (DWORD i = 0; i < kReferenceSlotCount; ++i) {
+        const DWORD next = slots[i * 2];
+        free_slots += next >= begin && next < end ? 1 : 0;
+    }
+    // The last free slot links nothing; a table never filled has it.
+    const DWORD used_slots = free_slots + 1 >= kReferenceSlotCount ? 0 : kReferenceSlotCount - free_slots - 1;
+    if (used_slots >= g_reference_slots_logged + 4096) {
+        g_reference_slots_logged = used_slots;
+        Log("ResourceManager: about %lu of %lu reference slots in use", static_cast<unsigned long>(used_slots),
+            static_cast<unsigned long>(kReferenceSlotCount));
+    }
+    DWORD transient = 0;
+    for (DWORD i = 0; i < kTransientIdCount; ++i) {
+        transient += links[i] == 0xFFFE ? 1 : 0;
+    }
+    if (transient >= g_transient_ids_logged + 512) {
+        g_transient_ids_logged = transient;
+        Log("ResourceManager: %lu of %lu transient resource IDs in use", static_cast<unsigned long>(transient),
+            static_cast<unsigned long>(kTransientIdCount));
+    }
+}
+
 struct DrawQueueHeader
 {
     volatile LONG count;
@@ -4355,6 +4409,7 @@ DWORD WINAPI InitThread(LPVOID)
         LogDrawQueueUse(exe);
         if (tick % 4 == 0) {
             LogResourceArenaUse();
+            LogResourceManagerTables(exe);
             LogSubmodelTableUse(exe);
         }
         if (tick % 4 == 0) {
