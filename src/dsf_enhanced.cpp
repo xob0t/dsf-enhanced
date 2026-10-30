@@ -105,6 +105,34 @@ constexpr DWORD kResourceHashBumpContinueRva = 0x007AEDD0;  // fills the node in
 // resolves them later. Entry 16,385 writes its UID over the count, and the next append faults
 // (0x6A594F). A world archive whose global region holds more than about 16,000 submodels hits it.
 constexpr DWORD kResourceManagerRva = 0x01332BF0;
+// The same manager's list of released resources: a resource pointer per entry at +0x15E090
+// (0x1890C80), count at +0x17E090 (0x18B0C80), 32,768 entries with no bound check. Three appenders
+// take the manager in ecx, always 0x1732BF0: the release 0xBAECA0 (after its key's reference
+// slots go back on the free list at +0x27E094), 0xBAEBE0, which replaces a resource and lists the
+// old one, and 0xBAEA60 (no callers found). Only 0xBAE6B0 drains it (called from 0xBABC10 and
+// 0xBAD790): it destroys every entry and sets the count to 0; 0xBAE930 (the manager's reset) also
+// sets it to 0. Entry 32,769 writes its pointer over the count, and the next append faults
+// (0xBAED45). Leaving a world with more than 32,768 resources resident (worldlod, about 52,000)
+// for a replay or another chapter releases them all before the drain.
+constexpr DWORD kReleaseListRva = 0x01490C80;
+constexpr DWORD kReleaseListCountOffset = 0x17E090;
+constexpr int kReleaseListStockCapacity = 32768;
+struct ReleaseAppendSite
+{
+    DWORD rva;
+    std::uint8_t size;             // bytes replaced by the jump: count load, (mov edx,[esi],) entry address
+    std::uint8_t expected[15];
+};
+// mov eax,[reg+0x17E090]; lea eax,[reg+eax*4+0x15E090]; then test eax,eax and the store.
+constexpr ReleaseAppendSite kReleaseAppendSites[] = {
+    {0x007AEA60, 13, {0x8B, 0x81, 0x90, 0xE0, 0x17, 0x00, 0x8D, 0x84, 0x81, 0x90, 0xE0, 0x15, 0x00}},  // 0xBAEA60, ecx
+    {0x007AEC17, 15, {0x8B, 0x87, 0x90, 0xE0, 0x17, 0x00, 0x8B, 0x16,                                // 0xBAEBE0, edi
+                      0x8D, 0x84, 0x87, 0x90, 0xE0, 0x15, 0x00}},                                     // (mov edx,[esi])
+    {0x007AED34, 13, {0x8B, 0x87, 0x90, 0xE0, 0x17, 0x00, 0x8D, 0x84, 0x87, 0x90, 0xE0, 0x15, 0x00}},  // 0xBAECA0, edi
+};
+// The drain: lea esi,[ebp+0x15E090] and mov ecx,[esi+0x20000] (the count, from the list's start).
+constexpr DWORD kReleaseDrainListRva = 0x007AE6D3;   // disp32 at +2
+constexpr DWORD kReleaseDrainCountRva = 0x007AE6E4;  // disp32 at +2
 // The submodel table (owner pointer at 0x19BBA74, table at owner+0x30): SBMC UID -> submodel, filled
 // by the SBMC loader (0xBBB6C5 -> 0xBBBE40) and emptied as submodels are released (0xBBBCA0). Its
 // nodes come from a pool of 15,000 24-byte nodes at table+0x10..table+0x57E50, taken by
@@ -324,6 +352,11 @@ void* g_submodel_pool_alloc = nullptr;
 DWORD g_submodel_table_logged_peak = 0;
 bool g_pending_reference_patch_applied = false;
 DWORD g_pending_reference_logged_peak = 0;
+int g_release_list_capacity = 262144;
+std::uint8_t* g_release_list = nullptr;
+volatile DWORD g_release_list_peak = 0;       // the most entries the list has held
+DWORD g_release_list_logged_peak = 0;
+void* g_release_append_continue[3] = {};
 int g_draw_queue_entries = 65536;
 int g_draw_queue_test_entries = 0;
 LONG g_draw_queue_capacity = 0;               // written into both headers; 0 until the patch is on
@@ -542,6 +575,8 @@ void LoadConfig()
         ClampInt(GetPrivateProfileIntA("Limits", "ResourceArenaStockNodes", 45000, ini_path), 1, 45000);
     g_pending_reference_capacity =
         ClampInt(GetPrivateProfileIntA("Limits", "PendingResourceReferences", 131072, ini_path), 0, 4194304);
+    g_release_list_capacity =
+        ClampInt(GetPrivateProfileIntA("Limits", "ResourceReleaseListEntries", 262144, ini_path), 0, 4194304);
     g_submodel_table_extra_nodes =
         ClampInt(GetPrivateProfileIntA("Limits", "SubmodelTableExtraNodes", 60000, ini_path), 0, 2000000);
     g_draw_queue_entries = ClampInt(GetPrivateProfileIntA("Limits", "DrawQueueEntries", 65536, ini_path), 0, 262144);
@@ -2820,6 +2855,182 @@ void LogPendingReferencePeak(const ModuleRange& range)
     }
 }
 
+// The release list's appends jump here: the stubs load the count as the code they replace does and
+// get the entry's address in the plugin's list from ReleaseEntryAddress, which also notes the
+// list's high water. eax is the entry's address on return, as after the replaced lea (0xBAEBE0's
+// stub also does its mov edx,[esi]); the test eax,eax that follows sets the flags again. A full
+// list ends the game with a message instead of writing past it.
+void __stdcall ResourceReleaseListFull()
+{
+    Log("ResourceReleaseList: full (%d entries); raise [Limits] ResourceReleaseListEntries", g_release_list_capacity);
+    FatalAppExitA(0, "DSF Enhanced: resource release list full. Raise [Limits] ResourceReleaseListEntries in dsf_enhanced.ini.");
+}
+
+__declspec(naked) void ReleaseEntryAddress()
+{
+    __asm {
+        cmp eax, dword ptr [g_release_list_capacity]
+        jae full
+        cmp eax, dword ptr [g_release_list_peak]
+        jb address
+        mov dword ptr [g_release_list_peak], eax
+        inc dword ptr [g_release_list_peak]
+
+    address:
+        shl eax, 2
+        add eax, dword ptr [g_release_list]
+        ret
+
+    full:
+        call ResourceReleaseListFull
+    }
+}
+
+__declspec(naked) void ProxyReleaseAppendEcx()
+{
+    __asm {
+        mov eax, dword ptr [ecx + 0x17E090]
+        call ReleaseEntryAddress
+        jmp dword ptr [g_release_append_continue]
+    }
+}
+
+__declspec(naked) void ProxyReleaseAppendReplace()
+{
+    __asm {
+        mov eax, dword ptr [edi + 0x17E090]
+        mov edx, dword ptr [esi]
+        call ReleaseEntryAddress
+        jmp dword ptr [g_release_append_continue + 4]
+    }
+}
+
+__declspec(naked) void ProxyReleaseAppendEdi()
+{
+    __asm {
+        mov eax, dword ptr [edi + 0x17E090]
+        call ReleaseEntryAddress
+        jmp dword ptr [g_release_append_continue + 8]
+    }
+}
+
+// Moves the release list to a bigger block; its count stays in the manager. The three appends
+// jump to the stubs above, and the drain's two displacements are rewritten: the list relative to
+// the manager, and the count relative to the list. All sites are checked first: on any mismatch
+// nothing is patched. If a write fails, the sites already written are put back: an append to the
+// new list that the drain doesn't read would never be released.
+void ApplyReleaseListPatch(const ModuleRange& range)
+{
+    if (g_release_list_capacity <= kReleaseListStockCapacity) {
+        return;
+    }
+    struct SiteWrite
+    {
+        DWORD rva;
+        std::uint8_t size;
+        std::uint8_t expected[15];
+        std::uint8_t patch[15];
+    };
+    constexpr int append_count = static_cast<int>(sizeof(kReleaseAppendSites) / sizeof(kReleaseAppendSites[0]));
+    SiteWrite writes[append_count + 2] = {
+        {kReleaseAppendSites[0].rva, kReleaseAppendSites[0].size},
+        {kReleaseAppendSites[1].rva, kReleaseAppendSites[1].size},
+        {kReleaseAppendSites[2].rva, kReleaseAppendSites[2].size},
+        {kReleaseDrainListRva, 6, {0x8D, 0xB5, 0x90, 0xE0, 0x15, 0x00}},  // lea esi, [ebp+0x15E090]
+        {kReleaseDrainCountRva, 6, {0x8B, 0x8E, 0x00, 0x00, 0x02, 0x00}}, // mov ecx, [esi+0x20000]
+    };
+    for (int i = 0; i < append_count; ++i) {
+        std::memcpy(writes[i].expected, kReleaseAppendSites[i].expected, kReleaseAppendSites[i].size);
+    }
+    for (const auto& site : writes) {
+        if (!IsRvaInRange(range, site.rva, site.size)) {
+            Log("ResourceReleaseList: site RVA 0x%08lX outside the loaded image; not patched", static_cast<unsigned long>(site.rva));
+            return;
+        }
+        if (std::memcmp(range.base + site.rva, site.expected, site.size) != 0) {
+            Log("ResourceReleaseList: unexpected bytes at RVA 0x%08lX; not patched", static_cast<unsigned long>(site.rva));
+            return;
+        }
+    }
+    const size_t bytes = static_cast<size_t>(g_release_list_capacity) * 4;
+    auto* list = static_cast<std::uint8_t*>(VirtualAlloc(nullptr, bytes, MEM_COMMIT | MEM_RESERVE, PAGE_READWRITE));
+    if (list == nullptr) {
+        Log("ResourceReleaseList: could not allocate %lu entries", static_cast<unsigned long>(g_release_list_capacity));
+        return;
+    }
+    std::memcpy(list, range.base + kReleaseListRva, kReleaseListStockCapacity * 4);
+    g_release_list = list;
+
+    void* const proxies[append_count] = {&ProxyReleaseAppendEcx, &ProxyReleaseAppendReplace, &ProxyReleaseAppendEdi};
+    for (int i = 0; i < append_count; ++i) {
+        auto& site = writes[i];
+        auto* target = range.base + site.rva;
+        g_release_append_continue[i] = target + site.size;
+        std::memset(site.patch, 0x90, site.size);
+        site.patch[0] = 0xE9;
+        const auto relative = static_cast<std::int32_t>(static_cast<std::uint8_t*>(proxies[i]) - (target + 5));
+        std::memcpy(&site.patch[1], &relative, sizeof(relative));
+    }
+    const auto manager = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(range.base + kResourceManagerRva));
+    const auto list_address = static_cast<DWORD>(reinterpret_cast<std::uintptr_t>(list));
+    const DWORD list_from_manager = list_address - manager;
+    const DWORD count_from_list = manager + kReleaseListCountOffset - list_address;
+    std::memcpy(writes[append_count].patch, writes[append_count].expected, 2);
+    std::memcpy(&writes[append_count].patch[2], &list_from_manager, 4);
+    std::memcpy(writes[append_count + 1].patch, writes[append_count + 1].expected, 2);
+    std::memcpy(&writes[append_count + 1].patch[2], &count_from_list, 4);
+
+    const int total = append_count + 2;
+    int patched = 0;
+    for (const auto& site : writes) {
+        if (!WriteMemory(range.base + site.rva, site.patch, site.size)) {
+            break;
+        }
+        ++patched;
+    }
+    if (patched != total) {
+        for (int i = 0; i < patched; ++i) {
+            WriteMemory(range.base + writes[i].rva, writes[i].expected, writes[i].size);
+        }
+        Log(
+            "ResourceReleaseList: failed to patch RVA 0x%08lX; the %d sites already patched were restored",
+            static_cast<unsigned long>(writes[patched].rva),
+            patched
+        );
+        g_release_list = nullptr;
+        VirtualFree(list, 0, MEM_RELEASE);
+        return;
+    }
+    Log(
+        "ResourceReleaseList: %d of %d sites patched; %d entries at 0x%p (%lu KB, stock %d)",
+        patched,
+        total,
+        g_release_list_capacity,
+        list,
+        static_cast<unsigned long>(bytes / 1024),
+        kReleaseListStockCapacity
+    );
+}
+
+// The most entries the list has held between two drains, logged when it passes its last logged
+// value by 1,024.
+void LogReleaseListPeak()
+{
+    if (g_release_list == nullptr) {
+        return;
+    }
+    const DWORD peak = g_release_list_peak;
+    if (peak >= g_release_list_logged_peak + 1024) {
+        g_release_list_logged_peak = peak;
+        Log(
+            "ResourceReleaseList: high water %lu of %d (stock limit %d)",
+            static_cast<unsigned long>(peak),
+            g_release_list_capacity,
+            kReleaseListStockCapacity
+        );
+    }
+}
+
 struct DrawQueueHeader
 {
     volatile LONG count;
@@ -4102,6 +4313,7 @@ void ApplyPatches()
     PatchDirect3DCreate9Import(exe);
     PatchBinkImports(exe);
     ApplyPendingReferencePatch(exe);
+    ApplyReleaseListPatch(exe);
     ApplyResourceArenaPatch(exe);
     ApplySubmodelTablePatch(exe);
     ApplyStartupPatches(exe);
@@ -4139,6 +4351,7 @@ DWORD WINAPI InitThread(LPVOID)
         ApplyDrlFlareCurves(exe);
         LogTrafficDiagnostics(exe);
         LogPendingReferencePeak(exe);
+        LogReleaseListPeak();
         LogDrawQueueUse(exe);
         if (tick % 4 == 0) {
             LogResourceArenaUse();
