@@ -9,7 +9,7 @@ Mods for Driver: San Francisco on PC (exe version 1.04). Each [release](https://
 
 - Fixes the aspect ratio and widens the FOV on ultrawide screens. Bink cinematics keep their proportions.
 - Adds borderless windowed mode, and an option to turn VSync off.
-- Forces 16x anisotropic and trilinear filtering.
+- Forces 16x anisotropic and trilinear texture filtering, so roads and walls stay sharp at shallow angles. That sharpens textures only. It does nothing for jagged edges, which is what DLAA is for.
 - Raises detail. Traffic cars stay at full detail out to their draw distance, traffic spawns up to 500 m away, and sun shadows use 3072x3072 shadow maps instead of 1536x1536.
 - Shrinks the flares of distant brake and position lamps to small dots.
 - Shows your passengers in the cockpit view. The game hides them, so after a Shift into a full car they vanish.
