@@ -95,6 +95,10 @@ void DlaaOnReset();
 extern bool g_d5_nr_on;
 extern bool g_dlaa_on;
 void TogglesFrameEnd(IDirect3DDevice9* device);
+// [Replay] DisableFilmEffect (replay_film.inl)
+extern bool g_replay_disable_film;
+bool ReplayFilmSkipDraw(IDirect3DDevice9* device);
+void ReplayFilmFrameEnd();
 // The game's render resolution: the back buffer size it asked for (BorderlessWindowed makes the
 // swap chain the monitor's size), else the back buffer's.
 UINT D5RenderWidth()
@@ -143,9 +147,16 @@ void LoadDlss5Config(const char* ini_path)
     }
 }
 
-bool Dlss5Wanted()
+// Draws are tracked (scene detection, view-projection, the pre-HUD point) for DLSS 5 and DLAA.
+// [Replay] DisableFilmEffect alone needs the hooks but not that: its draws go straight through.
+bool D5TracksDraws()
 {
     return g_d5_trace || g_d5_export || DlaaWantsDeviceHooks();
+}
+
+bool Dlss5Wanted()
+{
+    return D5TracksDraws() || g_replay_disable_film;
 }
 
 // ---------------------------------------------------------------------------------------
@@ -1752,6 +1763,7 @@ void D5FrameEnd(IDirect3DDevice9* device)
 
     D5FrameTimeTick();
     TogglesFrameEnd(device);   // after the HUD; before DLAA decides the next frame's jitter
+    ReplayFilmFrameEnd();
     DlaaFrameEnd(device);
     InterlockedIncrement(&g_d5_frame_index);
     g_d5_frame_best_rt = nullptr;
@@ -2059,6 +2071,12 @@ HRESULT STDMETHODCALLTYPE D5DrawPrimitive(IDirect3DDevice9* device, D3DPRIMITIVE
         DlaaSkipDraw(device);   // DisableMLAA
         return D3D_OK;
     }
+    if (ReplayFilmSkipDraw(device)) {
+        return D3D_OK;
+    }
+    if (!D5TracksDraws()) {
+        return g_d5_draw_primitive(device, type, start, prims);
+    }
     D5NoteBusiestPass();
     g_d5_draw_key = g_d5_trace_frame != nullptr ? D5DrawKey(start, prims, 0, 1) : 0;
     D5BeforeDraw(device, prims, 0);
@@ -2077,6 +2095,12 @@ HRESULT STDMETHODCALLTYPE D5DrawIndexedPrimitive(IDirect3DDevice9* device, D3DPR
         DlaaSkipDraw(device);   // DisableMLAA
         return D3D_OK;
     }
+    if (ReplayFilmSkipDraw(device)) {
+        return D3D_OK;
+    }
+    if (!D5TracksDraws()) {
+        return g_d5_draw_indexed_primitive(device, type, base, min_index, vertices, start, prims);
+    }
     D5NoteBusiestPass();
     g_d5_draw_key = g_d5_trace_frame != nullptr ? D5DrawKey(static_cast<DWORD>(base), start, prims, vertices) : 0;
     D5BeforeDraw(device, prims, vertices);
@@ -2093,6 +2117,12 @@ HRESULT STDMETHODCALLTYPE D5DrawPrimitiveUP(IDirect3DDevice9* device, D3DPRIMITI
     if (g_dlaa_skip_pass) {
         DlaaSkipDraw(device);   // DisableMLAA
         return D3D_OK;
+    }
+    if (ReplayFilmSkipDraw(device)) {
+        return D3D_OK;
+    }
+    if (!D5TracksDraws()) {
+        return g_d5_draw_primitive_up(device, type, prims, data, stride);
     }
     D5NoteBusiestPass();
     g_d5_draw_key = g_d5_trace_frame != nullptr ? D5DrawKey(prims, stride, 0, 2) : 0;
@@ -2111,6 +2141,12 @@ HRESULT STDMETHODCALLTYPE D5DrawIndexedPrimitiveUP(IDirect3DDevice9* device, D3D
     if (g_dlaa_skip_pass) {
         DlaaSkipDraw(device);   // DisableMLAA
         return D3D_OK;
+    }
+    if (ReplayFilmSkipDraw(device)) {
+        return D3D_OK;
+    }
+    if (!D5TracksDraws()) {
+        return g_d5_draw_indexed_primitive_up(device, type, min_index, vertices, prims, indices, index_format, data, stride);
     }
     D5NoteBusiestPass();
     g_d5_draw_key = g_d5_trace_frame != nullptr ? D5DrawKey(prims, vertices, stride, 3) : 0;
