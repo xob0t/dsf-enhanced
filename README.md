@@ -5,7 +5,8 @@ Each release has a ZIP for each:
 
 - **DSF Enhanced** (`DSF-Enhanced-<version>.zip`): an ASI plugin that fixes ultrawide
   and cinematics, adds borderless mode and better filtering, raises detail and
-  traffic, and lifts engine limits.
+  traffic, and lifts engine limits. Experimental: NVIDIA DLAA anti-aliasing and DLSS 5 on
+  NVIDIA RTX GPUs, through a small 64-bit helper in the ZIP's `dlss5` folder.
 - **worldlod** (`worldlod-<version>.zip`): a high-detail map for the upper Shift levels,
   built from your own copy of the game. It brings DSF Enhanced along.
 
@@ -89,7 +90,7 @@ These keys are in `[DLSS5]` in `dsf_enhanced.ini`. Changes need a restart of the
 
 - `Input` chooses what DLSS 5 sees:
   - `0` (the default) is the finished frame just before the HUD, with the game's colour grading, film grain and bloom already in it. DLSS 5's picture is drawn under the HUD.
-  - `1` is the 3D scene before the game's post-processing, the way RTX Remix feeds DLSS 5. The scene is tone-mapped for DLSS 5, and DLSS 5's picture is tone-mapped back into the scene (with Remix's highlight recovery). The game then adds its own bloom, tone mapping, colour grading, film grain and HUD on top. Untested in game so far.
+  - `1` is the 3D scene before the game's post-processing, the way RTX Remix feeds DLSS 5. The scene is tone-mapped for DLSS 5, and DLSS 5's picture is tone-mapped back into the scene (with Remix's highlight recovery). The game then adds its own bloom, tone mapping, colour grading, film grain and HUD on top, so the game's warm colour grade is applied after DLSS 5. With `Input=0`, and high `ToneStrength`, DLSS 5 tends to wash that grade out.
 - `HdrExposure` (default `0.6`, `Input=1` only) sets how bright the image DLSS 5 gets is. The way back undoes it, so it only changes what DLSS 5 works on.
 - `Style` (0-2, the model), `Intensity`, `ToneStrength` and `StructureStrength` (0-1) are RTX Remix's settings, with Remix's defaults (0, 1, 0.3, 0.7). On this game the defaults change the picture little: about 3-5 of 255 per colour channel on average. `Style=1`, `ToneStrength=1` and `StructureStrength=1` give the strongest change, about 5-13 of 255. Measured on still game frames.
 
@@ -117,10 +118,10 @@ After each press, "DLSS 5 ON" or "DLSS 5 OFF" shows in the top left corner for 2
 
 ### Known limitations
 
-- Experimental. Tested in single-player driving on one RTX 5070 Ti: the chase, cockpit and side views, the Shift zoom and the pause menu. The game ran at 1280x720, also in borderless mode on a 3440x1440 desktop. Other game resolutions, split screen and other GPUs are untested.
+- Experimental. Tested on one RTX 5070 Ti with DXVK: single-player driving (the chase, cockpit and side views, the Shift zoom and the pause menu) and Film Director replays, at 1280x720 and at 3440x1440 in borderless mode, with `Input=0` and `Input=1`, alone and with DLAA. Split screen and other GPUs are untested.
 - Cars, the player's car and the car interior get their own motion vectors. Everything else uses camera motion: pedestrians, the driver's hands, wheel spin, loose panels and moving props. Those can smear when they move fast.
 - The HUD and the pause menu are drawn over DLSS 5's image and stay as they are (tested). Bink cinematics and loading screens should be skipped the same way, but they weren't tested with DLSS 5 on.
-- Frame cost on the RTX 5070 Ti with DXVK, at 1280x720 with nothing else loading the GPU: frames took 8.3-9.1 ms with DLSS 5 against 8.35-8.7 ms without. Without DXVK it adds about 15 ms a frame.
+- Frame cost on the RTX 5070 Ti with DXVK. At 1280x720 with nothing else loading the GPU, frames took 8.3-9.1 ms with DLSS 5 against 8.35-8.7 ms without. At 3440x1440 the DLSS 5 pass takes about 5-6 ms of GPU time, and the round trip to the helper about 7 ms a frame on average. Without DXVK it adds about 15 ms a frame more.
 - Changes to `[DLSS5]` need a restart of the game.
 - With `Input=1`, the game's low-resolution particle layer (drawn after the scene at a quarter of its width and height) is added after DLSS 5, so DLSS 5 does not process it.
 - Only NVIDIA's signed `nvngx_dlssnr.dll` from RTX Remix 1.6.1 is accepted. A newer NVIDIA release would need a newer helper.
@@ -172,11 +173,12 @@ To turn it off, set `Enable=0` (or delete the line). `nvngx_dlss.dll` can stay i
 
 ### Cost
 
-Estimated, not yet measured in game. At 3440x1440 on an RTX 5070 Ti, preset K takes about 1.3-2 ms of GPU time and `L` about 2.5-3.5 ms. The frame is handed to the helper and back while the game waits, which adds about 1.5-2 ms with DXVK. All told, DLAA adds about 3-4 ms a frame with DXVK. Without DXVK the CPU copy adds about 15 ms. With DLSS 5 on too, each runs its own round trip. DLAA uses about 150-200 MB of video memory and saves the game's MLAA passes and the 4x MSAA swap chain (about 80 MB). `[DLSS5] FrameTimeLog=1` logs the measured costs.
+Measured in game at 3440x1440 on an RTX 5070 Ti with DXVK, preset K: the DLAA pass takes about 1 ms of GPU time, and the whole round trip to the helper and back, which the game waits for, about 2.2-2.4 ms a frame on average. Preset `L` is estimated at about twice the GPU time. Without DXVK the CPU copy adds about 15 ms. With DLSS 5 on too, each runs its own round trip. DLAA uses about 150-200 MB of video memory and saves the game's MLAA passes and the 4x MSAA swap chain (about 80 MB). `[DLSS5] FrameTimeLog=1` logs the measured costs.
 
 ### Known limitations
 
-- Experimental and not yet tested in game: only the offline parts are tested (the jitter, the helper and the protocol).
+- Experimental. Tested on one RTX 5070 Ti with DXVK at 3440x1440, preset K, in single-player driving and Film Director replays, alone and with DLSS 5. Preset L, the CPU copy without DXVK, split screen and other GPUs are untested in game.
+- In Film Director replays the game writes the vertex constant the jitter uses, and a few of its vertex shaders read it. Those few are drawn without jitter, so DLAA smooths them less; the rest of the scene is unaffected.
 - If DLAA stops working (no helper, a rejected DLL, a stalled or killed helper), the jitter stops and the game's MLAA comes back by the next frame. The frame on which DLAA fails is shown jittered without DLAA.
 - Split screen keeps the game's MLAA: when the scene is drawn in more than one view, DLAA, the jitter and the MLAA skip stay off.
 - Motion vectors are as for DLSS 5: cars have their own; pedestrians, wheel spin, sparks, smoke and scrolling textures use camera motion and can leave short trails.
@@ -226,11 +228,11 @@ This writes the plugin files, this README, the license, `DSF-Enhanced.zip` and `
 Releases are built by GitHub Actions ([.github/workflows/release.yml](.github/workflows/release.yml)). To release, push a version tag:
 
 ```powershell
-git tag v1.2.0
-git push origin v1.2.0
+git tag v1.3.0
+git push origin v1.3.0
 ```
 
-The workflow then runs worldlod's tests and lint and `build.ps1` on that tag, and publishes the GitHub release with `DSF-Enhanced-v1.2.0.zip` and `worldlod-v1.2.0.zip` and generated release notes. Started by hand from the Actions tab, it only builds and keeps both ZIPs as the run's artifacts.
+The workflow then runs worldlod's tests and lint and `build.ps1` on that tag (which also builds the DLSS 5 / DLAA helper), and publishes the GitHub release with `DSF-Enhanced-v1.3.0.zip` and `worldlod-v1.3.0.zip` and generated release notes. Started by hand from the Actions tab, it only builds and keeps both ZIPs as the run's artifacts.
 
 ## Repository layout
 
