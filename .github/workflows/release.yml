@@ -47,6 +47,9 @@ jobs:
             ".\dist\dsf_enhanced.ini",
             ".\dist\README.md",
             ".\dist\LICENSE",
+            ".\dist\dlss5\dsf-dlss5-helper.exe",
+            ".\dist\dlss5\NVIDIA-RTX-SDKs-LICENSE.txt",
+            ".\dist\dlss5\README.txt",
             ".\dist\DSF-Enhanced.zip",
             ".\dist\worldlod.zip"
           )
