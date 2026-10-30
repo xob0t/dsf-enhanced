@@ -1,5 +1,5 @@
-// Hotkeys that turn DLSS 5 and DLAA off and back on while playing, to compare (README.md, "Turn it
-// off and on while playing"). [DLSS5] ToggleKey and [DLAA] ToggleKey, only for what the
+// Hotkeys that turn DLSS 5 and DLAA off and back on while playing, to compare (docs/dlss5-dlaa.md,
+// "Hotkeys"). [DLSS5] ToggleKey and [DLAA] ToggleKey, only for what the
 // session started with: without DLSS 5 (Export and Helper, or SelfTest) or DLAA Enable there is
 // no key to read. The keys are read once a frame at Present (D5FrameEnd), on the press, while the
 // game's window is in front.

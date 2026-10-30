@@ -27,8 +27,8 @@ nvngx_dlss.dll (for DLAA) comes from NVIDIA's DLSS SDK, release v310.9.16 (use "
 The helper refuses any other copy of either file: it checks the SHA-256, the NVIDIA Corporation
 signature and the version before it loads it.
 
-Turning DLSS 5 and DLAA on and off, requirements and known limitations: README.md, "DLSS 5
-(experimental)" and "DLAA (experimental)".
+Turning DLSS 5 and DLAA on and off, settings, costs and known limitations: docs/dlss5-dlaa.md
+in the source, https://github.com/xob0t/dsf-enhanced/blob/main/docs/dlss5-dlaa.md
 
 Licenses
 
