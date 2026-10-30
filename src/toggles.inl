@@ -11,10 +11,13 @@
 //  - ToggleIndicator: "DLSS 5 ON" and the like for 2 s in the top left corner, over the finished
 //    frame (the HUD included), drawn with Clear rectangles from a built-in 5x7 font. Green is on,
 //    red off, yellow on but not running (the helper or the feature is off for the session).
+//  - ToggleIndicator=2: "DLSS 5" and "DLAA" in the same corner on every frame whose output that
+//    feature actually put back, so recorded footage shows which is which. Nothing for a feature
+//    that is off, stalled or not running; a key press shows nothing more.
 
 bool g_d5_nr_on = true;       // DLSS 5 runs (its hotkey turns it off)
 bool g_dlaa_on = true;        // DLAA runs
-bool g_toggle_indicator = true;
+int g_toggle_indicator = 1;   // 0 none, 1 for 2 s after a press, 2 while the feature's output is on screen
 
 constexpr DWORD kToggleIndicatorMs = 2000;
 
@@ -85,7 +88,7 @@ void ToggleReadKey(ToggleKey& key, const char* section, const char* feature, boo
 // After LoadDlss5Config and LoadDlaaConfig.
 void LoadToggleConfig(const char* ini_path)
 {
-    g_toggle_indicator = GetPrivateProfileIntA("DLSS5", "ToggleIndicator", 1, ini_path) != 0;
+    g_toggle_indicator = ClampInt(GetPrivateProfileIntA("DLSS5", "ToggleIndicator", 1, ini_path), 0, 2);
     if (g_d5_nr) {
         ToggleReadKey(g_toggle_keys[0], "DLSS5", "DLSS 5", &g_d5_nr_on, "F10", ini_path);
     }
@@ -95,7 +98,7 @@ void LoadToggleConfig(const char* ini_path)
     for (const ToggleKey& key : g_toggle_keys) {
         if (key.vk != 0) {
             Log("Toggle: %s on and off with %s (virtual key 0x%02X), indicator %s", key.feature, key.name, key.vk,
-                g_toggle_indicator ? "on" : "off");
+                g_toggle_indicator == 2 ? "while running" : g_toggle_indicator == 1 ? "on" : "off");
         }
     }
 }
@@ -210,7 +213,11 @@ void ToggleDrawIndicator(IDirect3DDevice9* device)
             continue;
         }
         char text[16] = {};
-        std::snprintf(text, sizeof(text), "%s %s", key.feature, *key.on ? "ON" : "OFF");
+        if (g_toggle_indicator == 2) {
+            std::snprintf(text, sizeof(text), "%s", key.feature);
+        } else {
+            std::snprintf(text, sizeof(text), "%s %s", key.feature, *key.on ? "ON" : "OFF");
+        }
         const LONG x = 8 * scale;
         const LONG width = static_cast<LONG>(std::strlen(text)) * 6 * scale - scale;
         const D3DRECT box = {x - 2 * scale, y - 2 * scale, x + width + 2 * scale, y + 9 * scale};
@@ -235,29 +242,41 @@ void ToggleDrawIndicator(IDirect3DDevice9* device)
 // D5FrameEnd, before DlaaFrameEnd decides the next frame's jitter.
 void TogglesFrameEnd(IDirect3DDevice9* device)
 {
-    if (g_toggle_keys[0].vk == 0 && g_toggle_keys[1].vk == 0) {
+    const bool running = g_toggle_indicator == 2;
+    if (g_toggle_keys[0].vk == 0 && g_toggle_keys[1].vk == 0 && !(running && (g_toggle_keys[0].on || g_toggle_keys[1].on))) {
         return;
     }
     const DWORD now = GetTickCount();
     bool shown = false;
     for (ToggleKey& key : g_toggle_keys) {
+        if (key.on == nullptr) {
+            continue;   // the session didn't start with this feature
+        }
+        if (running) {
+            // This frame's output of the feature went back (into the scene or the pre-HUD frame).
+            const D5Feature& f = g_d5_features[&key == &g_toggle_keys[1] ? DSF_DLSS5_FEATURE_DLAA : DSF_DLSS5_FEATURE_NR];
+            key.showing = *key.on && f.composited_frame == g_d5_frame_index;
+        }
         if (key.vk == 0) {
+            shown = shown || key.showing;
             continue;
         }
         const bool down = (GetAsyncKeyState(key.vk) & 0x8000) != 0;
         if (down && !key.down && ToggleGameInFront()) {
             *key.on = !*key.on;
-            key.showing = true;
+            key.showing = !running || key.showing;
             key.shown_at = now;
             Log("Toggle: %s %s (%s) from frame %ld%s", key.feature, *key.on ? "on" : "off", key.name,
                 static_cast<long>(g_d5_frame_index + 1),
                 !*key.on ? "" : ToggleFeatureGone(key) ? ", but it is off for this session (see above)" : ", its first frame with RESET");
         }
         key.down = down;
-        key.showing = key.showing && now - key.shown_at < kToggleIndicatorMs;
+        if (!running) {
+            key.showing = key.showing && now - key.shown_at < kToggleIndicatorMs;
+        }
         shown = shown || key.showing;
     }
-    if (shown && g_toggle_indicator) {
+    if (shown && g_toggle_indicator != 0) {
         ToggleDrawIndicator(device);
     }
 }

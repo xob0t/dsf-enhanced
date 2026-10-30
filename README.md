@@ -109,6 +109,8 @@ After each press, "DLSS 5 ON" or "DLSS 5 OFF" shows in the top left corner for 2
 
 `ToggleIndicator=0` hides it. Every press is also logged in `dsf_enhanced.log`, on a `Toggle:` line.
 
+`ToggleIndicator=2` is for recording comparison footage: "DLSS 5" and "DLAA" stay in the top left corner on every frame where that feature is actually running, meaning its output is on screen that frame. A feature that is turned off, or has stopped (for example the helper failed), shows nothing.
+
 `ToggleKey` takes a key name (F1-F24, A-Z, 0-9, Insert, Delete, Home, End, PageUp, PageDown, Pause, ScrollLock) or a Windows virtual-key code (`0x79` is F10). Empty or `0` means no key.
 
 ### Known limitations
